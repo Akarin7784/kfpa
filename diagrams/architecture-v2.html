@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>KFPA v2 — 知识优先流水线（人机分工版）</title>
+<style>
+  body { margin: 0; padding: 24px; background: #FFFFFF; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  svg text { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+</style>
+</head>
+<body>
+<svg viewBox="0 0 960 1400" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <text x="480" y="44" text-anchor="middle" font-size="20" font-weight="500" fill="#26215C">KFPA v2 — 知识优先流水线（人机分工版）</text>
+  <text x="480" y="68" text-anchor="middle" font-size="12" fill="#5F5E5A">人出原始设计，AI 负责转译与执行 · 含質問票 / 分级重试 / 维护快车道 / 知识沉淀闸门</text>
+
+  <g font-size="12" fill="#444441">
+    <rect x="50" y="88" width="12" height="12" rx="2" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/><text x="68" y="98">控制与决策</text>
+    <rect x="210" y="88" width="12" height="12" rx="2" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/><text x="228" y="98">知识与记忆</text>
+    <rect x="370" y="88" width="12" height="12" rx="2" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/><text x="388" y="98">执行</text>
+    <rect x="530" y="88" width="12" height="12" rx="2" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/><text x="548" y="98">质量验证</text>
+    <rect x="690" y="88" width="12" height="12" rx="2" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/><text x="708" y="98">异常与闸门</text>
+    <rect x="850" y="88" width="12" height="12" rx="2" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text x="868" y="98">产物</text>
+  </g>
+
+  <!-- 人类设计者 -->
+  <rect x="310" y="120" width="340" height="58" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="480" y="143" text-anchor="middle" font-size="14" font-weight="500" fill="#0C447C">人类设计者</text>
+  <text x="480" y="163" text-anchor="middle" font-size="12" fill="#185FA5">原始详细设计 · 设计变更 · 質問票批量确认</text>
+
+  <!-- ① 質問票上呈 -->
+  <path d="M120 210 V178 H304" fill="none" stroke="#A32D2D" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+  <text x="130" y="200" font-size="12" fill="#A32D2D">① 質問票上呈（歧义报告）</text>
+  <!-- ② 确认放行 -->
+  <path d="M600 178 V204" fill="none" stroke="#3B6D11" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="612" y="196" font-size="12" fill="#3B6D11">② 确认后放行</text>
+
+  <!-- 主BOT -->
+  <rect x="50" y="210" width="860" height="170" rx="12" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="70" y="236" font-size="14" font-weight="500" fill="#3C3489">主BOT（旗舰模型 · 控制平面）</text>
+  <g>
+    <rect x="70" y="250" width="190" height="112" rx="8" fill="#FFFFFF" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="165" y="272" text-anchor="middle" font-size="13" font-weight="500" fill="#26215C">① 设计辅助</text>
+    <text x="165" y="294" text-anchor="middle" font-size="12" fill="#444441">起草详细设计草案</text>
+    <text x="165" y="314" text-anchor="middle" font-size="12" fill="#444441">生成質問票（歧义报告）</text>
+    <text x="165" y="334" text-anchor="middle" font-size="12" fill="#444441">对抗性评审</text>
+  </g>
+  <g>
+    <rect x="276" y="250" width="190" height="112" rx="8" fill="#FFFFFF" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="371" y="272" text-anchor="middle" font-size="13" font-weight="500" fill="#26215C">② 设计转译</text>
+    <text x="371" y="294" text-anchor="middle" font-size="12" fill="#444441">编码任务包生成</text>
+    <text x="371" y="314" text-anchor="middle" font-size="12" fill="#444441">验收标准 · 边界 · 契约</text>
+    <text x="371" y="334" text-anchor="middle" font-size="12" fill="#444441">禁止事项</text>
+  </g>
+  <g>
+    <rect x="482" y="250" width="190" height="112" rx="8" fill="#FFFFFF" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="577" y="272" text-anchor="middle" font-size="13" font-weight="500" fill="#26215C">③ 调度与异常</text>
+    <text x="577" y="294" text-anchor="middle" font-size="12" fill="#444441">分级重试（自主/升级）</text>
+    <text x="577" y="314" text-anchor="middle" font-size="12" fill="#444441">变更影响分析</text>
+    <text x="577" y="334" text-anchor="middle" font-size="12" fill="#444441">重规划（改需求/改任务）</text>
+  </g>
+  <g>
+    <rect x="688" y="250" width="190" height="112" rx="8" fill="#FFFFFF" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="783" y="272" text-anchor="middle" font-size="13" font-weight="500" fill="#26215C">④ 反馈回灌</text>
+    <text x="783" y="294" text-anchor="middle" font-size="12" fill="#444441">失败分析写入记忆</text>
+    <text x="783" y="314" text-anchor="middle" font-size="12" fill="#444441">优化调度策略</text>
+    <text x="783" y="334" text-anchor="middle" font-size="12" fill="#444441">沉淀候选标记</text>
+  </g>
+
+  <!-- 知识层（双向） -->
+  <path d="M240 400 V386" fill="none" stroke="#534AB7" stroke-width="1.5" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <path d="M660 400 V386" fill="none" stroke="#534AB7" stroke-width="1.5" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <rect x="50" y="400" width="380" height="84" rx="10" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="240" y="430" text-anchor="middle" font-size="13" font-weight="500" fill="#3C3489">知识与组件库</text>
+  <text x="240" y="452" text-anchor="middle" font-size="12" fill="#444441">成熟组件 · 工程知识</text>
+  <text x="240" y="470" text-anchor="middle" font-size="12" fill="#444441">RAG + 规则引擎（版本匹配/兼容性）</text>
+  <rect x="470" y="400" width="380" height="84" rx="10" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="660" y="430" text-anchor="middle" font-size="13" font-weight="500" fill="#3C3489">项目记忆与状态库</text>
+  <text x="660" y="452" text-anchor="middle" font-size="12" fill="#444441">决策 ADR · 任务状态 · 質問票台账</text>
+  <text x="660" y="470" text-anchor="middle" font-size="12" fill="#444441">失败记录 · 回避模式清单</text>
+
+  <!-- 主调度下行走右侧走廊 -->
+  <path d="M880 380 V534" fill="none" stroke="#534AB7" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="872" y="502" text-anchor="end" font-size="12" fill="#534AB7">任务包 / 调度指令</text>
+
+  <!-- ③ 阻塞升级（右侧红色虚线回路） -->
+  <path d="M890 884 H932 V372 H916" fill="none" stroke="#A32D2D" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+  <text x="872" y="530" text-anchor="end" font-size="12" fill="#A32D2D">③ 阻塞升级 → 重规划 / 改任务</text>
+
+  <!-- 功能开发流水线 -->
+  <rect x="50" y="540" width="860" height="170" rx="12" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text x="70" y="566" font-size="14" font-weight="500" fill="#27500A">功能开发流水线（串行滚动 · 每轮开始先审核上一轮提交）</text>
+  <g>
+    <rect x="70" y="580" width="180" height="88" rx="8" fill="#FFFFFF" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="160" y="608" text-anchor="middle" font-size="13" font-weight="500" fill="#173404">功能N BOT</text>
+    <text x="160" y="630" text-anchor="middle" font-size="12" fill="#444441">设计功能N</text>
+    <text x="160" y="648" text-anchor="middle" font-size="12" fill="#444441">+ 审核第N-1轮代码</text>
+  </g>
+  <path d="M254 624 H276" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="280" y="580" width="180" height="88" rx="8" fill="#FFFFFF" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="370" y="608" text-anchor="middle" font-size="13" font-weight="500" fill="#173404">编码任务包</text>
+    <text x="370" y="630" text-anchor="middle" font-size="12" fill="#444441">验收标准 · 边界清单</text>
+    <text x="370" y="648" text-anchor="middle" font-size="12" fill="#444441">接口契约 · 禁止事项</text>
+  </g>
+  <path d="M464 624 H486" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="490" y="580" width="180" height="88" rx="8" fill="#FFFFFF" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="580" y="608" text-anchor="middle" font-size="13" font-weight="500" fill="#173404">Flash 执行器</text>
+    <text x="580" y="630" text-anchor="middle" font-size="12" fill="#444441">低思考 · 纯编码/修复</text>
+    <text x="580" y="648" text-anchor="middle" font-size="12" fill="#444441">局部优化（不写测试）</text>
+  </g>
+  <path d="M674 624 H696" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="700" y="580" width="180" height="88" rx="8" fill="#FFFFFF" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="790" y="608" text-anchor="middle" font-size="13" font-weight="500" fill="#173404">代码实现（第N轮）</text>
+    <text x="790" y="630" text-anchor="middle" font-size="12" fill="#444441">提交进入第N+1轮审核</text>
+    <text x="790" y="648" text-anchor="middle" font-size="12" fill="#444441">返工上限 = 一轮</text>
+  </g>
+
+  <path d="M480 710 V754" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- 验证与质量控制层 -->
+  <rect x="50" y="760" width="860" height="150" rx="12" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+  <text x="70" y="786" font-size="14" font-weight="500" fill="#633806">验证与质量控制层（测试从设计规约生成，与实现解耦）</text>
+  <g>
+    <rect x="70" y="800" width="180" height="60" rx="8" fill="#FFFFFF" stroke="#854F0B" stroke-width="0.5"/>
+    <text x="160" y="824" text-anchor="middle" font-size="13" font-weight="500" fill="#412402">集成测试</text>
+    <text x="160" y="844" text-anchor="middle" font-size="12" fill="#444441">回归 · 安全 · 契约</text>
+  </g>
+  <path d="M254 830 H276" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="280" y="800" width="180" height="60" rx="8" fill="#FFFFFF" stroke="#854F0B" stroke-width="0.5"/>
+    <text x="370" y="824" text-anchor="middle" font-size="13" font-weight="500" fill="#412402">审查聚合</text>
+    <text x="370" y="844" text-anchor="middle" font-size="12" fill="#444441">多维审查结果合并</text>
+  </g>
+  <path d="M464 830 H486" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="490" y="800" width="180" height="60" rx="8" fill="#FFFFFF" stroke="#854F0B" stroke-width="0.5"/>
+    <text x="580" y="824" text-anchor="middle" font-size="13" font-weight="500" fill="#412402">质量门禁</text>
+    <text x="580" y="844" text-anchor="middle" font-size="12" fill="#444441">三态判定（判据量化）</text>
+  </g>
+  <rect x="70" y="866" width="820" height="36" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+  <text x="480" y="889" text-anchor="middle" font-size="12" fill="#791F1F">三态出口：通过 → 版本管理 ｜ 需修复 → Flash 自主重试（失败原因回灌新任务包） ｜ 阻塞 → 升级主BOT 重规划</text>
+
+  <text x="480" y="936" text-anchor="middle" font-size="12" fill="#5F5E5A">通过 → 提交版本管理（按轮快照）</text>
+  <path d="M880 910 V1084" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- 维护轻量通道 -->
+  <rect x="50" y="950" width="800" height="110" rx="12" fill="#FFFFFF" stroke="#3B6D11" stroke-width="1" stroke-dasharray="6 4"/>
+  <text x="70" y="976" font-size="14" font-weight="500" fill="#27500A">维护轻量通道（小变更 · 不触设计边界 · 覆盖上线后八成需求长尾）</text>
+  <g font-size="12" fill="#173404">
+    <rect x="70" y="990" width="140" height="54" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="140" y="1013" text-anchor="middle" font-size="12" font-weight="500">小变更请求</text>
+    <text x="140" y="1032" text-anchor="middle" font-size="11" fill="#444441">改字段/文案/边界</text>
+    <path d="M214 1017 H232" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+    <rect x="236" y="990" width="140" height="54" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="306" y="1013" text-anchor="middle" font-size="12" font-weight="500">影响分析</text>
+    <text x="306" y="1032" text-anchor="middle" font-size="11" fill="#444441">主BOT 判定通道</text>
+    <path d="M380 1017 H398" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+    <rect x="402" y="990" width="140" height="54" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="472" y="1013" text-anchor="middle" font-size="12" font-weight="500">微型规格</text>
+    <text x="472" y="1032" text-anchor="middle" font-size="11" fill="#444441">主BOT 起草</text>
+    <path d="M546 1017 H564" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+    <rect x="568" y="990" width="140" height="54" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="638" y="1013" text-anchor="middle" font-size="12" font-weight="500">人批量承认</text>
+    <text x="638" y="1032" text-anchor="middle" font-size="11" fill="#444441">每周攒批处理</text>
+    <path d="M712 1017 H730" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+    <rect x="734" y="990" width="96" height="54" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text x="782" y="1013" text-anchor="middle" font-size="12" font-weight="500">Flash 直跑</text>
+    <text x="782" y="1032" text-anchor="middle" font-size="11" fill="#444441">免完整回合</text>
+  </g>
+
+  <!-- 产物与版本管理 -->
+  <rect x="50" y="1090" width="860" height="64" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+  <text x="480" y="1116" text-anchor="middle" font-size="13" font-weight="500" fill="#2C2C2A">产物与版本管理</text>
+  <text x="480" y="1138" text-anchor="middle" font-size="12" fill="#444441">Git 代码库 · 按轮快照（代码+任务包+测试结果绑定）· 轮次打标 · 一键回滚</text>
+
+  <path d="M480 1154 V1198" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- 知识沉淀与闸门 -->
+  <text x="70" y="1186" font-size="14" font-weight="500" fill="#26215C">持续反馈与知识沉淀（带闸门，防知识库中毒）</text>
+  <g>
+    <rect x="50" y="1204" width="170" height="60" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="135" y="1228" text-anchor="middle" font-size="13" font-weight="500" fill="#3C3489">执行结果汇总</text>
+    <text x="135" y="1248" text-anchor="middle" font-size="12" fill="#444441">代码·测试·审查记录</text>
+  </g>
+  <path d="M224 1234 H264" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="270" y="1204" width="200" height="60" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+    <text x="370" y="1228" text-anchor="middle" font-size="13" font-weight="500" fill="#791F1F">沉淀闸门</text>
+    <text x="370" y="1248" text-anchor="middle" font-size="12" fill="#791F1F">置信度门槛 + 人工抽检</text>
+  </g>
+  <path d="M474 1234 H514" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="520" y="1204" width="170" height="60" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="605" y="1228" text-anchor="middle" font-size="13" font-weight="500" fill="#3C3489">待验证隔离区</text>
+    <text x="605" y="1248" text-anchor="middle" font-size="12" fill="#444441">新知识先隔离试用</text>
+  </g>
+  <path d="M694 1234 H734" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g>
+    <rect x="740" y="1204" width="170" height="60" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+    <text x="825" y="1228" text-anchor="middle" font-size="13" font-weight="500" fill="#3C3489">正式知识库</text>
+    <text x="825" y="1248" text-anchor="middle" font-size="12" fill="#444441">供给后续项目复用</text>
+  </g>
+  <path d="M370 1264 V1290" fill="none" stroke="#A32D2D" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+  <rect x="270" y="1294" width="560" height="44" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+  <text x="550" y="1313" text-anchor="middle" font-size="12" fill="#791F1F">失败记录 → 回避模式清单（下一轮任务包显式规避）</text>
+  <text x="550" y="1331" text-anchor="middle" font-size="12" fill="#791F1F">不合格沉淀直接丢弃，不污染知识库</text>
+
+  <text x="480" y="1372" text-anchor="middle" font-size="13" fill="#5F5E5A">失败经济学：重试与回滚只烧 token —— 前提是失败原因回灌下一次任务包，否则重试只是掷骰子</text>
+</svg>
+</body>
+</html>

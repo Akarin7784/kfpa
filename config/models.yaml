@@ -1,0 +1,40 @@
+# =============================================================
+# KFPA v2 角色配置 —— 唯一的模型绑定点
+# 铁律：代码里只允许出现角色名（ARCHITECT/REVIEWER/FLASH），
+#       严禁出现模型字符串。换模型 = 改本文件 + reload，零代码。
+# LiteLLM 启动: litellm --config litellm.yaml
+# =============================================================
+
+roles:
+  # 主BOT：设计辅助 / 设计转译 / 调度与异常 / 反馈回灌
+  ARCHITECT:
+    model: deepseek/deepseek-v4.1-flash
+    thinking: true            # 开思考：转译和重规划是推理活
+    temperature: 0.2          # 规格化输出要稳
+    notes: "当前与 FLASH 同源，同源盲区债务挂账中"
+
+  # 评审位：对抗性评审 / PR-Agent 审查聚合
+  # [待替换] 接入异构 API 后，只改这里两行，其他什么都不用动
+  REVIEWER:
+    model: deepseek/deepseek-v4.1-flash   # [占位] 异构模型到位后换掉
+    thinking: true
+    fresh_context: true       # 硬规则：评审永远开全新上下文，禁止复用主BOT会话
+    temperature: 0.4
+    system_persona: "你是外部审查员，专挑设计书与实现不一致之处"
+
+  # Flash 执行器：纯编码 / 快速修复 / 局部优化
+  FLASH:
+    model: deepseek/deepseek-v4.1-flash
+    thinking: false           # 关思考：零思考执行器，任务包说东不往西
+    temperature: 0.0          # 执行要确定性，不要创意
+    notes: "备胎：Qwen3-Coder（本地 vLLM），断网/降本时改一行 model 即可"
+
+  # 向量检索（知识库 RAG）
+  EMBEDDING:
+    model: BAAI/bge-m3
+
+# 换挡规则：同一个物理模型，靠 thinking 开关分饰两角。
+# 债务清单（接入其他 API 后依次消化）：
+#   1. REVIEWER 换异构模型      —— 优先级最高（裁判不能和运动员同权重）
+#   2. ARCHITECT 换更强推理模型  —— 任务包质量决定返工率
+#   3. FLASH 维持现状           —— DeepSeek 便宜且 diff 格式支持好
