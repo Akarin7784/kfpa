@@ -267,6 +267,21 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 4. 测退出码的姿势统一为「先重定向到文件再读 `$LASTEXITCODE`」：PowerShell 里
    `python … | Select-Object -First 1` 会掐断上游，把 rc 污染成 0（我踩过，差点把未知票号读成 0）。
 
+## R-20 契约升版必须同批同步「升版守卫」，由 Chief 在升版 PR 里直接改
+
+- 台架里有一条**故意的守卫**：`scripts/verify_p0.py` 的 `SUPPORTED_CONTRACT_VERSIONS` 与
+  `tests/test_contract.py` 的 `SUPPORTED_CONTRACT_VERSIONS` 不含当前版本时，A1 与 pytest 直接红，
+  文案是「升版必须同步 scripts/verify_p0.py 与 docs/acceptance/」。这是好设计，保留。
+- **裁决**：升版由 Chief 发起，Chief 必须在**同一个 PR**里同步三处，不许把 main 留在红状态：
+  1. `src/kfpa/schemas.py` 的 `CONTRACT_VERSION`（＋本文件顶部的变更记录）
+  2. `scripts/verify_p0.py`：`CONTRACT_VERSION_LATEST` + `SUPPORTED_CONTRACT_VERSIONS`
+  3. `tests/test_contract.py`：`SUPPORTED_CONTRACT_VERSIONS`
+- 这三处里 2/3 落在镜鉴的写者范围内：属于**升版守卫的同步义务**，Chief 越界修改时必须在 PR 里明说，
+  由镜鉴复验（owner 不变，只是本节把「谁改」定死，避免升版卡住）。
+- 升版 PR 的验收命令固定为：`python scripts/verify_p0.py` + `python -m pytest tests -q` + `python scripts/selfcheck_core.py`，
+  三条都必须 rc=0（clean env）。
+- 首次执行记录：契约 1.0→1.1（守卫就位）、1.1→**1.2**（P1 D3-3.1，本 PR）。
+
 ---
 
 ## 变更记录
@@ -280,3 +295,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.4 | 2026-10-16 | R-17 marker 规范（`KFPA_TASK=` 为准，`[KFPA:…]` 永久兼容别名）· D1-7 加口径标注 | Chief |
 | 1.5 | 2026-10-16 | R-18 中文输出在非 UTF-8 控制台/重定向下必须不崩（新增验收 A10；R-2b 运行约定补充） | Chief |
 | 1.6 | 2026-10-16 | R-19 R-18 兜底必须覆盖独立脚本（`scripts/**` 自己也要能在 clean env 下跑）| Chief |
+| 1.7 | 2026-10-16 | R-20 契约升版必须同批同步「升版守卫」（Chief 直改三处 + 镜鉴复验）| Chief |
