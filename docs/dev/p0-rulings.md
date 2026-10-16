@@ -194,6 +194,17 @@ def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
   每合一个，镜鉴在 main 上复跑 A1–A9。
 - 预演发现冲突/接口不一致 → 群里报，不许自行改 main 或别人的分支。
 
+## R-17 marker 规范：`KFPA_TASK=` 为唯一规范，`[KFPA:…]` 永久保留为兼容别名
+
+- 背景：D1-7 写的是 `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` / `[KFPA:REVIEW]`，
+  R-3 写的是 `KFPA_TASK=qa_tickets` / `KFPA_TASK=task_package` —— 两个字面量并存，
+  而长流已按 R-3 往 prompt 里写，磐石用别名把两者都兼容了（做法正确）。
+- **裁决：以 R-3 的 `KFPA_TASK=<任务名>` 为唯一规范**（它是 k=v 形式，便于将来加参数、便于 grep）。
+  D1-7 的 `[KFPA:…]` **降为兼容别名，永久保留**。
+- **禁止**在代码注释里写「过渡期兼容，将来删除」这类话：将来谁照注释删掉别名，
+  就会在运行期静默炸成 `MockScriptError`。别名与规范 marker 都必须有测试覆盖。
+- 连带更新：`p0-design-addendum.md` D1-7 已加口径标注。
+
 ---
 
 ## 变更记录
@@ -204,3 +215,4 @@ def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
 | 1.1 | 2026-10-16 | R-3 补 `ticket_id` 去重口径 · R-8 `--impact` 下推 Store · R-9 batch-close 退出码（禁用 1） | Chief |
 | 1.2 | 2026-10-16 | R-10 A2/A3 不互斥 + `--inject high_ticket` · R-11 A5 白名单与两条验收命令 · R-12 main 基线核对与 rebase 要求 | Chief |
 | 1.3 | 2026-10-16 | R-13 放行判据（仅 HIGH 阻塞）· R-14 LangGraph state 契约与 `build_graph()` 签名 · R-15 界面小口径与 shim 处置 · R-16 集成预演纪律 | Chief |
+| 1.4 | 2026-10-16 | R-17 marker 规范（`KFPA_TASK=` 为准，`[KFPA:…]` 永久兼容别名）· D1-7 加口径标注 | Chief |

@@ -124,6 +124,11 @@ CLI 退出码（必须写进 `kfpa --help`）：
 
 ## D1-7 Mock 剧本 —— 离线验收的基石
 
+> **本节的 marker 字面量已由 D2 R-17 改口径**：规范 marker 是 `KFPA_TASK=qa_tickets` /
+> `KFPA_TASK=task_package`；本节下表里的 `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` /
+> `[KFPA:REVIEW]` 降为**兼容别名，永久保留，不许删**。其余内容（抽机读行、同输入同输出、
+> 未知 marker 抛 `MockScriptError`）继续有效。
+
 MockLLM **不推理**：它按 prompt 里的 marker 从输入文本抽机读行，同一输入永远同一输出。
 设计文本（`examples/*.md`）里的机读行：
 
