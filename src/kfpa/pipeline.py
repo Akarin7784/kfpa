@@ -175,8 +175,23 @@ class OpenHighTicketsError(PipelineError):
 
 
 def _log(text: str) -> None:
-    """阶段日志：每阶段一行，写 stderr，避免污染 --json 的 stdout。"""
-    print(text, file=sys.stderr, flush=True)
+    """阶段日志：每阶段一行，写 stderr，避免污染 --json 的 stdout。
+
+    R-18 兜底：控制台/重定向为非 UTF-8（如 cp1252）且未设 `PYTHONIOENCODING` 时，
+    中文日志不得让流水线崩掉 —— 编码失败就降级成 ASCII 安全文本再试一次。
+    CLI 入口的 `sys.stdout/stderr.reconfigure(utf-8)`（磐石）是主兜底，这里是第二层。
+    """
+    try:
+        print(text, file=sys.stderr, flush=True)
+        return
+    except UnicodeEncodeError:
+        pass
+    except (ValueError, OSError):  # pragma: no cover - 流已关闭等
+        return
+    try:
+        print(text.encode("ascii", "replace").decode("ascii"), file=sys.stderr, flush=True)
+    except (UnicodeEncodeError, ValueError, OSError):  # pragma: no cover
+        pass
 
 
 # ---------------------------------------------------------------- 模板渲染
