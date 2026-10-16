@@ -11,17 +11,17 @@
 - ``kfpa tickets close <ticket_id> --answer "<人工确认>"``：关闭并入库，回显票面与结论
 - ``kfpa tickets batch-close --file <answers.yaml|json>``：攒批确认，格式与失败规则见 D1-8
 
-退出码（D1-5）：``0`` 成功 / ``2`` 用法与参数错误 / ``4`` 依赖缺失 / ``5`` I/O 或数据库错误。
+退出码（R-1）：``0`` 成功 / ``2`` 用法与参数错误 / ``4`` 依赖与环境错误 / ``5`` I/O 与数据库错误。
 
-D1-8 落地口径：
+D1-8 + R-8/R-9 落地口径：
 
 - 台账列固定 ``ticket_id | round | impact | status | location | architect_preference | answer``；
-- ``batch-close`` 是**事务**：出现未知票号 → 退出码 2 且整体不写；
-- 答案为空 → 拒绝该条（其余照写，最终退出码 2）；
-- 已关闭票重复提交 → 幂等忽略并提示（不改库、不计错）；单张 ``close`` 同口径。
+- ``--impact`` 按 R-8 **下推 Store**（``list_tickets(round_no, status, impact)``），界面不做本地过滤；
+- ``batch-close`` 是**事务**（R-9）：未知票号或某条答案为空 → 整体不写 + 退出码 2；
+- 已关闭票重复提交 → 幂等跳过并打印原因（不改库），退出码 0；全部成功 → 0；
+- 单张 ``close``：未知票号 / 空结论 → 2；已关闭 → 幂等忽略 + 0。
 
-其它约束：只用标准库；``yaml`` 惰性可选；``kfpa.store`` 惰性导入，未就绪时给中文提示；
-影响面过滤在本地做（冻结签名 ``Store.list_tickets(round_no, status)`` 没有 impact 参数）。
+其它约束：只用标准库；``yaml`` 惰性可选；``kfpa.store`` 惰性导入，未就绪时给中文提示（4）。
 """
 
 from __future__ import annotations
@@ -304,10 +304,9 @@ def cmd_list(args) -> int:
         return EXIT_DEPS
     try:
         status = TicketStatus(args.status.lower()) if args.status else None
-        tickets = list(store.list_tickets(round_no=args.round, status=status))
-        if args.impact:
-            want = args.impact.lower()
-            tickets = [t for t in tickets if enum_value(getattr(t, "impact", "")) == want]
+        impact = TicketImpact(args.impact.lower()) if args.impact else None
+        # R-8：影响面下推到 Store，界面不做本地过滤
+        tickets = list(store.list_tickets(round_no=args.round, status=status, impact=impact))
     except Exception as exc:  # sqlite3.Error 等
         return _io_error("读取台账", exc, db_path)
     print(render_tickets(tickets))
@@ -491,7 +490,7 @@ class BatchPlan:
 
 
 def plan_batch(store, answers: dict[str, str]) -> BatchPlan:
-    """逐条预检，**不写库**；未知票号返回在 ``unknown`` 里，由调用方整体拒绝。"""
+    """逐条预检，**不写库**；``unknown`` / ``rejected`` 都是输入错误，调用方整体不写。"""
     plan = BatchPlan()
     for ticket_id, answer in answers.items():
         text = str(answer or "").strip()
@@ -522,19 +521,26 @@ def apply_batch(store, plan: BatchPlan) -> list[str]:
 
 
 def apply_answers(store, answers: dict[str, str]) -> tuple[list[str], list[str]]:
-    """页面用的一次性封装：未知票号则整体不写；返回 ``(已关闭, 提示)``。"""
+    """页面用的一次性封装：未知票号或空结论则整体不写（R-9）；返回 ``(已关闭, 提示)``。"""
     plan = plan_batch(store, answers)
-    if plan.unknown:
-        return [], [f"{t}：未知票号，按事务规则本次不写任何票" for t in plan.unknown]
+    if plan.unknown or plan.rejected:
+        notes = [f"{t}：未知票号" for t in plan.unknown]
+        notes += [f"拒绝：{r}" for r in plan.rejected]
+        return [], [n + "，按 R-9 本次不写任何票" for n in notes]
     closed = apply_batch(store, plan)
-    notes = [f"{t}：已关闭，幂等忽略" for t in plan.ignored] + list(plan.rejected)
-    return closed, notes
+    return closed, [f"跳过 {t}：已关闭（幂等忽略）" for t in plan.ignored]
 
 
 def cmd_batch_close(args) -> int:
     path = Path(args.file)
     try:
         payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        print(
+            f"[kfpa-ui] 答案文件不存在：{path}（{exc}）→ 按 D1-8 格式准备文件后重跑",
+            file=sys.stderr,
+        )
+        return EXIT_DEPS
     except OSError as exc:
         print(f"[kfpa-ui] 读不到答案文件 {path}：{exc} → 检查路径与 UTF-8 编码", file=sys.stderr)
         return EXIT_IO
@@ -562,13 +568,18 @@ def cmd_batch_close(args) -> int:
     except Exception as exc:
         return _io_error("预检攒批答案", exc, db_path)
 
-    if plan.unknown:
-        print(
-            "[kfpa-ui] 未知票号："
-            + "、".join(plan.unknown)
-            + f" → 按 D1-8 事务规则整体不写；先跑 `kfpa tickets list --db {db_path}` 核对票号",
-            file=sys.stderr,
-        )
+    # R-9：未知票号 / 空结论等输入错误 → 整体不写（事务）
+    if plan.unknown or plan.rejected:
+        if plan.unknown:
+            print(
+                "[kfpa-ui] 未知票号："
+                + "、".join(plan.unknown)
+                + f" → 先跑 `kfpa tickets list --db {db_path}` 核对票号",
+                file=sys.stderr,
+            )
+        for reason in plan.rejected:
+            print(f"[拒绝] {reason}", file=sys.stderr)
+        print("[kfpa-ui] 按 R-9 本次整体不写（事务）", file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -579,10 +590,6 @@ def cmd_batch_close(args) -> int:
     for ticket_id in closed:
         print(f"已关闭 {ticket_id} → {plan.to_close[ticket_id]}")
     for ticket_id in plan.ignored:
-        print(f"已关闭过 {ticket_id} → 幂等忽略，未改动库")
-    for reason in plan.rejected:
-        print(f"[拒绝] {reason}", file=sys.stderr)
-    print(
-        f"攒批完成：关闭 {len(closed)} 张，幂等忽略 {len(plan.ignored)} 张，拒绝 {len(plan.rejected)} 张。"
-    )
-    return EXIT_USAGE if plan.rejected else EXIT_OK
+        print(f"跳过 {ticket_id}：已关闭（幂等忽略，未改动库）")
+    print(f"攒批完成：关闭 {len(closed)} 张，跳过 {len(plan.ignored)} 张。")
+    return EXIT_OK
