@@ -15,7 +15,10 @@
 - **A17 的 headless 入口**：``render_tickets(db_path=…)`` 直接返回台账表格数据（list[dict]），
   不需要浏览器、不 import streamlit；``render_headless(db_path=…)`` 则是「真跑一次 AppTest 再取数据」；
 - 台账列与攒批事务规则**不变**（D1-8 / R-9），攒批复用 ``kfpa.ui.cli`` 的解析与落库；
-- 快车道承认页在 ``kfpa/ui/fastlane.py``（D3 §2/§3.6/§3.7），判定走 ``kfpa.impact.analyze``；
+- 快车道页在 ``kfpa/ui/fastlane.py``（D3 §2/§3.6/§3.7）：**只做预览**（R-23，P1 不落库、
+  按钮文案写明「P3 才接攒批承认入库」），判定走 ``kfpa.impact.analyze``；
+  ``diff_files`` 按 R-23 三来源优先级（执行产物 → ``--files`` → 无来源则 ``fast_lane=None``），
+  界面预览可选展示层来源 ``--git-diff``（CLI 判定不得依赖 git）；
 - 数据层（``load_ticket_rows`` / ``fastlane.load_reports``）不 import streamlit，可直接 headless 断言；
 - 页面数据落在 ``st.session_state["kfpa_rows"]``，``render_headless()`` 用它作为返回的表格数据；
 - ``main(db_path=…)`` 也可直接调用；裸 python（没有 streamlit runtime）下自动走 headless，
@@ -42,9 +45,13 @@ EXIT_IO = 5
 
 #: 命令行不给 --db 时的兜底环境变量（headless 渲染用）
 _ENV_DB = "KFPA_UI_DB"
-#: 快车道 diff 文件清单（JSON：{"1": ["src/kfpa/gates.py"]}）与承认留痕文件
+#: 快车道 diff 来源（R-23）：显式文件清单 JSON（{"1": ["src/…"]}）/ 逗号分隔的 --files
 _ENV_DIFF_FILES = "KFPA_UI_DIFF_FILES"
-_ENV_ACK_FILE = "KFPA_UI_ACK_FILE"
+_ENV_FILES = "KFPA_UI_FILES"
+#: 展示层来源开关（git diff），默认关；仅界面预览可用（R-23）
+_ENV_GIT_DIFF = "KFPA_UI_GIT_DIFF"
+#: 预览留痕文件（本地 JSONL，不是入库；R-23 下 P1 无承认落库）
+_ENV_PREVIEW_LOG = "KFPA_UI_PREVIEW_LOG"
 #: render_headless() 运行 AppTest 时的标记：让 __main__ 不 raise SystemExit（见该函数）
 _ENV_APPTEST = "KFPA_UI_APPTEST"
 
@@ -188,14 +195,35 @@ def diff_files_from_env() -> dict[int, list[str]]:
         return {}
 
 
+def _files_from_args(args=None) -> list[str]:
+    """R-23 来源 2：显式 ``--files a.py,b.py``（或环境变量 ``KFPA_UI_FILES``）。"""
+    raw = getattr(args, "files", None) if args is not None else None
+    if raw is None:
+        raw = os.environ.get(_ENV_FILES)
+    if isinstance(raw, (list, tuple)):
+        items = [str(item) for item in raw]
+    else:
+        items = str(raw or "").split(",")
+    return [item.strip() for item in items if item.strip()]
+
+
+def _git_preview_enabled(args=None) -> bool:
+    """展示层 git 来源开关（R-23：仅界面预览可用，默认关）。"""
+    if args is not None and getattr(args, "git_diff", False):
+        return True
+    return str(os.environ.get(_ENV_GIT_DIFF, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def collect_page_data(
     db_path: str = DEFAULT_DB,
     *,
     store=None,
     include_fastlane: bool = True,
     diff_files: Optional[dict[int, list[str]]] = None,
+    cli_files: Optional[list[str]] = None,
+    use_git: bool = False,
 ) -> dict[str, Any]:
-    """页面/headless 共用的数据组装：台账行 + 快车道行 + 提示。"""
+    """页面/headless 共用的数据组装：台账行 + 快车道预览行 + 提示。"""
     store = store or _open_store(db_path)
     raw = _list_tickets(store)
     rows = _ticket_rows(raw)
@@ -205,8 +233,12 @@ def collect_page_data(
         try:
             from kfpa.ui import fastlane
 
+            # R-23：diff_files 三来源优先级（执行产物 → 显式 --files → 无来源=未判定）
             fastlane_rows, hint = fastlane.load_reports(
-                store, diff_files_by_round=diff_files if diff_files is not None else diff_files_from_env()
+                store,
+                diff_files_by_round=diff_files if diff_files is not None else diff_files_from_env(),
+                cli_files=cli_files if cli_files is not None else _files_from_args(),
+                use_git=use_git or _git_preview_enabled(),
             )
             if hint:
                 hints.append(hint)
@@ -229,7 +261,9 @@ def page(
     db_path: Optional[str] = None,
     *,
     include_fastlane: bool = True,
-    ack_file: Optional[str] = None,
+    preview_log: Optional[str] = None,
+    cli_files: Optional[list[str]] = None,
+    use_git: bool = False,
 ) -> dict[str, Any]:
     """渲染整页；返回页面数据（同时写入 ``st.session_state["kfpa_rows"]``）。"""
     from kfpa.ui.cli import (
@@ -252,7 +286,13 @@ def page(
 
     store = _open_store(db)
     raw = _list_tickets(store)
-    data = collect_page_data(db, store=store, include_fastlane=include_fastlane)
+    data = collect_page_data(
+        db,
+        store=store,
+        include_fastlane=include_fastlane,
+        cli_files=cli_files,
+        use_git=use_git,
+    )
     st.session_state["kfpa_rows"] = data
 
     for hint in data["hints"]:
@@ -336,17 +376,18 @@ def page(
     if include_fastlane:
         from kfpa.ui import fastlane
 
-        ack_path = ack_file or os.environ.get(_ENV_ACK_FILE)
+        log_path = preview_log or os.environ.get(_ENV_PREVIEW_LOG)
 
         def _ack(rounds: list[int], note: str) -> dict[str, Any]:
+            # R-23：只算预览结果，不写库；preview_log 仅本地 JSONL 留痕
             return fastlane.acknowledge(
-                data["fastlane"], rounds, actor="streamlit", note=note, ack_file=ack_path
+                data["fastlane"], rounds, actor="streamlit", note=note, preview_log=log_path
             )
 
         fastlane.render(st, data["fastlane"], ack=_ack)
 
     st.caption(
-        "台账列 / 攒批事务：D1-8 · R-9；快车道判据：D3 §3.6；"
+        "台账列 / 攒批事务：D1-8 · R-9；快车道判据：D3 §3.6；快车道承认：P3（R-23，本页仅预览）；"
         f"契约 {_contract_version()}。"
     )
     return data
@@ -368,6 +409,8 @@ def render_headless(
     db_path: str = DEFAULT_DB,
     *,
     include_fastlane: bool = True,
+    cli_files: Optional[list[str]] = None,
+    use_git: bool = False,
     timeout: int = 60,
 ) -> dict[str, Any]:
     """用 ``streamlit.testing.v1.AppTest`` 真渲染一次（不进浏览器），返回页面数据。"""
@@ -382,6 +425,14 @@ def render_headless(
         os.environ["KFPA_UI_NO_FASTLANE"] = "1"
     else:
         os.environ.pop("KFPA_UI_NO_FASTLANE", None)
+    if cli_files:
+        os.environ[_ENV_FILES] = ",".join(str(f) for f in cli_files)
+    else:
+        os.environ.pop(_ENV_FILES, None)
+    if use_git:
+        os.environ[_ENV_GIT_DIFF] = "1"
+    else:
+        os.environ.pop(_ENV_GIT_DIFF, None)
 
     # AppTest 里脚本以 __main__ 执行；末尾 raise SystemExit 会让 AppTest 的
     # 「脚本无错」内部键拿不到（KeyError），用这个标记让 __main__ 不抛
@@ -419,7 +470,24 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
     parser.add_argument("--db", default=None, help=f"SQLite 库路径（默认 {DEFAULT_DB}，环境变量 {_ENV_DB}）")
     parser.add_argument("--headless", action="store_true", help="不进浏览器，用 AppTest 渲染一次（A17）")
     parser.add_argument("--json", action="store_true", help="headless 时输出 schemas.dumps 单行 JSON")
-    parser.add_argument("--no-fastlane", action="store_true", help="不渲染快车道承认页")
+    parser.add_argument("--no-fastlane", action="store_true", help="不渲染快车道预览页")
+    parser.add_argument(
+        "--files",
+        default=None,
+        metavar="A.py,B.py",
+        help="R-23 来源 2：预判用的变更文件（逗号分隔；没有执行产物时用）",
+    )
+    parser.add_argument(
+        "--git-diff",
+        action="store_true",
+        help="R-23 展示层来源：用 git diff --name-only HEAD 作预览输入（CLI 判定不依赖 git）",
+    )
+    parser.add_argument(
+        "--preview-log",
+        default=None,
+        metavar="PATH",
+        help="预览确认的本地 JSONL 留痕（不是入库；R-23 下 P1 无承认落库）",
+    )
     # streamlit run 会在 sys.argv 里塞脚本路径与自己的参数，未知参数一律忽略
     args, _unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
     return args
@@ -449,13 +517,22 @@ def main(
     args = _parse(argv)
     resolved_db = db_path or db or args.db or _env_db()
     include_fastlane = not args.no_fastlane and not os.environ.get("KFPA_UI_NO_FASTLANE")
+    cli_files = _files_from_args(args)
+    use_git = _git_preview_enabled(args)
+    if getattr(args, "preview_log", None):
+        os.environ[_ENV_PREVIEW_LOG] = args.preview_log
 
     # 裸 python（没有 streamlit runtime）自动走 headless；但 AppTest 内部必须留在
     # 浏览器渲染路径，否则 render_headless → 脚本 → main → render_headless 递归。
     in_apptest = bool(os.environ.get(_ENV_APPTEST))
     if args.headless or (not in_apptest and not _has_streamlit_runtime()):
         try:
-            data = render_headless(resolved_db, include_fastlane=include_fastlane)
+            data = render_headless(
+                resolved_db,
+                include_fastlane=include_fastlane,
+                cli_files=cli_files or None,
+                use_git=use_git,
+            )
         except UIDependencyError as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_DEPS
@@ -480,7 +557,13 @@ def main(
         return EXIT_DEPS
 
     try:
-        page(st, resolved_db, include_fastlane=include_fastlane)
+        page(
+            st,
+            resolved_db,
+            include_fastlane=include_fastlane,
+            cli_files=cli_files or None,
+            use_git=use_git,
+        )
     except UIDependencyError as exc:
         st.error(str(exc))
         return EXIT_DEPS
