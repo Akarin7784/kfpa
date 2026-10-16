@@ -32,7 +32,7 @@ import os
 import sys
 import tempfile
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -245,14 +245,14 @@ def call_cli(parser, argv: list[str], store: FakeStore, module) -> int:
         original = module._store_for
         module._store_for = lambda _db: store  # noqa: ARG005 - 桩注入
         try:
-            with redirect_stdout(io.StringIO()):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 return args.handler(args)
         finally:
             module._store_for = original
     original_make = store_mod.make_store
     store_mod.make_store = lambda _db=None: store  # noqa: ARG005 - 桩注入（knowledge 用工厂）
     try:
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             return args.handler(args)
     finally:
         store_mod.make_store = original_make
@@ -430,6 +430,26 @@ def run_fastlane() -> None:
         builtins.__import__ = real_import
     expect("清单：没装 pyyaml 时逐行兜底仍认得冻结形状",
            fallback_ids == ["fl-7-6", "fl-7-7"], str(fallback_ids))
+
+    # R-34 坏形状：一律 rc=2（CLI 判），不许静默跳过 / 补行 / 只 ack 一半
+    for label, bad_text in (
+        ("`acks` 是标量（界面报的第三种坏形状）", "acks: fl-1-1\n"),
+        ("元素缺 `request_id`", "acks:\n  - note: 没票号\n"),
+        ("`acks` 不是列表（JSON）", '{"acks": "fl-1-1"}'),
+        ("`acks` 是空列表", "acks: []\n"),
+        ("空文件", "   \n"),
+        ("没有可识别条目", "note: 只有注释\n"),
+    ):
+        raised = False
+        try:
+            fastlane.load_ack_ids(bad_text)
+        except fastlane.FastlaneError as exc:
+            raised = "rc=2" in str(exc) and "request_id" in str(exc)
+        expect(f"R-34 坏形状 → 中文 + rc=2：{label}", raised)
+    expect("R-34：内联列表 `acks: [fl-1-1, fl-1-2]` 合法",
+           fastlane.load_ack_ids("acks: [fl-1-1, fl-1-2]") == ["fl-1-1", "fl-1-2"])
+    expect("宽松入口 parse_ack_file 对坏形状不抛异常（只给空清单）",
+           fastlane.parse_ack_file("acks: fl-1-1\n") == [])
 
     spec = fastlane.micro_spec(FastlaneRequest(request_id="fl-8-1", round_no=8, summary="小改"))
     expect("微型规格渲染（含 request_id 与三判据）",
@@ -886,6 +906,24 @@ def run_fastlane_cli() -> None:
                 rc_batch_text = batch_text.handler(batch_text)
             expect("CLI：batch-ack 文本输出失败条",
                    rc_batch_text == fastlane.EXIT_MANUAL and "✗" in out_batch_text.getvalue())
+
+            # R-34 第三种坏形状：`acks: fl-1-1` → rc=2 且**不许静默承认**
+            bad_file = Path(tmp) / "bad.yaml"
+            bad_file.write_text("acks: fl-1-1\n", encoding="utf-8")
+            bad_store = FakeStore()
+            bad_store.add_fastlane_request(FastlaneRequest(
+                request_id="fl-19-1", round_no=19, summary="s"))
+            bad_args = parser.parse_args(["fastlane", "batch-ack", "--file", str(bad_file),
+                                          "--by", "probe", "--db", "x"])
+            original_store = fastlane._store_for
+            fastlane._store_for = lambda _db: bad_store
+            try:
+                rc_bad = bad_args.handler(bad_args)
+            finally:
+                fastlane._store_for = original_store
+            expect("CLI：`acks: fl-1-1` → rc=2 且行保持 pending（不许静默落库）",
+                   rc_bad == fastlane.EXIT_USAGE
+                   and bad_store.get_fastlane_request("fl-19-1").status is FastlaneStatus.PENDING)
 
         # reject 三态：pending → rejected；重复拒绝幂等；已 approved 不许拒
         pending = FastlaneRequest(request_id="fl-14-1", round_no=14, summary="s")
