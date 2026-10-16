@@ -186,12 +186,13 @@ def test_default_workdir_layout():
 
 
 def test_exception_exit_code_mapping():
+    """R-31 rc 三分（#48 落地后）：依赖/凭据类 `RuntimeError` 归 4，I/O 与 DB 归 5。"""
     assert cli._exception_exit_code(ImportError("no litellm")) == cli.EXIT_DEP_MISSING
     assert cli._exception_exit_code(RuntimeError("未安装 streamlit")) == cli.EXIT_DEP_MISSING
+    assert cli._exception_exit_code(RuntimeError("其它")) == cli.EXIT_DEP_MISSING   # RuntimeError 一律环境类
     assert cli._exception_exit_code(OSError("disk")) == cli.EXIT_IO
     # R-31：RuntimeError 是本仓库的依赖/凭据类错误载体 → 4；真正「其它异常」走 5。
-    assert cli._exception_exit_code(RuntimeError("其它")) == cli.EXIT_DEP_MISSING
-    assert cli._exception_exit_code(ValueError("其它")) == cli.EXIT_IO
+    assert cli._exception_exit_code(ValueError("参数怪")) == cli.EXIT_IO
 
 
 def test_init_happy_path_and_bad_path(tmp_path):
