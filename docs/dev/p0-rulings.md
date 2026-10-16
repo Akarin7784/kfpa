@@ -300,6 +300,38 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
      新增 `P1_TABLE_NAMES = ("ledger", "knowledge")` 与 `ALL_TABLE_NAMES = TABLE_NAMES + P1_TABLE_NAMES`。
      需要「当前所有表」的断言（A12 双库对拍、P1 台架）一律用 `ALL_TABLE_NAMES`（9 张）。
 
+## R-22 P1 首次全量验收的六个红：两个集成根因 + 四条口径
+
+**实测（我合并 #22/#19/#20/#18/#21 后，在 main `3596f6c` clean env 跑 `verify_p1.py`）**：
+`A11/A12/A13/A15/A16/A17` FAIL，`A14` PASS。逐条定位到四个根因：
+
+| 根因 | 影响断言 | 归属 |
+|---|---|---|
+| `cli.py` 没挂载 `ledger` / `knowledge` / `fastlane` 三个子命令（`--help` 里只有 init/round/gate/history/rollback/tickets） | A11 / A15 / A16 | 磐石（CLI）+ 长流（`register()`） |
+| `docker-compose.pg.yml` 默认宿主端口 55432 被别的项目容器占用（`wms-pg` / `wms-pg-verify` / `wms-pg-base`） | A12 | 磐石 |
+| pipeline 默认没用 `SqliteSaver`，workdir 下没有 checkpoint 库 | A13 | 长流 |
+| A17 的调用口径未对齐 | A17 | 界面 + 镜鉴 |
+
+**裁决**：
+
+1. **PG 宿主端口默认改 `55440`**，支持 `KFPA_PG_PORT` 覆盖（compose：`ports: "${KFPA_PG_PORT:-55440}:5432"`）。
+   本机 55432/55433/55434 已被其它项目占用，**KFPA 不得占用这三个端口**；台架 A12 优先读 `KFPA_PG_PORT`。
+2. **checkpoint 落盘口径（冻结）**：P1 默认 `SqliteSaver`，库固定为 **`{workdir}/checkpoints.sqlite`**，
+   `thread_id = f"kfpa-r{round_no}"`，可用 `--checkpoint-db` 覆盖；
+   台架 A13 按此对齐搜索目录与文件名（现已在 workdir 找 `*.sqlite`，形状兼容）。
+3. **G7 的启用条件**：**只有显式提供覆盖率报告时才启用**（`kfpa round --coverage-json <cov.json>`）；
+   无报告 → G7 跳过，**不得判红**（否则默认 happy-path 全红）。json 顶层需含 `critical_paths_ok`
+   （由台架把「A1–A10 是否全绿」写进去）；**缺该键即 False，不许编造**。
+4. **覆盖率门槛只统计核心模块白名单**：`schemas.py`、`config.py`、`cli.py`、`store/**`、`gates.py`、`pipeline.py`；
+   **不含** `ui/**`、`executor.py`（适配器）、`scripts/**`。全仓库行覆盖不作为门槛。
+5. **A14 本轮只验机制**：提供报告 → 正确判 `NEEDS_FIX` + `error_category=coverage` + 未达标文件清单即通过；
+   真实达标（白名单行覆盖 ≥80%）登记为 **P1 尾项债务**，不阻塞本轮合并（当前全仓库 37.6%）。
+6. **A17 以 `scripts/verify_p1.py` 的调用口径为准**（验收方定义接口），界面按其对齐；
+   有歧义找镜鉴澄清，不许各自「就地发明」入口。
+
+**派工**：磐石补 CLI 接线（三个子命令 + `--coverage-json` + `--checkpoint-db`）与 compose 端口；
+长流落 checkpoint 默认盘并提供 `register()`；界面对齐 A17；镜鉴按 1–3 条调整台架后复跑。
+
 ---
 
 ## 变更记录
@@ -315,3 +347,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.6 | 2026-10-16 | R-19 R-18 兜底必须覆盖独立脚本（`scripts/**` 自己也要能在 clean env 下跑）| Chief |
 | 1.7 | 2026-10-16 | R-20 契约升版必须同批同步「升版守卫」（Chief 直改三处 + 镜鉴复验）| Chief |
 | 1.8 | 2026-10-16 | R-21 升级守卫同步义务归发起变更者 · `schema_version` 断言跟常量走 · `ALL_TABLE_NAMES` 语义 | Chief |
+| 1.9 | 2026-10-16 | R-22 P1 首轮验收六红定位：PG 端口默认 55440 · checkpoint 落盘口径 · G7 仅在提供报告时启用 · 覆盖率白名单 · A14 只验机制 · A17 以台架口径为准 | Chief |
