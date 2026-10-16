@@ -182,6 +182,14 @@ def _sample_row(sample: dict[str, Any], index: int) -> dict[str, Any]:
         "false_alarm": false_alarm,
         "flagged": missed is not None and false_alarm is not None,
         "defects": findings,
+        # 生产端的诊断字段（长流 eval.py，D4 未列但保留）：渲染层只读不改，缺失时为 None/空
+        "parse_ok": sample.get("parse_ok"),
+        "context_id": str(sample.get("context_id") or ""),
+        "blocking_criteria": [
+            str(c) for c in (sample.get("blocking_criteria") or []) if str(c).strip()
+        ]
+        if isinstance(sample.get("blocking_criteria") or [], list)
+        else [],
     }
 
 
@@ -262,6 +270,13 @@ def normalize(payload: Any) -> dict[str, Any]:
         )
     if not has_baseline:
         notes.append("缺 baseline_* 指标 → 结论判「无法判定」，不按 0 假设（D4 §3.4）")
+
+    parse_failed = [s["id"] for s in samples if s["parse_ok"] is False]
+    if parse_failed:
+        notes.append(
+            f"{len(parse_failed)} 条样本评审解析失败（parse_ok=false）→ 按 R-5 只记 reasons、不改三态，"
+            f"不并入漏检/误报：{'、'.join(parse_failed[:8])}" + ("…" if len(parse_failed) > 8 else "")
+        )
 
     passed: Optional[bool]
     if has_baseline:
