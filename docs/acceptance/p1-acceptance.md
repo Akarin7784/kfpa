@@ -13,9 +13,13 @@
 |---|---|
 | 验收台架 | `scripts/verify_p1.py`（A11–A17 ＋ **A0 = P0 不回归守卫**，共 8 条断言） |
 | 契约版本 | `CONTRACT_VERSION 1.2`（`LedgerEntry` / `KnowledgeCandidate` / `CandidateStatus` / `CoverageReport`） |
-| 最近一次全量运行 | 2026-10-16 @ `main@60b786d`（P1 模块未交付）：**8 条断言 PASS 1 / FAIL 7**，唯一 PASS 是 A0（P0 台架 13/13 无回归）；A11–A17 的 FAIL 全部指名「缺哪个文件、归谁写」 |
-| 判定 | **P1 未交付**：`p1/store`（磐石）、`p1/pipeline`（长流）、`p1/ui`（界面）尚未落分支 |
-| 契约层测试 | `tests/test_contract_p1.py`（1.2 三件新结构）；`pytest tests -q` → **40 passed** |
+| 最近一次全量运行 | 2026-10-16 @ `main@84fa7f1`（五个 P1 PR 已合）：**8 条断言 PASS 1 / FAIL 7**，唯一 PASS 是 A0（P0 台架 13/13 无回归）；7 条红已按 R-22 定位到「CLI 接线未完成 / checkpoint 未落盘 / compose 端口与容器名 / `--coverage-json` 未接线 / A17 口径」 |
+| 判定 | **未通过**：红项已转成 R-22 的派工（磐石 CLI 接线与 compose、长流 checkpoint、界面对齐 A17），台架只给可复现证据 |
+| 契约层测试 | `tests/test_contract_p1.py`（1.2 三件新结构）＋ `tests/test_harness_compat.py`；`pytest tests -q` → **44 passed** |
+
+**R-22 对齐（本分支）**：A12 端口改读 `KFPA_PG_PORT`（默认 **55440**，55432-55434 禁用，并断言 compose 默认值）；
+A13 按冻结口径断言 `{workdir}/checkpoints.sqlite` 与 `thread_id=kfpa-r{n}`；
+A14 增加「**不给报告 → G7 必须跳过、不得判红**」与 `--coverage-json` 三态（不达标拦 / 缺 `critical_paths_ok` 键视为 False / 达标放行）。
 
 台架原则与 P0 一致：缺件按 FAIL 报、逐条指名到文件与责任人；SKIP 只用于环境不具备（A12 的 Docker），
 且必须在报告里显式可见。
