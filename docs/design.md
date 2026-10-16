@@ -219,8 +219,8 @@ Flash 越笨，规约必须越精确。六段式模板（Jinja2 渲染）：
   —— 已交付（2026-10-16）：双库对拍、token 账本、checkpoint、G7 门槛、Streamlit 台账；见 `docs/dev/p1-plan.md`（D3）与 `docs/acceptance/p1-acceptance.md`。
 - [x] **P2 评审位异构化**：接入第二个模型 API，消化同源盲区债务
   —— 已交付（2026-10-17，main `be4da48`）：按角色 provider、fresh context、G8 折算、同源盲区度量（异构漏检 0 vs 同源 12）、覆盖率债清偿（R-32 纯逻辑白名单 90.7%）；见 `docs/dev/p2-plan.md`（D4，契约 1.3）与 `docs/acceptance/p2-acceptance.md`。
-- [ ] **P3 快车道 + 沉淀闸门全量落地**，验证八成维护长尾的消化能力
-  —— 进行中（2026-10-17 开工）：快车道承认落库 + 沉淀闸门全量 + 负知识闭环 + 本地回退检索（RAG）；契约见 `docs/dev/p3-plan.md`（D5，契约 1.4 / schema 4）。
+- [x] **P3 快车道 + 沉淀闸门全量落地**，验证八成维护长尾的消化能力
+  —— 已交付（2026-10-17，main `358ad46`）：快车道承认落库（`fastlane_requests`/攒批承认/审计留痕/幂等不可翻案）、沉淀闸门全量（门槛 0.80 · 隔离区 · 后续轮次转正 · 动态抽检 · 回避模式）、负知识回灌（R-28）、本地回退检索（RAG + Dify 惰性适配器）；验收 `verify_p3` **6/6**，白名单覆盖率 96.3%；见 `docs/dev/p3-plan.md`（D5，契约 1.4 / schema 4）与 `docs/acceptance/p3-acceptance.md`。
 
 ## 9. 非目标（Non-Goals)
 

@@ -102,11 +102,11 @@
   <div class="chips">
     <span class="chip">仓库 <b>Akarin7784/kfpa</b></span>
     <span class="chip">main <b class="mono">e09f925</b></span>
-    <span class="chip">契约 <b>CONTRACT_VERSION 1.2</b></span>
-    <span class="chip">裁决 <b>D2 v2.5（R-1 ~ R-28）</b></span>
+    <span class="chip">契约 <b>CONTRACT_VERSION 1.4</b></span>
+    <span class="chip">裁决 <b>D2 v3.3（R-1 ~ R-38）</b></span>
     <span class="chip">提交 <b>38</b> · 已合并 PR <b>37</b></span>
-    <span class="chip">更新 <b>2026-10-17 01:15</b></span>
-    <span class="chip">main <b class="mono">eca4837</b></span>
+    <span class="chip">更新 <b>2026-10-17 04:25</b></span>
+    <span class="chip">main <b class="mono">358ad46</b></span>
   </div>
 
   <h2>里程碑</h2>
@@ -126,10 +126,10 @@
       <p>评审位接进主循环（G8 折算：<span class="mono">major + criterion</span> 才阻塞）、异构 provider 可换挡、同源盲区可量化度量、评审报告三形态（Markdown / HTML / 页面）。</p>
       <div class="sub">2026-10-17 · 验收 A18–A22 <b>6/6</b> · 异构漏检 <b>0</b> vs 同源 <b>12</b>（一致率 100% vs 50%，24 样本）</div>
     </div>
-    <div class="card next">
-      <h4><span class="tag t-wip">进行中</span>P3 快车道 + 沉淀闸门全量</h4>
-      <p>快车道承认落库（<span class="mono">fastlane_requests</span> 攒批承认 + 审计留痕）、沉淀闸门全量（置信度门槛 · 隔离区 · 后续轮次复用转正 · 动态抽检）、负知识闭环、本地回退检索（RAG，Dify 惰性适配器）。</p>
-      <div class="sub">2026-10-17 开工 · 契约 D5（CONTRACT 1.4 / schema 4）· 验收 A23–A27 + A0 不回归</div>
+    <div class="card done">
+      <h4><span class="tag t-ok">已交付</span>P3 快车道 + 沉淀闸门全量</h4>
+      <p>快车道承认落库（<span class="mono">fastlane_requests</span> 攒批承认 + 审计留痕 + 幂等/不可翻案）、沉淀闸门全量（门槛 0.80 · 隔离区 · 后续轮次复用才转正 · 动态抽检 · 回避模式）、负知识回灌（R-28 轮次范围）、本地回退检索（RAG + Dify 惰性适配器）。</p>
+      <div class="sub">2026-10-17 · 契约 D5（CONTRACT 1.4 / schema 4）· 验收 A0 + A23–A27 <b>6/6</b>（0 SKIP）· 白名单覆盖 96.3%</div>
     </div>
   </div>
 
@@ -138,14 +138,17 @@
     <div class="card"><div class="v ok">13/13</div><div class="k">P0 台架 verify_p0.py（A1–A10）</div></div>
     <div class="card"><div class="v ok">8/8</div><div class="k">P1 台架 verify_p1.py（A11–A17，0 SKIP）</div></div>
     <div class="card"><div class="v ok">6/6</div><div class="k">P2 台架 verify_p2.py（A18–A22，0 SKIP）</div></div>
-    <div class="card"><div class="v ok">194</div><div class="k">pytest passed</div></div>
-    <div class="card"><div class="v ok">90.7%</div><div class="k">R-32 纯逻辑白名单行覆盖（门槛 80%）</div></div>
+    <div class="card"><div class="v ok">6/6</div><div class="k">P3 台架 verify_p3.py（A0 + A23–A27，0 SKIP）</div></div>
+    <div class="card"><div class="v ok">342</div><div class="k">pytest passed</div></div>
+    <div class="card"><div class="v ok">96.3%</div><div class="k">R-32 纯逻辑白名单行覆盖（门槛 80%）</div></div>
+    <div class="card"><div class="v ok">83.3% / 84.5%</div><div class="k">P3 模块 fastlane / knowledge（门槛各 ≥80%）</div></div>
     <div class="card"><div class="v ok">0</div><div class="k">selfcheck_core 失败项</div></div>
   </div>
   <div class="note" style="margin-top:14px">
     clean env 口径（R-2/R-18/R-19/R-25）：不设 <span class="mono">PYTHONIOENCODING</span>、不设残留 <span class="mono">KFPA_DB_URL</span>，stdout 重定向下 rc 必须正确；
-    A12 在真 PostgreSQL 上做双库对拍（9 表一致、<span class="mono">package_hash</span> 一致）。
+    A12/A26 在真 PostgreSQL 上做双库对拍（库表、票号、账本、门禁态、<span class="mono">package_hash</span> 一致）。
     退出码三分（R-31）：未知值 <b>2</b> · 合法但缺依赖/凭据 <b>4</b> · I/O 与 DB <b>5</b>。
+    <b>终验纪律（R-37/R-38）</b>：PG 必须独占；台架探针不许依赖 gitignored 的运行时状态（<span class="mono">runs/**</span>）。
   </div>
 
   <h2>分层架构与落地状态</h2>
@@ -324,6 +327,9 @@
       <tr><td>P2</td><td class="mono">A18 / A19 / A20</td><td>评审位接入（provider 三分退出码 + 评审留痕） · 重试产生多次<b>独立 context</b>（fresh context） · R-32 纯逻辑白名单 ≥80% 且 G7 口径不吃门槛外文件</td><td><span class="tag t-ok">PASS</span></td></tr>
       <tr><td>P2</td><td class="mono">A20b</td><td>报告项（非门槛）：<span class="mono">store/postgres.py</span> 行覆盖在无 Docker 的 clean env 下为 0/196 —— PG 覆盖交给 A12 双库对拍</td><td><span class="tag t-wip">报告项</span></td></tr>
       <tr><td>P2</td><td class="mono">A21 / A22</td><td>同源盲区度量（missed / false_alarm / agreement + baseline，报告落盘） · G8 折算（<span class="mono">major + criterion</span> 才阻塞）+ reviews 留痕 + 解析失败不改三态</td><td><span class="tag t-ok">PASS</span></td></tr>
+      <tr><td>P3</td><td class="mono">A23 / A24</td><td>快车道<b>承认落库</b>（幂等 · <span class="mono">batch_id</span> 同批共享 · ESCALATED/REJECTED 不可翻白 · <span class="mono">acks</span> 三种坏形状 rc=2） · 三判据 + <span class="mono">no_diff_source</span> 不许默认真（R-35）</td><td><span class="tag t-ok">PASS</span></td></tr>
+      <tr><td>P3</td><td class="mono">A25 / A26</td><td>沉淀闸门全量（门槛 0.80 · 隔离区 · 后续轮次才转正 · 抽检留痕 + 回避模式） · 负知识回灌只取本轮+上一轮（R-28）且 SQLite/PG <span class="mono">package_hash</span> 一致</td><td><span class="tag t-ok">PASS</span></td></tr>
+      <tr><td>P3</td><td class="mono">A27 / A0</td><td>RAG：本地回退稳定命中（<span class="mono">provider=local</span>）· 显式 <span class="mono">--provider dify</span> 缺凭据 rc=4 · 无 key 明文；A0 = P0/P1/P2 不回归 + <span class="mono">pytest</span> rc=0 + 覆盖率门槛</td><td><span class="tag t-ok">PASS</span></td></tr>
     </tbody>
   </table>
 
@@ -351,12 +357,12 @@
   </table>
   <h3>配套</h3>
   <div class="chips">
-    <span class="chip">tests <b>13 文件 / 194 passed</b></span>
-    <span class="chip">scripts <b>4 个（verify_p0 / verify_p1 / verify_p2 / selfcheck_core）</b></span>
-    <span class="chip">benchmarks <b>5 个桩（R-30 交接物）</b></span>
-    <span class="chip">migrations <b>1（PG DDL）</b></span>
+    <span class="chip">tests <b>18 文件 / 342 passed</b></span>
+    <span class="chip">scripts <b>5 个（verify_p0 / verify_p1 / verify_p2 / verify_p3 / selfcheck_core）</b></span>
+    <span class="chip">benchmarks <b>桩与自查（R-30 交接物）</b></span>
+    <span class="chip">migrations <b>3（PG DDL）</b></span>
     <span class="chip">examples <b>3</b></span>
-    <span class="chip">docs <b>9（D1 / D2 / D3 / 验收报告）</b></span>
+    <span class="chip">docs <b>D1–D5 + P0–P3 验收报告</b></span>
   </div>
 
   <h2>工程护栏（今天实战踩出来的）</h2>
@@ -371,6 +377,8 @@
     <div class="card"><h4>R-31 / R-32 退出码与门槛口径</h4><p>rc 三分：未知值 <b>2</b>（argparse 原生，不劫持）· 合法但缺依赖/凭据 <b>4</b> · I/O 与 DB <b>5</b>；覆盖率门槛只算<b>纯逻辑白名单</b>（D4 §3.5），<span class="mono">store/postgres.py</span> 排除、只作 A20b 报告项。</p></div>
     <div class="card"><h4>子进程覆盖盲区</h4><p>台架走 <span class="mono">subprocess</span> 跑 CLI 时子进程覆盖不计入父进程 <span class="mono">--cov</span>（<span class="mono">cli.py</span> 曾长期显示 0%）→ 覆盖率用例必须 in-process 调 <span class="mono">cli.main()</span>。</p></div>
     <div class="card"><h4>合并顺序</h4><p>PR 基点落后于最新 main 时，squash 合并会在 main 上产生「新实现 + 旧期望」的假绿真红（P2 #49 撞过一次）→ 合前先 rebase，合后跑全量台架。</p></div>
+    <div class="card"><h4>R-33 ~ R-36 契约与判定口径</h4><p>沉淀门槛 0.80（0.6 是笔误）· <span class="mono">kfpa.fastlane</span> 是 <span class="mono">fastlane</span> 组唯一 owner · 「无 diff 来源」不许默认真（<span class="mono">no_diff_source</span>）· A27 的 rc 三态（<span class="mono">auto</span>/<span class="mono">local</span> 回退 rc=0，显式 <span class="mono">--provider dify</span> 缺凭据 rc=4）。</p></div>
+    <div class="card"><h4>R-37 / R-38 终验纪律</h4><p>终验必须<b>独占 PG</b>（A12/A26 共用库，并发跑会读串 → 假红；报红先 <span class="mono">--only</span> 复跑再定论）；台架<b>不许依赖 gitignored 的运行时状态</b>（<span class="mono">runs/**</span> 是产品行为，探针钉自己的空 <span class="mono">--workdir</span>），且隔离与「接链」要一起断。</p></div>
   </div>
 
   <h2>未完成与已知债务</h2>
@@ -378,10 +386,10 @@
     <thead><tr><th>项</th><th>现状</th><th>影响</th><th>计划</th></tr></thead>
     <tbody>
       <tr><td>评审位同源盲区</td><td><span class="tag t-ok">已收口（P2）</span>异构 REVIEWER 接进主循环，24 样本度量：异构漏检 0 vs 同源 12</td><td>裁判不再与运动员同权重</td><td>换 provider 只用改 <span class="mono">config/models.yaml</span> 一行</td></tr>
-      <tr><td>快车道承认落库</td><td>P1 只做预览（R-23.1）</td><td>承认动作不留痕</td><td>P3 新表 + schema_version 递增</td></tr>
-      <tr><td>知识库 RAG</td><td>EMBEDDING 角色占位，Dify 未接</td><td>设计与转译无法检索历史知识</td><td>P3 / 独立排期</td></tr>
-      <tr><td>覆盖率债务</td><td><span class="tag t-ok">已收口（P2）</span>R-32 纯逻辑白名单 90.7%（1605/1770，门槛 80%）；<span class="mono">store/postgres.py</span> 0/196 已按 R-32 排除出门槛，只作 A20b 报告项</td><td>回归漏网风险下降</td><td>PG 覆盖由 A12 双库对拍承担</td></tr>
-      <tr><td>真实适配器</td><td>LiteLLM（需 key）/ Aider / Dify 均未在真机跑通</td><td>P0–P2 验收走 mock</td><td>接入 key 后逐项验证</td></tr>
+      <tr><td>快车道承认落库</td><td><span class="tag t-ok">已收口（P3）</span><span class="mono">fastlane_requests</span> 攒批承认 + 审计留痕（<span class="mono">batch_id</span>/<span class="mono">decided_by</span>/<span class="mono">decided_at</span>），幂等且不可翻案</td><td>承认动作全程留痕</td><td>真执行器接入后跑「Flash 直跑」</td></tr>
+      <tr><td>知识库 RAG</td><td><span class="tag t-ok">已收口（P3）</span>本地回退检索可用（离线、稳定排序）；Dify 适配器接线完成、未真调</td><td>设计轮次已能检索历史知识（回退路径）</td><td>用户给 Dify 地址与 key 后真调一次</td></tr>
+      <tr><td>覆盖率债务</td><td><span class="tag t-ok">已收口（P2/P3）</span>R-32 纯逻辑白名单 96.3%（1823/1893，门槛 80%）；P3 新模块 <span class="mono">fastlane.py</span> 83.3% · <span class="mono">knowledge.py</span> 84.5%；<span class="mono">store/postgres.py</span> 非门槛</td><td>回归漏网风险下降</td><td>PG 覆盖由 A12/A26 双库对拍承担</td></tr>
+      <tr><td>真实适配器</td><td>LiteLLM（需 key）/ Aider / Dify 均未在真机跑通</td><td>P0–P3 验收走 mock</td><td>接入 key 后逐项验证</td></tr>
       <tr><td>Streamlit 台账</td><td>headless 冒烟通过，不列入验收</td><td>页面交互无自动断言</td><td>可选增强</td></tr>
     </tbody>
   </table>
@@ -400,16 +408,20 @@ docker compose -f docker-compose.pg.yml up -d --wait
 $env:KFPA_DB_URL="postgresql://kfpa:kfpa@127.0.0.1:55440/kfpa"
 python -m kfpa init; python -m kfpa round --design examples/design-r1.md --round 2 --dry-run
 
-# 三套台架
+# 四套台架（终验必须独占 PG，见 R-37）
 python scripts/verify_p0.py      # 13/13
 python scripts/verify_p1.py      # 8/8（A12 需 Docker）
 python scripts/verify_p2.py      # 6/6（A18–A22；A20 先要求 pytest 全绿）
-python scripts/verify_p2.py --coverage-out cov.json   # A20 合并覆盖率报告，供 G7 复用
+python scripts/verify_p3.py --coverage-out cov.json   # 6/6（A0 + A23–A27）
 python scripts/selfcheck_core.py # FAILED: 无
-python -m pytest tests -q        # 194 passed</pre>
+python -m pytest tests -q        # 342 passed
+
+# P3 收口后的两条新命令
+python -m kfpa fastlane plan --round 1 --files src/kfpa/x.py --db kfpa.db
+python -m kfpa rag search "回灌范围" --db kfpa.db --json</pre>
 
   <div class="foot">
-    数据来源：仓库 main <span class="mono">eca4837</span> 实测 · 设计文档 <span class="mono">docs/design.md</span> · 施工图 <span class="mono">docs/dev/p0-plan.md</span> · 补充件 <span class="mono">docs/dev/p0-design-addendum.md</span>（D1）· 裁决 <span class="mono">docs/dev/p0-rulings.md</span>（D2 v2.5，R-1–R-32）· P1 契约 <span class="mono">docs/dev/p1-plan.md</span>（D3）· P2 契约 <span class="mono">docs/dev/p2-plan.md</span>（D4）· 验收报告 <span class="mono">docs/acceptance/p0-acceptance.md</span> / <span class="mono">p1-acceptance.md</span> / <span class="mono">p2-acceptance.md</span>
+    数据来源：仓库 main <span class="mono">358ad46</span> 实测 · 设计文档 <span class="mono">docs/design.md</span> · 施工图 <span class="mono">docs/dev/p0-plan.md</span> · 补充件 <span class="mono">docs/dev/p0-design-addendum.md</span>（D1）· 裁决 <span class="mono">docs/dev/p0-rulings.md</span>（D2 v3.3，R-1–R-38）· P1 契约 <span class="mono">docs/dev/p1-plan.md</span>（D3）· P2 契约 <span class="mono">docs/dev/p2-plan.md</span>（D4）· P3 契约 <span class="mono">docs/dev/p3-plan.md</span>（D5，契约 1.4 / schema 4）· 验收报告 <span class="mono">docs/acceptance/</span> p0 / p1 / p2 / p3
   </div>
 </div>
 </body>
