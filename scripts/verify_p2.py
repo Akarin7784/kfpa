@@ -634,24 +634,28 @@ def check_a21(ctx: Ctx, c: Check) -> None:
             if bad:
                 c.fail("A21：`samples` 里存在缺 `missed`/`false_alarm` 布尔（或写成非布尔）的条目 —— "
                        "D4 §3.4 要求逐条给出，渲染层不得自行推断。")
-            c.add(ok=len(samples) == int(metrics.get("total") or -1),
+            def _num(key):
+                v = metrics.get(key)
+                return int(v) if isinstance(v, (int, float)) else None
+
+            n_total, n_missed, n_fa = _num("total"), _num("missed"), _num("false_alarms")
+            c.add(ok=len(samples) == n_total,
                   note=f"len(samples) = {len(samples)} vs metrics.total = {metrics.get('total')}")
-            if isinstance(samples, list) and metrics.get("total") is not None \
-                    and len(samples) != int(metrics.get("total") or -1):
+            if n_total is not None and len(samples) != n_total:
                 c.fail("A21：`samples` 条数与 `metrics.total` 不一致。")
-            # 可复算：指标必须与逐样本明细自洽
+            # 可复算：指标必须与逐样本明细自洽（注意 0 是合法值，不能用 `or` 兜底）
             if samples and all(isinstance(s.get("missed"), bool) for s in samples):
                 sum_missed = sum(1 for s in samples if s.get("missed"))
                 sum_fa = sum(1 for s in samples if s.get("false_alarm"))
-                c.add(ok=sum_missed == int(metrics.get("missed") or -1),
+                c.add(ok=sum_missed == n_missed,
                       note=f"复算漏检：samples 求和 {sum_missed} vs metrics.missed "
                            f"{metrics.get('missed')}")
-                if sum_missed != int(metrics.get("missed") or -1):
+                if sum_missed != n_missed:
                     c.fail("A21：`metrics.missed` 与逐样本 `missed` 求和不一致（不可复算）。")
-                c.add(ok=sum_fa == int(metrics.get("false_alarms") or -1),
+                c.add(ok=sum_fa == n_fa,
                       note=f"复算误报：samples 求和 {sum_fa} vs metrics.false_alarms "
                            f"{metrics.get('false_alarms')}")
-                if sum_fa != int(metrics.get("false_alarms") or -1):
+                if sum_fa != n_fa:
                     c.fail("A21：`metrics.false_alarms` 与逐样本 `false_alarm` 求和不一致。")
             c.warn("A21：「缺 baseline_* 判无法判定」是渲染层（interface 侧 ui/eval_page.py）的口径，"
                    "台架只保证生产端 `metrics` 永远带 baseline_* 字段。")
