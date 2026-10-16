@@ -442,13 +442,24 @@ def _tagged(rid: str) -> str:
 
 
 def _cleanup(store) -> None:
-    """只删本进程前缀的行（**独立改写**：实现方桩原先全表 DELETE，会清掉共享库别人的行）。"""
+    """只删本进程前缀的行（**独立改写**：实现方桩原先全表 DELETE，会清掉共享库别人的行）。
+
+    占位符两套都试：SQLite 用 `?`、psycopg 用 `%s`。**两套都失败就抛**，不许静默 ——
+    第一版这里写了 `except: pass`，结果 PG 上残留 12+6 行而「清理成功」是假的（自己抓的）。
+    """
+    last: Exception | None = None
     for table, key in (("fastlane_requests", "request_id"), ("knowledge_samples", "cid")):
-        try:
-            store._conn.execute(f"DELETE FROM {table} WHERE {key} LIKE ?", (f"{PG_TAG}-%",))
-            store._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        done = False
+        for ph in ("%s", "?"):
+            try:
+                store._conn.execute(f"DELETE FROM {table} WHERE {key} LIKE {ph}", (f"{PG_TAG}-%",))
+                store._conn.commit()
+                done = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+        if not done:
+            raise AssertionError(f"PG 清理失败（{table}）：{type(last).__name__}: {last}")
 
 
 def test_pg_driver_same_signature_and_same_semantics():
