@@ -138,9 +138,15 @@ def run_round(round_no: int, design_text: str, design_ref: str, *,
 def generate_tickets(round_no: int, design_text: str, llm: LLM) -> list[QATicket]: ...
 def build_task_package(round_no: int, design_text: str, tickets: list[QATicket],
                        llm: LLM, avoid_patterns: list[str]) -> TaskPackage: ...
-def build_graph(store, llm, executor, ...):   # LangGraph StateGraph（见 D1-12）
-    ...
+class RoundGraphState(TypedDict, total=False): ...   # 冻结的 state 契约，见 D2 R-14
+GRAPH_NODES = ("gen_tickets", "guard_tickets", "build_package", "execute", "gate", "finalize")
+def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
+                dry_run=True, injection="none", checkpointer=None): ...
 ```
+
+- 图的入参 / 终止态 / 节点与边**按 D2 R-14 冻结**：`invoke` 最少给 `round_no/design_text/design_ref`，
+  终止态必须含 `state/tickets/task_package/exec_result/gate/snapshot/message`。
+- 放行判据按 D2 R-13：**只有未关闭 HIGH 阻塞**，MEDIUM/LOW 走攒批、不阻塞出包。
 
 - 编排用 LangGraph；**业务判定只能来自纯函数**（约束见 D1-12），图节点不许内嵌判据。
 - 硬规则：`store.list_open_high_tickets(round_no)` 非空时，`build_task_package` 必须拒绝
@@ -201,7 +207,7 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 
 - `kfpa init [--db PATH]`：建库建表
 - `kfpa round --design <file> --round N [--dry-run] [--db PATH] [--workdir PATH]
-  [--provider mock|litellm] [--inject none|apply_fail|test_fail] [--max-attempts 3] [--json]`
+  [--provider mock|litellm] [--inject none|apply_fail|test_fail|high_ticket] [--max-attempts 3] [--json]`
 - `kfpa gate --round N [--db PATH]`：对已有轮次重跑门禁判定
 - `kfpa history [--db PATH]`：按轮列出 `round_no | state | package_hash | gate_state | tag`
 - `kfpa rollback <round> [--apply] [--repo PATH]`：默认只打印，`--apply` 才执行（见 D1-6）
@@ -215,12 +221,16 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 |---|---|---|
 | A1 | CLI 可用：`python -m kfpa --help` 退出码 0，含 `init/round/tickets/history`，退出码表可见 | `python -m kfpa --help` |
 | A2 | **离线端到端**：dry-run 跑完整轮，質問票 ≥1 张且票面五要素齐全、任务包六段齐全、执行结果有 `results`、门禁有态、六表有记录 | `python -m kfpa init --db t.db` && `python -m kfpa round --design examples/design-r1.md --round 1 --dry-run --db t.db` |
-| A3 | 硬规则：存在未关闭高影响票时**不得**生成任务包 → 退出码 3 + 中文错误；关闭后可继续 | 构造 HIGH 票后跑 round；再 `tickets close` 后重跑 |
+| A3 | 硬规则（仅 HIGH 阻塞，见 R-13）：有未关闭 HIGH 票 → 不出任务包、**退出码 3** + 中文错误；`tickets close` 后重跑同轮正常出包 | `... round --inject high_ticket --round 1 --dry-run --db t.db` → 3；再 `kfpa tickets close R1-001 --answer "采用A"` → 重跑 |
 | A4 | 三态闭环：`--inject test_fail` → `NEEDS_FIX` 且第 2 次任务包 `feedback` 段带上次 `AVOID[...]`；同类第 2 次 → `BLOCKED` + `escalated=True` | `... round --inject test_fail --round 2 ...` |
 | A5 | 模型绑定铁律：`src/` 业务代码内不出现模型字符串（`deepseek`/`gpt`/`claude`/`qwen`/`bge`），仅 `llm.py` 适配器与 config 白名单 | `grep -riE "deepseek\|gpt-\|claude\|qwen\|bge" src --include=*.py` |
 | A6 | 快照可查：PASS 轮落 `snapshots` 表 + `kfpa history` 可列出 | `python -m kfpa history --db t.db` |
 | A7 | 質問票台账可读写：`tickets list` 列全（含影响面/状态）；`tickets close`、`batch-close` 关闭入库，未知票号整体拒绝 | `python -m kfpa tickets list --db t.db` |
-| A8 | LangGraph 图可编译并可跑（D1-12 约束 3）：`build_graph()` 冒烟跑一次 dry-run 得 PASS | `python -m pytest tests/test_graph_smoke.py` |
+| A8 | LangGraph 图可编译并可跑（D1-12 / R-14 冻结契约）：`build_graph(**deps)` 可编译；`invoke({"round_no","design_text","design_ref"})` 返回 dict，`round_no==1`、`tickets` 非空、`task_package is not None`、`gate.state=="pass"`（不断言 snapshot） | `python -m pytest tests/test_graph_smoke.py` |
+| A9 | litellm 异常包装（R-7）：适配器把调用异常统一包成中文 `RuntimeError`，消息含 `--provider mock`；不裸抛底层异常 | `python -m pytest tests/test_llm_adapter.py` |
+
+> **A5 的旧命令作废**：表中 A5 那行示例 grep 会误杀适配器 `llm.py`，**以 D2 R-11 的两条命令为准**
+> （A5.1 业务代码排除 `llm.py` 后零命中；A5.2 `llm.py` 自身零字面量模型串），白名单只有一个文件。
 
 验证要求：
 - **不得**依赖网络、API key、aider/streamlit 安装（langgraph/jinja2/pyyaml/pytest 已装）。
@@ -230,7 +240,7 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 ## 5. PR 与合并
 
 1. 各自分支推 PR，标题 `p0/<模块>: <一句话>`，描述含：改了什么 / 怎么验 / 已知未做。
-2. 镜鉴在 PR 评论给出 A1–A8 中与本次改动相关的结论（通过/不通过 + 证据）。
+2. 镜鉴在 PR 评论给出 A1–A9 中与本次改动相关的结论（通过/不通过 + 证据）。
 3. Chief 复核 diff 后合并（无阻塞即合）；合并后由镜鉴对 main 再跑一次端到端。
 4. 出现接口冲突：先群里说，Chief 改契约并升 `CONTRACT_VERSION`，不要各自就地改。
 
@@ -240,3 +250,4 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 |---|---|---|---|
 | 1.0 | 2026-10-16 | 首版冻结：模块布局、接口、验收 A1–A7、分工 | Chief |
 | 1.1 | 2026-10-16 | 契约升 1.1（ExecResult/GateReport 补字段）；补 D1 补充件指引；编排定为 LangGraph；退出码表；A4 注入式验收；新增 A8 图冒烟；依赖清单落文 | Chief |
+| 1.2 | 2026-10-16 | 依 D2 收敛：A3 改 `--inject high_ticket`（退出码 3）· A5 作废旧命令、以 R-11 为准 · A8 改按 R-14 冻结的 state 契约断言 · 新增 A9 异常包装 · §3.4 补图契约 · §5 覆盖 A1–A9 | Chief |

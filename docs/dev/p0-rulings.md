@@ -135,6 +135,65 @@
 - `batch-close` 的文件格式**不是未定义**：见 `p0-design-addendum.md` **D1-8**
   （YAML/JSON 的 `票号 -> 结论` 映射；界面额外接受列表形状，属宽松扩展，不冲突）。
 
+## R-13 放行判据：只有 HIGH 阻塞，MEDIUM/LOW 不阻塞
+
+- 明确「存在未关闭高影响票不得生成任务包」的**边界**：阻塞条件只有 `impact=HIGH 且 status=open`。
+- MEDIUM / LOW 未关闭**不阻塞**出包（走 D1-1 攒批确认，保护人的确认带宽），票面照常入台账；
+  任务包不因未关闭的中低票判缺段。
+- 放行时 `rounds.state → RELEASED`；被拦停时（有未关闭 HIGH）`→ TICKETS_OPEN`，CLI 退出码 3。
+- 依据：design.md §4 硬规则写的是「未关闭的**高影响**質問票」，不得扩大解释。
+
+## R-14 LangGraph state 契约与 `build_graph()` 签名（冻结，回应 D1-12 未定义）
+
+```python
+# src/kfpa/pipeline.py（长流）
+class RoundGraphState(TypedDict, total=False):
+    # 入参（invoke 时必须给全）
+    round_no: int
+    design_text: str
+    design_ref: str
+    # 图内逐步填充
+    state: RoundState
+    tickets: list[QATicket]
+    open_high: list[str]
+    task_package: TaskPackage | None
+    exec_result: ExecResult | None
+    gate: GateReport | None
+    snapshot: Snapshot | None
+    attempt: int
+    avoid_patterns: list[str]
+    message: str
+
+GRAPH_NODES = ("gen_tickets", "guard_tickets", "build_package", "execute", "gate", "finalize")
+
+def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
+                dry_run=True, injection="none", checkpointer=None): ...
+```
+
+- `invoke` 入参**最少**给 `{"round_no", "design_text", "design_ref"}` 三键，其余由图内节点填充。
+- **终止态必须含**：`state / tickets / task_package / exec_result / gate / snapshot / message`（类型同 `RoundResult` 字段）。
+- 边：`gen_tickets → guard_tickets`；若有未关闭 HIGH → 直接 `finalize`（`state=TICKETS_OPEN`，退出码 3），
+  否则 `build_package → execute → gate`；`gate` 判 NEEDS_FIX 且 `attempt < max_attempts` → 带 `avoid_patterns` 回 `execute`；
+  `PASS` / `BLOCKED` → `finalize`。
+- `run_round()` 是 `build_graph(...).invoke(init)` 的薄包装（返回 `RoundResult`），业务判据仍在纯函数里。
+- **A8 断言（环境无关）**：图可编译；`invoke` 返回 dict 且 `round_no == 1`、`tickets` 非空、
+  `task_package is not None`、`gate.state == "pass"`。**不断言 `snapshot`**（依赖 git 标签环境）。
+
+## R-15 界面两个小口径 + R-8 兼容 shim 处置
+
+- 单张 `kfpa tickets close` 遇已关闭票 → **幂等忽略 + 退出码 0** + 打印原因（与 R-9 一致）。
+- `kfpa tickets batch-close --file` 的**文件不存在** → 退出码 **4**（同「设计文件不存在」）。
+- 界面为等 R-8 写的**兼容 shim 允许在本分支暂存，但合并进 main 前必须删除**：
+  磐石 PR #3 带上 `impact` 参数后，界面 rebase → 去 shim → 复跑自测（43/43 + 集成 8/8）再合。
+
+## R-16 集成预演纪律：预演不上推 main
+
+- 四条分支合并做全链预演，只允许在**本地临时分支或临时工作树**里进行，
+  **禁止 `git push` 到 `origin/main`**（未评审的代码不得进主干）。
+- 正式合入顺序由 Chief 按 PR 走：`#3 core（含 R-8）→ pipeline → #4 ui → #6 verify`；
+  每合一个，镜鉴在 main 上复跑 A1–A9。
+- 预演发现冲突/接口不一致 → 群里报，不许自行改 main 或别人的分支。
+
 ---
 
 ## 变更记录
@@ -144,3 +203,4 @@
 | 1.0 | 2026-10-16 | R-1 退出码 · R-2 运行方式 · R-3 Mock 剧本 · R-4 失败计数 · R-5 REVIEWER · R-6 票号 · R-7 异常包装与 A9 | Chief |
 | 1.1 | 2026-10-16 | R-3 补 `ticket_id` 去重口径 · R-8 `--impact` 下推 Store · R-9 batch-close 退出码（禁用 1） | Chief |
 | 1.2 | 2026-10-16 | R-10 A2/A3 不互斥 + `--inject high_ticket` · R-11 A5 白名单与两条验收命令 · R-12 main 基线核对与 rebase 要求 | Chief |
+| 1.3 | 2026-10-16 | R-13 放行判据（仅 HIGH 阻塞）· R-14 LangGraph state 契约与 `build_graph()` 签名 · R-15 界面小口径与 shim 处置 · R-16 集成预演纪律 | Chief |
