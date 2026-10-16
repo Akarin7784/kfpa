@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -607,6 +608,23 @@ def _r34_acks_schema(ctx: Ctx, c: Check, db: Path) -> None:
             c.fail(f"R-34：acks.yaml「{label}」抛裸栈（应中文 + rc=2）。")
 
 
+def _isolated_plan_workdir(ctx: Ctx, name: str) -> str:
+    """给 `fastlane plan` 一个**空**工作目录（R-38：别让共享树里的 `runs/` 污染来源①）。
+
+    `impact.files_from_workdir()` 在 `--workdir` 缺省时读 **cwd** 下的
+    `runs/round-{n}/files_changed.json`；而 `runs/` 是 gitignored 的**运行时残留**
+    （任何一次 `round --dry-run` 都会往共享工作树里落盘）。于是「不给 `--files`
+    必然 `no_diff_source`」这个前提在跑过 P2 的机器上不成立 —— 来源①（执行器产出）
+    先命中，状态变 `pending`，A23 那条 `escalated` 断言规律性假红。
+    探针钉在自己的空目录上，结论才与「谁的机器里有没有 `runs/`」无关。
+    """
+    work = ctx.tmp / name
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    return str(work)
+
+
 def check_a23(ctx: Ctx, c: Check) -> None:
     """A23：快车道登记 → 承认落库；幂等；batch_id 同批共享；ESCALATED/REJECTED 不可翻白。"""
     _r34_fastlane_owner(ctx, c)
@@ -620,10 +638,37 @@ def check_a23(ctx: Ctx, c: Check) -> None:
 
     # R-23 diff 来源三优先级：**不给 `--files` → `no_diff_source` → ESCALATED**，
     # 只有带 `--files`（第二来源）才登记出可承认的 PENDING；先各造一条，两个语义都验。
-    plan_esc = ctx.cli("fastlane", "plan", "--round", "2", db=db)
+    #
+    # R-38：来源① 读的是 **cwd** 下 `runs/round-{n}/files_changed.json`（gitignored 运行时残留），
+    # 共享树里跑过一次 P2 就有它 —— 所以 `plan` 一律喂**空** `--workdir`。
+    # 还要先正向验一遍来源① **仍接得上**：否则「空目录 → escalated」可能只是来源① 断了，
+    # 而那种断法会被下面「带 `--files` 得到 pending」这条盖住、谁也发现不了。
+    work = _isolated_plan_workdir(ctx, "a23-plan-work")
+    src1 = ctx.tmp / "a23-plan-source1"
+    src1.mkdir(parents=True, exist_ok=True)
+    (src1 / "files_changed.json").write_text(
+        json.dumps({"files_changed": ["src/kfpa/gates.py"]}), encoding="utf-8")
+    ambient = ctx.root / "runs" / "round-2" / "files_changed.json"
+    c.add(ok=True, note=f"A23：探针隔离 —— `plan` 一律带空 `--workdir`；本机默认位置 "
+                        f"`runs/round-2/files_changed.json` = "
+                        f"{'存在（已被隔离，不再左右结论）' if ambient.is_file() else '不存在'}")
+    before_ids = {r["request_id"] for r in _fastlane_rows(db)}
+    plan_src1 = ctx.cli("fastlane", "plan", "--round", "2", "--workdir", str(src1), db=db)
+    new_src1 = [r for r in _fastlane_rows(db) if r["request_id"] not in before_ids]
+    src1_ok = (plan_src1["rc"] == EXIT_PASS and len(new_src1) == 1
+               and str(new_src1[0].get("status")) == "pending")
+    c.add(cmd=plan_src1["cmd"], rc=plan_src1["rc"], stdout=plan_src1["stdout"],
+          stderr=plan_src1["stderr"], ok=src1_ok,
+          note=f"A23：来源①（R-23.2 优先级①）正向 —— `--workdir` 里放 `files_changed.json` → "
+               f"{[str(r.get('status')) for r in new_src1]}（必须 pending）")
+    if not src1_ok:
+        c.fail("A23：`--workdir` 里的执行器产出没被来源① 采纳（R-23.2 优先级① 断链）——"
+               " 那样「空 workdir → escalated」就不成立，必须先修来源①。")
+    plan_esc = ctx.cli("fastlane", "plan", "--round", "2", "--workdir", work, db=db)
     c.add(cmd=plan_esc["cmd"], rc=plan_esc["rc"], stdout=plan_esc["stdout"], stderr=plan_esc["stderr"],
-          note="A23：`fastlane plan --round 2`（不给 `--files`，R-23 第三来源）")
-    plan = ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py", db=db)
+          note="A23：`fastlane plan --round 2 --workdir <空>`（不给 `--files`，R-23 第三来源）")
+    plan = ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py",
+                   "--workdir", work, db=db)
     c.add(cmd=plan["cmd"], rc=plan["rc"], stdout=plan["stdout"], stderr=plan["stderr"],
           ok=plan["rc"] == EXIT_PASS, note="A23：`fastlane plan --round 1 --files …` 登记（第二来源）")
     if plan["rc"] != EXIT_PASS:
@@ -656,7 +701,8 @@ def check_a23(ctx: Ctx, c: Check) -> None:
     # 免得「坏形状被静默接受」时顺手改掉主库状态、把后面的幂等/留痕断言带红。
     schema_db = _fastlane_db(ctx, c, "a23-acks")
     if schema_db is not None:
-        ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py", db=schema_db)
+        ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py",
+                "--workdir", work, db=schema_db)
         _r34_acks_schema(ctx, c, schema_db)
         # 坏形状若被静默接受，主库状态会漂；这里独立记一条「有没有被改」
         rows_before = len(_fastlane_rows(schema_db))
@@ -692,7 +738,8 @@ def check_a23(ctx: Ctx, c: Check) -> None:
         c.fail("A23：重复承认不幂等（写了新行或覆盖了首次 decided_by/decided_at）。")
 
     # 攒批承认：同批共享 batch_id（R-34 冻结形状 `acks: [{request_id, note?}]`）
-    ctx.cli("fastlane", "plan", "--round", "3", "--files", "src/kfpa/gates.py", db=db)
+    ctx.cli("fastlane", "plan", "--round", "3", "--files", "src/kfpa/gates.py",
+            "--workdir", work, db=db)
     pending = [r for r in _fastlane_rows(db) if str(r.get("status")) == "pending"]
     acks = ctx.tmp / "acks.yaml"
     acks.write_text("acks:\n"
