@@ -12,11 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from kfpa import eval as E
-from kfpa import review as R
-from kfpa import schemas as sc
-from kfpa.eval import EvalError
-from kfpa.review import ReviewError
+# P2 的 review.py / eval.py 由 `p2/review` 分支交付；按合并顺序 verify 最后，
+# 但在「只有 verify 分支」的树上必须**跳过而不是 collection error**（否则会打断整轮 pytest）。
+pytest.importorskip("kfpa.review", reason="P2 的 review.py 未交付（p2/review 分支）")
+pytest.importorskip("kfpa.eval", reason="P2 的 eval.py 未交付（p2/review 分支）")
+
+from kfpa import eval as E  # noqa: E402
+from kfpa import review as R  # noqa: E402
+from kfpa import schemas as sc  # noqa: E402
+from kfpa.eval import EvalError  # noqa: E402
+from kfpa.review import ReviewError  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 SEED = REPO / "benchmarks/review/seed.jsonl"
