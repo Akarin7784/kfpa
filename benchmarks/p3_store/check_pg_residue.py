@@ -70,17 +70,34 @@ def _with_timeout(dsn: str) -> str:
     return f"{dsn} connect_timeout={CONNECT_TIMEOUT_S}"
 
 
-def _dsn(port: str) -> str:
-    """解析目标 DSN：`KFPA_DB_URL` 优先，否则按端口拼默认。"""
-    return os.environ.get(DB_URL_ENV) or f"postgresql://kfpa:kfpa@127.0.0.1:{port}/kfpa"
+def resolve_dsn(env_url: str, explicit_port: str | None, env_port: str) -> tuple[str, str]:
+    """解析目标 DSN，返回 `(dsn, 冲突提醒或空串)`。
+
+    优先级按 **R-25.1**（与 `make_store()` 同一口径）：**显式 `--port` > `KFPA_DB_URL` > `KFPA_PG_PORT` > 55440**。
+
+    先前的实现让 `KFPA_DB_URL` 压过显式 `--port`，与 R-25.1 相反（镜鉴实测：`--port 55440` + env 指 55999
+    → 仍连 55999）。现在显式端口优先；若 env 与显式端口**指向不同实例**，额外返回一行中文提醒 ——
+    这种「机器上残留的环境变量把结论带歪」正是 R-25.1 要防的机型。
+    """
+    dsn_env = str(env_url or "").strip()
+    if explicit_port:
+        dsn = f"postgresql://kfpa:kfpa@127.0.0.1:{explicit_port}/kfpa"
+        notice = ""
+        if dsn_env and dsn_env != dsn:
+            notice = (f"显式 --port {explicit_port} 优先于环境变量 {DB_URL_ENV}={mask_dsn(dsn_env)}"
+                      "（R-25.1）")
+        return dsn, notice
+    if dsn_env:
+        return dsn_env, ""
+    return f"postgresql://kfpa:kfpa@127.0.0.1:{env_port or '55440'}/kfpa", ""
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="PG 残留自查（R-30 桩收尾卫生）")
     ap.add_argument("--prefix", action="append", default=None,
                     help=f"要查的前缀（可重复；默认 {list(DEFAULT_PREFIXES)}）")
-    ap.add_argument("--port", default=os.environ.get("KFPA_PG_PORT", "55440"),
-                    help="PG 端口（默认 KFPA_PG_PORT 或 55440）")
+    ap.add_argument("--port", default=None,
+                    help="PG 端口（**显式给出时优先于 KFPA_DB_URL**，R-25.1；未给则看环境变量）")
     ap.add_argument("--all", action="store_true", help="连整表行数一起报（仅上下文，看不出归属）")
     ap.add_argument("--allow-skip", action="store_true",
                     help="PG 不可达时 rc=0 + 说明（clean env 用；默认 rc=4）")
@@ -91,7 +108,10 @@ def main(argv: list[str] | None = None) -> int:
         print("[residue] 用法错误：--prefix 不许为空", file=sys.stderr)
         return 2
 
-    dsn = _dsn(args.port)
+    dsn, notice = resolve_dsn(os.environ.get(DB_URL_ENV, ""), args.port,
+                              os.environ.get("KFPA_PG_PORT", "55440"))
+    if notice:
+        print(f"[residue] 提醒：{notice}", file=sys.stderr)
     # 门禁：本工具的对象**必须是 PG**。否则（典型是机器上残留的 `KFPA_DB_URL=sqlite://…`）
     # 会连到一个新建的空 sqlite 并宣布「无残留」—— 那是撒谎的结论（R-25.1 的机型）。
     if not is_postgres_dsn(dsn):
