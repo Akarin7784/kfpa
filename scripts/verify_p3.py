@@ -760,6 +760,44 @@ def check_a24(ctx: Ctx, c: Check) -> None:
             c.fail(f"A24：缺冻结出口 `{name}(...)`（D5 §3.2 / R-33）；"
                    f"当前模块顶层有 {sorted(n for n in vars(mod) if not n.startswith('_'))[:12]}…")
 
+    # R-35 反向断言：**空 `diff_files` 不许进 PENDING**（模块级 `plan()` 侧，与 A23 的 CLI 侧互为双保险）
+    plan_db = _fastlane_db(ctx, c, "a24-plan")
+    if plan_db is not None:
+        st_mod, _se = import_mod("kfpa.store")
+        store_obj = None
+        if st_mod is not None:
+            try:
+                store_obj = st_mod.make_store(str(plan_db))
+            except Exception as exc:  # noqa: BLE001
+                c.add(ok=False, note=f"A24：make_store 失败：{type(exc).__name__}: {exc}")
+        plan_fn = getattr(mod, "plan", None)
+        if store_obj is not None and callable(plan_fn):
+            planned, perr = None, None
+            for call in (lambda: plan_fn(store_obj, 1, diff_files=[]),
+                         lambda: plan_fn(store_obj, 1)):
+                try:
+                    planned, perr = call(), None
+                    break
+                except TypeError as exc:
+                    perr = exc
+                except Exception as exc:  # noqa: BLE001
+                    perr = exc
+                    break
+            if planned is None:
+                c.add(ok=False,
+                      note=f"A24：`fastlane.plan()` 调不动（{type(perr).__name__ if perr else '?'}: {perr}）")
+                c.fail("A24：R-35 反向断言调不动 `fastlane.plan(store, round_no, …)`。")
+            else:
+                got_status = str(getattr(getattr(planned, "status", ""), "value",
+                                         getattr(planned, "status", "")))
+                c.add(ok=got_status == "escalated",
+                      note=f"A24：空 `diff_files` 走 `plan()` → status={got_status!r}"
+                           "（R-35：必须 ESCALATED，不许进 PENDING）")
+                if got_status != "escalated":
+                    c.fail(f"A24：空 `diff_files` 的 `plan()` 状态是 {got_status!r}"
+                           " —— R-35 要求 ESCALATED（无 diff 依据不许当快车道）。")
+            store_obj.close()
+
     sc, serr = import_mod("kfpa.schemas")
     if sc is None or not hasattr(sc, "FastlaneRequest"):
         c.add(ok=False, note=f"契约缺 FastlaneRequest：{serr}")
