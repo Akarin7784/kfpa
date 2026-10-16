@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
 import sqlite3
 import subprocess
 import sys
@@ -24,7 +25,6 @@ from typing import Any, Callable, Optional
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH
 from .schemas import CONTRACT_VERSION, GateState, RoundState, dumps
-from .store import Store
 
 # ---- D1-5 退出码 ----
 EXIT_PASS = 0
@@ -66,6 +66,26 @@ def default_workdir(round_no: int) -> str:
     return str(Path("runs") / f"round-{round_no}")
 
 
+def _open_store(db_arg: str) -> Any:
+    """打开状态库（口径见 `kfpa.store.make_store`，R-22.1）：
+
+    显式 DSN（`postgresql://…` / `sqlite://…`）> `KFPA_DB_URL` > 显式普通路径 > 默认 `kfpa.db`。
+    当环境变量压过显式普通路径时打一行中文提示——这种覆盖必须看得见，不许静默换库。
+    """
+    from .store import DB_URL_ENV, make_store, mask_dsn
+
+    explicit = str(db_arg or "").strip()
+    env_url = os.environ.get(DB_URL_ENV, "").strip()
+    is_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
+    if explicit and not is_dsn and env_url and explicit != "kfpa.db":
+        print(
+            f"[core] 提示：KFPA_DB_URL 优先于 --db {explicit} → 本次使用 {mask_dsn(env_url)}"
+            "（要强制本地 SQLite 请传 --db sqlite://<path>）",
+            file=sys.stderr,
+        )
+    return make_store(explicit or None)
+
+
 #: D2 R-10：注入件里与执行器相关、需要透传给 run_round 的值
 _EXECUTOR_INJECTIONS = ("apply_fail", "test_fail")
 
@@ -88,14 +108,17 @@ def _exception_exit_code(exc: BaseException) -> int:
 def cmd_init(args: argparse.Namespace) -> int:
     """建库建表（meta + 六张业务表）。"""
     try:
-        store = Store(args.db)
+        store = _open_store(args.db)
         tables = store.list_tables()
         version = store.get_meta("schema_version")
         store.close()
     except (sqlite3.Error, OSError) as exc:
         print(f"[core] 建库失败：{exc} → 检查 --db 路径与写权限", file=sys.stderr)
         return EXIT_IO
-    print(f"已初始化 SQLite 状态库：{args.db}（schema_version={version}）")
+    print(
+        f"已初始化状态库：{getattr(store, 'db_path', args.db)}"
+        f"（驱动 {type(store).__name__}，schema_version={version}）"
+    )
     print(f"表就绪：{' / '.join(tables)}")
     return EXIT_PASS
 
@@ -114,7 +137,7 @@ def cmd_round(args: argparse.Namespace) -> int:
         return EXIT_IO
 
     try:
-        store = Store(args.db)
+        store = _open_store(args.db)
     except (sqlite3.Error, OSError) as exc:
         print(f"[core] 状态库打开失败：{exc} → 检查 --db 路径与写权限", file=sys.stderr)
         return EXIT_IO
@@ -185,12 +208,55 @@ def cmd_round(args: argparse.Namespace) -> int:
             # D2 R-10：只有执行器注入（apply_fail / test_fail）透传给 run_round；
             # high_ticket 已在 build_llm 里作用于 mock 剧本，传给执行器无意义。
             try:
-                if "injection" in inspect.signature(run_round).parameters:
-                    call_kwargs["injection"] = (
-                        args.inject if args.inject in _EXECUTOR_INJECTIONS else "none"
+                params = inspect.signature(run_round).parameters
+            except (TypeError, ValueError):  # pragma: no cover - 不可内省的可调用对象
+                params = {}
+
+            if "injection" in params:
+                call_kwargs["injection"] = (
+                    args.inject if args.inject in _EXECUTOR_INJECTIONS else "none"
+                )
+
+            # D3 R-22.2：checkpoint 库固定 `{workdir}/checkpoints.sqlite`，`--checkpoint-db` 可覆盖；
+            # 由 CLI 显式算路径，保证与工作目录绑定（不依赖 pipeline 的默认值）。
+            if "checkpointer" in params:
+                checkpoint_path = Path(args.checkpoint_db) if args.checkpoint_db else workdir / "checkpoints.sqlite"
+                try:
+                    from .pipeline import make_checkpointer
+
+                    call_kwargs["checkpointer"] = make_checkpointer(checkpoint_path)
+                except RuntimeError as exc:  # 缺 langgraph-checkpoint-sqlite → 退出码 4
+                    print(f"[core] 依赖缺失：{exc}", file=sys.stderr)
+                    return EXIT_DEP_MISSING
+
+            # 账本要拿角色表才能记 model_ref（不编造模型名）
+            if "roles" in params:
+                call_kwargs["roles"] = roles
+
+            # R-22.3：只有显式给报告才启用 G7；没给就跳过、不得判红。
+            coverage = None
+            if args.coverage_json:
+                from .gates import load_coverage_report
+
+                try:
+                    coverage = load_coverage_report(args.coverage_json)
+                except (OSError, ValueError) as exc:
+                    print(
+                        f"[core] 覆盖率报告不可用：{args.coverage_json}：{exc} → "
+                        "用 `pytest --cov=kfpa --cov-report=json` 生成后再传（退出码 4）",
+                        file=sys.stderr,
                     )
-            except (TypeError, ValueError):  # pragma: no cover - 可调用对象的签名不可内省
-                pass
+                    return EXIT_DEP_MISSING
+                for key in ("coverage", "coverage_report"):
+                    if key in params:
+                        call_kwargs[key] = coverage
+                        break
+                else:
+                    print(
+                        "[core] 警告：pipeline.run_round 还没有 coverage 形参，本轮 G7 不会生效"
+                        " → 已在群里点名（R-22.3）；报告仍会解析但不参与判定",
+                        file=sys.stderr,
+                    )
 
             result = run_round(args.round_no, design_text, str(design_path), **call_kwargs)
         except Exception as exc:  # CLI 边界：任何异常都要变成「中文 + 退出码」，不许裸崩
@@ -273,7 +339,7 @@ def _round_exit_code(result: Any) -> int:
 def cmd_gate(args: argparse.Namespace) -> int:
     """查看某轮最新门禁判定；退出码即门禁态（0 PASS / 10 NEEDS_FIX / 11 BLOCKED）。"""
     try:
-        store = Store(args.db)
+        store = _open_store(args.db)
         reports = store.list_gate_reports(args.round_no)
         store.close()
     except (sqlite3.Error, OSError) as exc:
@@ -301,7 +367,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
 def cmd_history(args: argparse.Namespace) -> int:
     """列轮次快照：轮次 / 状态 / package_hash / 门禁态 / 标签（D1-6）。"""
     try:
-        store = Store(args.db)
+        store = _open_store(args.db)
         snapshots = store.list_snapshots()
         rounds = {s.round_no: store.get_round(s.round_no) for s in snapshots}
         store.close()
@@ -327,7 +393,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 def cmd_rollback(args: argparse.Namespace) -> int:
     """D1-6：默认只打印将要执行的命令；`--apply` 才真跑 `git checkout kfpa-r{n}`。"""
     try:
-        store = Store(args.db)
+        store = _open_store(args.db)
         snap = store.get_snapshot(args.round_no)
         store.close()
     except (sqlite3.Error, OSError) as exc:
@@ -369,19 +435,36 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- 解析
 
 
-def _register_tickets(parser: argparse.ArgumentParser, subparsers: Any) -> None:
-    """把界面的 `tickets` 子命令组挂进来（模块缺失时静默跳过）。"""
-    try:
-        from .ui import cli as ui_cli
-    except ImportError:
-        return
-    except Exception as exc:  # 界面模块自身炸了要让用户看见，但不能拖垮主 CLI
-        print(f"[kfpa] 警告：ui 模块装载失败：{exc}", file=sys.stderr)
-        return
-    try:
-        ui_cli.register(subparsers)
-    except Exception as exc:
-        print(f"[kfpa] 警告：tickets 子命令注册失败：{exc}", file=sys.stderr)
+def _register_plugin_commands(subparsers: Any) -> None:
+    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3）：
+    `tickets`（界面）、`ledger` / `knowledge`（长流）、`fastlane`（长流 impact）。
+
+    每个模块导出 `register(subparsers)`；模块缺失时静默跳过（P0 core-only 环境仍可用），
+    模块存在但挂载失败时打警告——**不许让一个坏插件拖垮整个 CLI**。
+    """
+    builtins_list = [
+        ("kfpa.ui.cli", ".ui"),
+        ("kfpa.ledger", ".ledger"),
+        ("kfpa.knowledge", ".knowledge"),
+        ("kfpa.impact", ".impact"),
+    ]
+    import importlib
+
+    for module_name, short in builtins_list:
+        try:
+            module = importlib.import_module(module_name, package=__package__)
+        except ImportError:
+            continue
+        except Exception as exc:  # 模块自身炸了要让用户看见，但不能拖垮主 CLI
+            print(f"[kfpa] 警告：{short} 模块装载失败：{exc}", file=sys.stderr)
+            continue
+        register = getattr(module, "register", None)
+        if not callable(register):
+            continue
+        try:
+            register(subparsers)
+        except Exception as exc:
+            print(f"[kfpa] 警告：{short} 子命令注册失败：{exc}", file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -422,6 +505,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="失败注入（默认 none；high_ticket 改 mock 剧本，apply_fail/test_fail 交执行器 —— D2 R-10）",
     )
     p_round.add_argument("--max-attempts", type=int, default=3, help="门禁重试上限（默认 3，D1-5）")
+    p_round.add_argument(
+        "--coverage-json",
+        default="",
+        help="pytest --cov-report=json 报告；给了才启用 G7（R-22.3：没给不判红）",
+    )
+    p_round.add_argument(
+        "--checkpoint-db",
+        default="",
+        help="SqliteSaver 库路径（默认 {workdir}/checkpoints.sqlite，R-22.2）",
+    )
     p_round.add_argument("--json", action="store_true", help="最后输出单行 JSON（schemas.dumps(RoundResult)）")
     p_round.set_defaults(handler=cmd_round)
 
@@ -440,7 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rollback.add_argument("--apply", action="store_true", help="真执行 git checkout kfpa-r{n}（D1-6）")
     p_rollback.set_defaults(handler=cmd_rollback)
 
-    _register_tickets(parser, subparsers)
+    _register_plugin_commands(subparsers)
     return parser
 
 
@@ -493,3 +586,4 @@ __all__ = [
     "EXIT_NEEDS_FIX",
     "EXIT_BLOCKED",
 ]
+

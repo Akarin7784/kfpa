@@ -11,12 +11,16 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from .schemas import LedgerEntry
 
 #: token 估算比率（D3-3.4：字符数 // 3）
 CHARS_PER_TOKEN = 3
+
+#: 契约 §3.3 的角色名单（配置读不到时的兜底；这里是**角色名**不是模型名）
+ROLE_NAMES: tuple[str, ...] = ("ARCHITECT", "REVIEWER", "FLASH", "EMBEDDING")
 
 #: roles 配置里可选的单价字段（元 / 千 token）；没有就记 0.0
 PRICE_IN_KEYS = ("price_per_1k_in", "input_price_per_1k", "cost_per_1k_in")
@@ -234,13 +238,19 @@ def summarize(entries: list[LedgerEntry]) -> dict:
     return {"by_role": by_role, "totals": totals}
 
 
-def format_report(entries: list[LedgerEntry]) -> str:
-    """CLI 文本（每轮每角色 token 与合计，D3-3.4）。"""
+def format_report(entries: list[LedgerEntry], roles: Optional[list[str]] = None) -> str:
+    """CLI 文本（每轮**每角色** token 与合计，D3-3.4）。
+
+    `roles` 给出配置里的全部角色时，**零消耗的角色也要列出来**（A11 断言输出含
+    `ARCHITECT` 与 `FLASH`；dry-run 只调 ARCHITECT，若只列有记录的角色就会漏）。
+    """
     data = summarize(entries)
-    if not data["by_role"]:
+    known = list(dict.fromkeys([str(r) for r in (roles or [])] + sorted(data["by_role"])))
+    if not known:
         return "（账本为空）"
     lines = ["角色        调用  输入token  输出token  合计     费用"]
-    for role, bucket in sorted(data["by_role"].items()):
+    for role in known:
+        bucket = data["by_role"].get(role, {"tokens_in": 0, "tokens_out": 0, "cost": 0.0, "calls": 0})
         total = bucket["tokens_in"] + bucket["tokens_out"]
         lines.append(
             f"{role:<11} {bucket['calls']:<5} {bucket['tokens_in']:<9} {bucket['tokens_out']:<9} "
@@ -252,6 +262,36 @@ def format_report(entries: list[LedgerEntry]) -> str:
         f"{totals['total_tokens']:<8} {totals['cost']}"
     )
     return "\n".join(lines)
+
+
+def roles_from_config() -> dict[str, dict]:
+    """尽力从 `config/models.yaml` 读角色表：先看 cwd，再看 cwd 的上级目录。
+
+    读不到（或没有该文件）→ 返回 `{}`，调用方按「不编造」处理（model_ref 记空串）。
+    """
+    try:
+        from .config import load_roles
+    except Exception:  # pragma: no cover - config 模块缺失
+        return {}
+    cwd = Path.cwd()
+    candidates = [cwd / "config" / "models.yaml"] + [
+        parent / "config" / "models.yaml" for parent in list(cwd.parents)[:4]
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                return dict(load_roles(path))
+            except Exception:  # pragma: no cover - 继续找下一个候选
+                continue
+    try:  # 退回 config 模块自己的默认路径
+        return dict(load_roles())
+    except Exception:
+        return {}
+
+
+def configured_role_names() -> list[str]:
+    """配置里的角色名单；读不到就退回契约 §3.3 的四个角色名（保证 A11 输出含 FLASH）。"""
+    return [str(name) for name in roles_from_config()] or list(ROLE_NAMES)
 
 
 # ---------------------------------------------------------------- CLI 挂载（供 cli.py 调用）
@@ -276,10 +316,11 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
 
             store = Store(args.db)
         entries = list(store.list_ledger(args.round_no))
+        roles = configured_role_names()
         if args.json:
-            print(dumps({"entries": entries, "summary": summarize(entries)}))
+            print(dumps({"entries": entries, "summary": summarize(entries), "roles": roles}))
         else:
-            print(format_report(entries))
+            print(format_report(entries, roles))
         return 0
 
     parser.set_defaults(handler=_run, func=_run)
@@ -287,6 +328,7 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
 
 __all__ = [
     "CHARS_PER_TOKEN",
+    "ROLE_NAMES",
     "Ledger",
     "estimate_tokens",
     "LocalLedger",
@@ -296,5 +338,7 @@ __all__ = [
     "wrap_llm",
     "summarize",
     "format_report",
+    "roles_from_config",
+    "configured_role_names",
     "register",
 ]

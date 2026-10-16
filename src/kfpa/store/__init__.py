@@ -127,14 +127,25 @@ def is_postgres_dsn(dsn: str) -> bool:
 
 
 def make_store(dsn: Optional[str] = None) -> "StoreProtocol":
-    """装配存储驱动（D3 §3.2）。
+    """装配存储驱动（D3 §3.2 + R-22.1）。
 
-    - `dsn` 为空 → 取环境变量 `KFPA_DB_URL`；仍为空 → SQLite 默认 `kfpa.db`；
-    - `postgresql://` / `postgres://` → :class:`~kfpa.store.postgres.PostgresStore`（惰性 import psycopg）；
-    - `sqlite://<path>` → 指定路径的 SQLite（`sqlite://` 空路径 = `:memory:`）；
-    - 其它字符串 → 当作 SQLite 文件路径（含 `:memory:`）。
+    取值优先级（**普通路径不压过环境变量**，否则台架同时传 `--db` 与 `KFPA_DB_URL` 时会静默退回 SQLite）：
+    1. 显式 DSN（`postgresql://` / `postgres://` / `sqlite://`）—— 最优先，用户就是要它；
+    2. `KFPA_DB_URL` —— 普通路径（含默认 `kfpa.db`）压不过它；这是「全局选驱动」的开关；
+    3. 显式普通路径（含 `:memory:`）；
+    4. 都没有 → SQLite `kfpa.db`。
+
+    想在有 `KFPA_DB_URL` 时强制走本地 SQLite：用 `sqlite://<path>`（显式 DSN，第 1 条）。
     """
-    url = str(dsn if dsn is not None else os.environ.get(DB_URL_ENV, "") or "").strip()
+    explicit = str(dsn or "").strip()
+    env_url = os.environ.get(DB_URL_ENV, "").strip()
+    is_explicit_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
+    if is_explicit_dsn:
+        url = explicit
+    elif env_url:
+        url = env_url
+    else:
+        url = explicit or DEFAULT_SQLITE_PATH
     if not url:
         return Store(DEFAULT_SQLITE_PATH)
     if is_postgres_dsn(url):

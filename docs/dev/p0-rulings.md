@@ -332,6 +332,56 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 **派工**：磐石补 CLI 接线（三个子命令 + `--coverage-json` + `--checkpoint-db`）与 compose 端口；
 长流落 checkpoint 默认盘并提供 `register()`；界面对齐 A17；镜鉴按 1–3 条调整台架后复跑。
 
+## R-23 快车道承认不进 P1；`diff_files` 的三来源优先级（补 D3 两处空白）
+
+- 界面问的两处 D3 空白：①快车道承认的落库接口；②`impact.analyze()` 的 `diff_files` 从哪来。
+- **裁决 1：快车道「承认」不落库，P1 不做。**
+  - 依据路线图：design.md §8 把「快车道 + 沉淀闸门**全量**落地」放在 **P3**；P1 只交付**判据计算**与
+    `kfpa fastlane check --round N`（A16 的全部内容）。
+  - 因此 P1 **不新增** `fastlane_requests` 表、不动 `schema_version`、不升契约。
+  - 界面的快车道页只能做**预览与提示**：结论、三判据、边界清单都可展示；
+    任何「承认/放行」按钮的文案必须写明 **「预览：P3 才接攒批承认入库」**，禁止做出已持久化的假象。
+  - 将来落库走 P3 契约（新增 `fastlane_requests` 表 + `schema_version` 递增，按 R-21 同批同步守卫）。
+- **裁决 2：`diff_files` 三来源优先级**（`impact.analyze(task_package, diff_files)`）：
+
+  | 优先级 | 来源 | 适用 |
+  |---|---|---|
+  | 1 | `ExecResult.files_changed`（本轮执行器真实产出） | `kfpa fastlane check --round N` 默认路径 |
+  | 2 | CLI 显式传参 `--files a.py,b.py`（逗号分隔） | 无执行结果时的预判 |
+  | 3 | 都拿不到 → **`fast_lane=None` + `reason="no_diff_source"`** | 不猜、不默认 True |
+
+  - 界面预览可用 `git diff --name-only HEAD` 作**展示层**来源，但 **CLI 判定不得依赖 git 状态**
+    （脏工作树会给出假判据）。
+  - 判据本身不变：不新增/改接口契约、不改数据模型、波及 ≤1 模块，三者全真才 `True`。
+
+## R-24 P1 第二轮的三个红：账本角色口径 / compose 撞名 / fastlane 退出码
+
+**实测（#26 合入后 main `ea74c00`，`KFPA_DB_URL` 指向已在跑的 PG）**：A11/A12/A16 FAIL，其余全 PASS。
+
+| 现象 | 根因 | 归属 |
+|---|---|---|
+| A11 `NG ledger 输出含角色 FLASH` | mock 路径下 `MockExecutor` **不调 LLM**，只有 ARCHITECT 有账；台架强制 FLASH 是**断言写错** | 镜鉴 |
+| A12 compose 用 55432 起栈成功但 PG 探针 rc=1 | 台架自己给 compose 传了 55432（wms-pg 占着），探针连到了别的项目的库；且 compose 固定 `container_name: kfpa-pg` 与 ad-hoc 实例撞名 | 镜鉴 + 磐石 |
+| A16 `kfpa fastlane check` rc=3（期望 0） | `fastlane check` 把「无 diff 来源/需人工」映射成 3，与 D1-5 的 3（等待人工确认）语义混淆 | 长流 |
+
+**裁决**：
+
+1. **A11 的角色断言口径**：账本只记录**实际发生过的 LLM 调用**。mock 路径只 **REQUIRE `ARCHITECT`**；
+   `FLASH` 允许缺席。要验 FLASH 记账，另加一条**直接注入用例**：`ledger.record(LedgerEntry(role="FLASH", …))`
+   后 `kfpa ledger` 必须含 FLASH。禁止为了让台架变绿而让 mock 执行器凭空产生 LLM 调用。
+2. **compose 不得使用固定 `container_name`**（`container_name: kfpa-pg` 删除）：固定全局名会让多个工作树、
+   多个 clone、台架与人工实例互相撞名（今天就撞了）。由 Compose 按项目前缀命名（`<project>-pg-1`）。
+   台架 A12 起栈时必须**显式独立项目名**（`docker compose -p kfpa-verify-a12 …`）并**优先复用**
+   `KFPA_DB_URL` 已指向的 PG（有则可直接对拍，不起栈）；用完 `down -v` 只清自己那一栈。
+   端口仍按 R-22.1：默认 `55440`，`KFPA_PG_PORT` 覆盖，**禁用 55432–55434**。
+   禁止 `docker rm -f` 别人的容器。
+3. **`kfpa fastlane check --round N` 的退出码固定为 `0`**（成功输出判定）：
+   `fast_lane` 为 `True` / `False` / `None`（`no_diff_source`）都算**成功**，判定结果在输出文本与 `--json` 里。
+   只有输入错误才非零（轮次/库打不开 → 5，参数错 → 2）。**不得占用 3**（3 保留给 round 的人工确认语义）。
+4. **`run_round` 的覆盖率形参名冻结为 `coverage`**：
+   `run_round(..., coverage: CoverageReport | None = None)`，内部转给 `gates.evaluate(..., coverage=…)`。
+   CLI 现有的 `coverage` / `coverage_report` 兼容探测保留，但**以 `coverage` 为准**，将来只加这一个名字。
+
 ---
 
 ## 变更记录
@@ -348,3 +398,5 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.7 | 2026-10-16 | R-20 契约升版必须同批同步「升版守卫」（Chief 直改三处 + 镜鉴复验）| Chief |
 | 1.8 | 2026-10-16 | R-21 升级守卫同步义务归发起变更者 · `schema_version` 断言跟常量走 · `ALL_TABLE_NAMES` 语义 | Chief |
 | 1.9 | 2026-10-16 | R-22 P1 首轮验收六红定位：PG 端口默认 55440 · checkpoint 落盘口径 · G7 仅在提供报告时启用 · 覆盖率白名单 · A14 只验机制 · A17 以台架口径为准 | Chief |
+| 2.0 | 2026-10-16 | R-23 快车道承认不进 P1（P3 落库）；`diff_files` 三来源优先级（执行产物 → `--files` → `no_diff_source`） | Chief |
+| 2.1 | 2026-10-16 | R-24 账本角色断言只认实际调用 · compose 去固定 `container_name` + 台架独立项目名 · `fastlane check` 退出码 0 · `run_round(coverage=)` 形参名冻结 | Chief |

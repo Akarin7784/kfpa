@@ -131,18 +131,46 @@ def _summary(text: str | None) -> str:
 
 # ---------------------------------------------------------------- G7 覆盖率（P1 D3-3.3）
 
+#: R-22.4 冻结的核心模块白名单：只有这些文件的行覆盖率算 G7 门槛。
+#: 不含 `ui/**`、`executor.py`（适配器）、`scripts/**`；全仓库行覆盖不作为门槛。
+CORE_COVERAGE_FILES: tuple[str, ...] = (
+    "src/kfpa/schemas.py",
+    "src/kfpa/config.py",
+    "src/kfpa/cli.py",
+    "src/kfpa/gates.py",
+    "src/kfpa/pipeline.py",
+)
+#: 白名单目录前缀（`store/**`）
+CORE_COVERAGE_PREFIXES: tuple[str, ...] = ("src/kfpa/store/",)
+
+
+def _norm_cov_path(value: str) -> str:
+    return str(value or "").strip().replace("\\", "/").lstrip("./")
+
+
+def in_core_coverage_scope(path: str) -> bool:
+    """该文件是否计入 G7 门槛（R-22.4 白名单）。"""
+    normal = _norm_cov_path(path)
+    return normal in CORE_COVERAGE_FILES or any(
+        normal.startswith(prefix) for prefix in CORE_COVERAGE_PREFIXES
+    )
+
 
 def load_coverage_report(
     json_path: str | Path,
     *,
     critical_paths_ok: Optional[bool] = None,
+    scope: Optional[tuple[str, ...]] = None,
 ) -> CoverageReport:
     """读 `pytest --cov-report=json` 的报告 → `CoverageReport`（G7 的量化入口）。
 
     - `totals.percent_covered` → `line_rate / 100`；`files[*].summary.percent_covered` → 各文件行覆盖率。
+    - **门槛只统计核心模块白名单（R-22.4）**：默认按 `in_core_coverage_scope()` 过滤，
+      并用各文件的 `covered_lines / num_statements` 重算 `line_rate`（加权，不是简单平均）；
+      报告里一个白名单文件都没有时退回全量口径（避免拿一份无关报告做出「0% 全红」的假判定）。
     - `critical_paths_ok`：显式传入优先；否则读 JSON 里的 `critical_paths_ok` 键；
       两者都没有 → **False（不编造）**，即关键路径未证明全绿时不允许 PASS。
-    - 文件不存在 / JSON 解析失败 → 抛 `PipelineError` 风格的中文错误（让调用方决定退出码）。
+    - 文件不存在 / JSON 解析失败 → 抛 `GatesError`（中文三段式，让调用方决定退出码）。
     """
     path = Path(json_path)
     if not path.is_file():
@@ -157,12 +185,41 @@ def load_coverage_report(
         ) from exc
 
     totals = payload.get("totals") or {}
-    line_rate = float(totals.get("percent_covered", 0.0) or 0.0) / 100.0
-    files: dict[str, float] = {}
-    for name, info in (payload.get("files") or {}).items():
+    total_rate = float(totals.get("percent_covered", 0.0) or 0.0) / 100.0
+    raw_files = payload.get("files") or {}
+
+    all_files: dict[str, float] = {}
+    all_statements: dict[str, int] = {}
+    all_covered: dict[str, int] = {}
+    for name, info in raw_files.items():
         summary = (info or {}).get("summary") or {}
+        key = _norm_cov_path(name)
         if "percent_covered" in summary:
-            files[str(name)] = float(summary["percent_covered"] or 0.0) / 100.0
+            all_files[key] = float(summary["percent_covered"] or 0.0) / 100.0
+        if "num_statements" in summary:
+            all_statements[key] = int(summary.get("num_statements") or 0)
+            all_covered[key] = int(summary.get("covered_lines") or 0)
+
+    scoped = scope if scope is not None else None
+    if scoped is None:
+        selected = {k: v for k, v in all_files.items() if in_core_coverage_scope(k)}
+    else:
+        wanted = tuple(_norm_cov_path(s) for s in scoped)
+        selected = {
+            k: v for k, v in all_files.items() if k in wanted or any(k.startswith(w) for w in wanted)
+        }
+
+    if selected:
+        statements = sum(all_statements.get(k, 0) for k in selected)
+        covered = sum(all_covered.get(k, 0) for k in selected)
+        if statements > 0:
+            line_rate = covered / statements
+        else:  # 报告没给行数时退回各文件覆盖率的算术平均
+            line_rate = sum(selected.values()) / len(selected)
+        files = selected
+    else:  # 报告里没有白名单文件 → 退回全量口径（不编造 0%）
+        line_rate, files = total_rate, all_files
+
     if critical_paths_ok is None:
         critical_paths_ok = bool(payload.get("critical_paths_ok", False))
     return CoverageReport(line_rate=line_rate, files=files, critical_paths_ok=bool(critical_paths_ok))
@@ -400,7 +457,10 @@ __all__ = [
     "ESCALATE_THRESHOLD",
     "ERROR_CATEGORIES",
     "BLOCKING_SEVERITIES",
+    "CORE_COVERAGE_FILES",
+    "CORE_COVERAGE_PREFIXES",
     "GatesError",
+    "in_core_coverage_scope",
     "normalize_category",
     "normalize_target",
     "make_reason_key",
