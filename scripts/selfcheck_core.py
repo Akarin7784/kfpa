@@ -231,6 +231,16 @@ lit = (root / "kfpa" / "llm.py").read_text(encoding="utf-8")
 check("A5.2 llm.py 也没有字面量模型串", not re.search(r"[\"'](deepseek|gpt-|claude|qwen|bge)[^\"']*[\"']", lit))
 
 # ---------- CLI（D1-5 / D2 R-1）
+# 【镜鉴搬运补丁】原脚本只在「只有 core、没有 pipeline」的 clone 里跑，下面三条断言以
+# 「缺 pipeline → 4」为前提；搬到集成树（core+pipeline+ui 都在）后该前提不成立，会出假红。
+# 这里按是否装了 pipeline 分流：没 pipeline 时保持原意；有 pipeline 时改判「语义不得退化」。
+try:
+    import importlib.util as _ilu
+    HAS_PIPELINE = _ilu.find_spec("kfpa.pipeline") is not None
+except Exception:  # noqa: BLE001
+    HAS_PIPELINE = False
+print(f"[镜鉴补丁] kfpa.pipeline 已装 = {HAS_PIPELINE}（决定三条 CLI 断言的期望值）")
+
 check("CLI: --help 返回 0", cli.main(["--help"]) == 0)
 check("CLI: 位置参数错返回 2", cli.main(["nope"]) == 2)
 check("CLI: 缺必填参数返回 2", cli.main(["round", "--round", "1"]) == 2)
@@ -242,7 +252,8 @@ with tempfile.TemporaryDirectory() as td:
     check("CLI: gate 无记录返回 3（R-1）", cli.main(["gate", "1", "--db", db]) == 3)
     check("CLI: rollback 无快照返回 5", cli.main(["rollback", "1", "--db", db]) == 5)
     check("CLI: round 缺设计文件返回 4（R-1）", cli.main(["round", "--design", "nope.md", "--round", "1", "--db", db]) == 4)
-    check("CLI: round 缺 pipeline 返回 4", cli.main(["round", "--design", "README.md", "--round", "1", "--db", db]) == 4)
+    if not HAS_PIPELINE:
+        check("CLI: round 缺 pipeline 返回 4", cli.main(["round", "--design", "README.md", "--round", "1", "--db", db]) == 4)
     check("CLI: round 坏 config 返回 4", cli.main(["round", "--design", "README.md", "--round", "1", "--db", db, "--config", "nope.yaml"]) == 4)
     st = Store(db)
     st.save_gate_report(GateReport(1, GateState.NEEDS_FIX, reasons=["x"]))
@@ -262,10 +273,20 @@ with tempfile.TemporaryDirectory() as td:
     st.add_ticket(QATicket("R9-002", 9, "§5", "a", "b", "A", impact=TicketImpact.LOW))
     check("R-13 MEDIUM/LOW 不进 open-high 清单", st.list_open_high_tickets(9) == [])
     st.close()
-    check("R-13 MEDIUM/LOW 不拦停（走到依赖缺失 4，不是 3）",
-          cli.main(["round", "--design", "README.md", "--round", "9", "--db", db]) == 4)
-    # R-10：high_ticket 注入在 CLI 被接受（无 pipeline 时仍应走到依赖缺失 4，而不是用法错误 2）
-    check("CLI: --inject high_ticket 合法", cli.main(["round", "--design", "README.md", "--round", "2", "--db", db, "--inject", "high_ticket"]) == 4)
+    if HAS_PIPELINE:
+        # 集成树：pipeline 在场，round 会真的跑起来 → 改判「语义不得退化」
+        _rc_ml = cli.main(["round", "--design", "README.md", "--round", "9", "--db", db])
+        check("R-13 MEDIUM/LOW 不拦停（集成树：不得是 3）", _rc_ml != 3, f"rc={_rc_ml}")
+        _rc_hi = cli.main(["round", "--design", "README.md", "--round", "2", "--db", db,
+                           "--inject", "high_ticket"])
+        check("CLI: --inject high_ticket 合法（集成树：不得是用法错误 2）", _rc_hi != 2, f"rc={_rc_hi}")
+    else:
+        check("R-13 MEDIUM/LOW 不拦停（走到依赖缺失 4，不是 3）",
+              cli.main(["round", "--design", "README.md", "--round", "9", "--db", db]) == 4)
+        # R-10：high_ticket 注入在 CLI 被接受（无 pipeline 时应走到依赖缺失 4，而不是用法错误 2）
+        check("CLI: --inject high_ticket 合法",
+              cli.main(["round", "--design", "README.md", "--round", "2", "--db", db,
+                        "--inject", "high_ticket"]) == 4)
     check("CLI: --inject 非法值 = 2", cli.main(["round", "--design", "README.md", "--round", "2", "--db", db, "--inject", "boom"]) == 2)
 
 # ---------- 轮次退出码映射（只在本文件，D2 R-1）
