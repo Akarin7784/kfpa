@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -94,7 +95,11 @@ def _blocking_criteria(report: ReviewReport) -> set[str]:
 
 
 def score_reports(samples: list[dict], reports: list[ReviewReport]) -> dict:
-    """按 D4 §3.4 的口径算三项指标 + 逐样本明细（可复算）。"""
+    """按 D4 §3.4 的口径算三项指标 + 逐样本明细（可复算）。
+
+    明细形状按 D4 冻结的报告形状：每条自带 `missed` / `false_alarm` **布尔**，
+    渲染层不得自行推断（另附 parse_ok/expected/blocking 等诊断字段，便于台架定位）。
+    """
     total = len(samples)
     missed = 0
     false_alarms = 0
@@ -110,30 +115,38 @@ def score_reports(samples: list[dict], reports: list[ReviewReport]) -> dict:
         blocking = _blocking_criteria(report)
         hit_all = criteria.issubset(blocking) if criteria else report.verdict == "fail"
         is_fail = report.verdict == "fail"
-        row = {
-            "id": sample.get("id"),
-            "human": human,
-            "verdict": report.verdict,
-            "parse_ok": report.parse_ok,
-            "blocking_criteria": sorted(blocking),
-            "expected_criteria": sorted(criteria),
-            "context_id": report.context_id,
-        }
-        if human == "fail":
-            if not (is_fail and hit_all):
-                missed += 1
-                row["outcome"] = "missed"
-            else:
-                row["outcome"] = "hit"
-        elif human == "pass":
-            if is_fail or blocking:
-                false_alarms += 1
-                row["outcome"] = "false_alarm"
-            else:
-                row["outcome"] = "clean"
+        sample_missed = human == "fail" and not (is_fail and hit_all)
+        sample_false_alarm = human == "pass" and (is_fail or bool(blocking))
+        if sample_missed:
+            missed += 1
+        if sample_false_alarm:
+            false_alarms += 1
         if report.verdict == human:
             agree += 1
-        details.append(row)
+        details.append(
+            {
+                # ---- 冻结形状要求的字段
+                "id": sample.get("id"),
+                "human_verdict": human,
+                "review_verdict": report.verdict,
+                "missed": bool(sample_missed),
+                "false_alarm": bool(sample_false_alarm),
+                "findings": [
+                    {
+                        "severity": f.severity.value,
+                        "location": f.location,
+                        "issue": f.issue,
+                        "criterion": f.criterion,
+                    }
+                    for f in report.findings
+                ],
+                # ---- 诊断字段（台架定位用，渲染层可忽略）
+                "parse_ok": report.parse_ok,
+                "expected_criteria": sorted(criteria),
+                "blocking_criteria": sorted(blocking),
+                "context_id": report.context_id,
+            }
+        )
     return {
         "total": total,
         "missed": missed,
@@ -229,6 +242,7 @@ def evaluate(
     metrics.baseline_details = base_scored["details"]  # type: ignore[attr-defined]
     metrics.provider = provider  # type: ignore[attr-defined]
     metrics.baseline_provider = baseline_provider  # type: ignore[attr-defined]
+    metrics.baseline_known = True  # type: ignore[attr-defined]  # 本函数总会跑出 baseline 列
     return metrics
 
 
@@ -236,18 +250,26 @@ def evaluate(
 
 
 def render_report(metrics: ReviewMetrics, fmt: str = "json") -> str:
-    """渲染度量报告：`json`（含逐样本明细）或 `md`（对照表 + 明细）。"""
+    """渲染度量报告：`json`（**D4 冻结形状**）或 `md`（对照表 + 明细）。
+
+    冻结的 JSON 顶层：`{corpus, generated_at, provider, baseline_provider, metrics, samples}`；
+    `metrics` 的字段名与 `schemas.ReviewMetrics` 一一对应（结论 `passed()` 由渲染层自判，报告不写死）；
+    `samples` 每条自带 `missed` / `false_alarm` 布尔。
+    """
     details = getattr(metrics, "details", [])
     provider = getattr(metrics, "provider", "")
     baseline_provider = getattr(metrics, "baseline_provider", "")
     if fmt == "md":
+        baseline_known = getattr(metrics, "baseline_known", True)
+        verdict = "无法判定（缺 baseline_*）" if not baseline_known else (
+            "✅ 达标" if metrics.passed() else "❌ 未达标"
+        )
         lines = [
             f"# 同源盲区度量报告 · {metrics.corpus}",
             "",
             f"- 种子集样本数：{metrics.total}",
             f"- 异构组 provider = `{provider}`；同源 baseline = `{baseline_provider}`",
-            f"- 通过判据（D4-3.4）：漏检不增、误报不增、一致率不降 → "
-            f"{'✅ 达标' if metrics.passed() else '❌ 未达标'}",
+            f"- 通过判据（D4-3.4）：漏检不增、误报不增、一致率不降 → {verdict}",
             "",
             "| 指标 | 异构组 | 同源 baseline |",
             "|---|---|---|",
@@ -259,33 +281,34 @@ def render_report(metrics: ReviewMetrics, fmt: str = "json") -> str:
             "",
             "## 逐样本明细",
             "",
-            "| 样本 | 人工 | 评审 | 结论 | 期望 criterion | 命中 criterion |",
-            "|---|---|---|---|---|---|",
+            "| 样本 | 人工 | 评审 | 漏检 | 误报 | 期望 criterion | 命中 criterion |",
+            "|---|---|---|---|---|---|---|",
         ]
         for row in details:
             lines.append(
-                f"| {row['id']} | {row['human']} | {row['verdict']} | {row['outcome']} | "
-                f"{', '.join(row['expected_criteria']) or '-'} | "
-                f"{', '.join(row['blocking_criteria']) or '-'} |"
+                f"| {row['id']} | {row['human_verdict']} | {row['review_verdict']} | "
+                f"{'是' if row['missed'] else '否'} | {'是' if row['false_alarm'] else '否'} | "
+                f"{', '.join(row.get('expected_criteria') or []) or '-'} | "
+                f"{', '.join(row.get('blocking_criteria') or []) or '-'} |"
             )
         return "\n".join(lines) + "\n"
+
     payload = {
         "corpus": metrics.corpus,
+        "generated_at": time.time(),
         "provider": provider,
         "baseline_provider": baseline_provider,
         "metrics": {
+            "corpus": metrics.corpus,
             "total": metrics.total,
             "missed": metrics.missed,
             "false_alarms": metrics.false_alarms,
             "agreement": metrics.agreement,
-            "miss_rate": metrics.miss_rate(),
-            "false_alarm_rate": metrics.false_alarm_rate(),
             "baseline_missed": metrics.baseline_missed,
             "baseline_false_alarms": metrics.baseline_false_alarms,
             "baseline_agreement": metrics.baseline_agreement,
-            "passed": metrics.passed(),
         },
-        "details": details,
+        "samples": details,
     }
     return dumps(payload)
 
