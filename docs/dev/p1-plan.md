@@ -108,7 +108,10 @@ class Store(Protocol):                      # 现有方法全保留（P0 契约�
     def drop_candidate(self, cid: str, reason: str) -> None: ...
 ```
 
-- 表：P0 七表 + `ledger` + `knowledge`（`schema_version = "2"`）。
+- 表：P0 七表 + `ledger` + `knowledge`（`schema_version = "2"`）；
+  常量按 D2 **R-21.3**：`BUSINESS_TABLES` / `TABLE_NAMES` 保持 P0 含义不变，
+  新增 `P1_TABLE_NAMES = ("ledger", "knowledge")` 与 `ALL_TABLE_NAMES = TABLE_NAMES + P1_TABLE_NAMES`（9 张）；
+  断言「当前所有表」一律用 `ALL_TABLE_NAMES`。
 - **双驱动行为必须一致**：同一断言集在 SQLite 与 PG 上都要绿（镜鉴做对拍，A12）。
 - SQLite 侧保持 `:memory:` 可用；PG 侧 DSN 泄漏不得进日志（打印时打码）。
 
