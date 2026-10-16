@@ -228,6 +228,7 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 | A7 | 質問票台账可读写：`tickets list` 列全（含影响面/状态）；`tickets close`、`batch-close` 关闭入库，未知票号整体拒绝 | `python -m kfpa tickets list --db t.db` |
 | A8 | LangGraph 图可编译并可跑（D1-12 / R-14 冻结契约）：`build_graph(**deps)` 可编译；`invoke({"round_no","design_text","design_ref"})` 返回 dict，`round_no==1`、`tickets` 非空、`task_package is not None`、`gate.state=="pass"`（不断言 snapshot） | `python -m pytest tests/test_graph_smoke.py` |
 | A9 | litellm 异常包装（R-7）：适配器把调用异常统一包成中文 `RuntimeError`，消息含 `--provider mock`；不裸抛底层异常 | `python -m pytest tests/test_llm_adapter.py` |
+| A10 | 中文输出健壮性（R-18，**Chief 实测抓到**）：stdout 被重定向且**不设** `PYTHONIOENCODING` 时，`--help`/`init`/`tickets list`/`round --json` 不得 UnicodeEncodeError，rc 符合 D1-5 | `python -c "import subprocess,sys; print(subprocess.run([sys.executable,'-m','kfpa','--help'],capture_output=True).returncode)"` → 0 |
 
 > **A5 的旧命令作废**：表中 A5 那行示例 grep 会误杀适配器 `llm.py`，**以 D2 R-11 的两条命令为准**
 > （A5.1 业务代码排除 `llm.py` 后零命中；A5.2 `llm.py` 自身零字面量模型串），白名单只有一个文件。
@@ -240,7 +241,8 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 ## 5. PR 与合并
 
 1. 各自分支推 PR，标题 `p0/<模块>: <一句话>`，描述含：改了什么 / 怎么验 / 已知未做。
-2. 镜鉴在 PR 评论给出 A1–A9 中与本次改动相关的结论（通过/不通过 + 证据）。
+2. 镜鉴在 PR 评论给出 A1–A10 中与本次改动相关的结论（通过/不通过 + 证据）。
+   台架**至少有一遍不设** `PYTHONIOENCODING`（否则测不出 A10 这类环境相关的假绿）。
 3. Chief 复核 diff 后合并（无阻塞即合）；合并后由镜鉴对 main 再跑一次端到端。
 4. 出现接口冲突：先群里说，Chief 改契约并升 `CONTRACT_VERSION`，不要各自就地改。
 
@@ -251,3 +253,4 @@ def main(argv: list[str] | None = None) -> int: ...   # 返回退出码（表见
 | 1.0 | 2026-10-16 | 首版冻结：模块布局、接口、验收 A1–A7、分工 | Chief |
 | 1.1 | 2026-10-16 | 契约升 1.1（ExecResult/GateReport 补字段）；补 D1 补充件指引；编排定为 LangGraph；退出码表；A4 注入式验收；新增 A8 图冒烟；依赖清单落文 | Chief |
 | 1.2 | 2026-10-16 | 依 D2 收敛：A3 改 `--inject high_ticket`（退出码 3）· A5 作废旧命令、以 R-11 为准 · A8 改按 R-14 冻结的 state 契约断言 · 新增 A9 异常包装 · §3.4 补图契约 · §5 覆盖 A1–A9 | Chief |
+| 1.3 | 2026-10-16 | 新增 A10（中文输出在重定向/非 UTF-8 下不得崩，R-18）· §5 覆盖 A1–A10 并要求台架不设 `PYTHONIOENCODING` 跑一遍 | Chief |
