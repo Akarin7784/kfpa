@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,6 +22,46 @@ CORE_ROLES: tuple[str, ...] = ("ARCHITECT", "REVIEWER", "FLASH")
 
 #: 默认配置路径（相对仓库根目录）
 DEFAULT_CONFIG_PATH = "config/models.yaml"
+
+#: 可覆盖配置路径的环境变量（R-26）
+CONFIG_ENV = "KFPA_CONFIG"
+
+
+def resolve_config_path(config_path: str | Path = DEFAULT_CONFIG_PATH) -> Path:
+    """R-26：把配置路径解析成一个真实文件，**不依赖 cwd**。
+
+    顺序：`--config` 显式（给了就只认它，不做回退）→ `KFPA_CONFIG` →
+    cwd 及其父目录下的 `config/models.yaml` → 包/仓库安装位置（`kfpa` 包上溯）。
+    都没有 → 中文列出已试过的路径（不猜、不回退到空配置）。
+    """
+    explicit = str(config_path or "").strip()
+    if explicit and explicit != DEFAULT_CONFIG_PATH:
+        path = Path(explicit)
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f"角色配置不存在：{path}（--config 显式指定，R-26 不做回退）")
+
+    candidates: list[Path] = []
+    env_path = os.environ.get(CONFIG_ENV, "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    here = Path.cwd().resolve()
+    candidates.extend(base / DEFAULT_CONFIG_PATH for base in (here, *here.parents))
+    package_root = Path(__file__).resolve()
+    candidates.extend(base / DEFAULT_CONFIG_PATH for base in package_root.parents)
+
+    tried: list[str] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in tried:
+            continue
+        tried.append(key)
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "角色配置不存在（R-26：依次试过 --config / KFPA_CONFIG / cwd 及父目录 / 包位置）：\n  - "
+        + "\n  - ".join(tried)
+    )
 
 
 def normalize_role(role: str) -> str:
@@ -41,12 +82,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]
             "缺少 pyyaml：请让 Chief 统一安装（pip install pyyaml），不要在项目目录里自建 venv"
         ) from exc
 
-    path = Path(config_path)
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"角色配置不存在：{path}（默认 {DEFAULT_CONFIG_PATH}；"
-            "请在仓库根目录运行，或用 --config 显式指定）"
-        )
+    path = resolve_config_path(config_path)
 
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))

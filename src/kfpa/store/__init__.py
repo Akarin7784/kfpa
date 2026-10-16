@@ -127,20 +127,23 @@ def is_postgres_dsn(dsn: str) -> bool:
 
 
 def make_store(dsn: Optional[str] = None) -> "StoreProtocol":
-    """装配存储驱动（D3 §3.2 + R-22.1）。
+    """装配存储驱动（D3 §3.2 + R-22.1 + R-25.1）。
 
-    取值优先级（**普通路径不压过环境变量**，否则台架同时传 `--db` 与 `KFPA_DB_URL` 时会静默退回 SQLite）：
+    取值优先级（**CLI 常规约定：显式 flag > 环境变量 > 默认值**）：
     1. 显式 DSN（`postgresql://` / `postgres://` / `sqlite://`）—— 最优先，用户就是要它；
-    2. `KFPA_DB_URL` —— 普通路径（含默认 `kfpa.db`）压不过它；这是「全局选驱动」的开关；
-    3. 显式普通路径（含 `:memory:`）；
+    2. 显式普通路径（`dsn` 非空且不是默认 `kfpa.db` 时）—— 也压过环境变量；
+    3. `KFPA_DB_URL` —— 只在没给 `--db`、或给的就是默认 `kfpa.db` 时生效（「全局选驱动」的开关）；
     4. 都没有 → SQLite `kfpa.db`。
 
-    想在有 `KFPA_DB_URL` 时强制走本地 SQLite：用 `sqlite://<path>`（显式 DSN，第 1 条）。
+    R-25.1 的理由：显式 `--db /tmp/x.db` 被环境变量静默改写，会制造一整类
+    「机器上残留 KFPA_DB_URL → 台架临时库全被顶成同一个 PG」的假红。
     """
     explicit = str(dsn or "").strip()
     env_url = os.environ.get(DB_URL_ENV, "").strip()
     is_explicit_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
     if is_explicit_dsn:
+        url = explicit
+    elif explicit and explicit != DEFAULT_SQLITE_PATH:
         url = explicit
     elif env_url:
         url = env_url
