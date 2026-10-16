@@ -28,6 +28,7 @@ import pytest
 from kfpa import eval as eval_mod
 from kfpa import executor as ex_mod
 from kfpa import gates, pipeline
+from kfpa import store as st_mod
 from kfpa.schemas import (
     AcceptanceCriterion,
     CandidateStatus,
@@ -376,6 +377,125 @@ def test_fold_reviews_splits_blocking_from_records():
     ])
     assert blocking == [("AC1", "other")]   # 只有 major + criterion 才是阻塞
     assert len(reasons) == 4                # 四条都要留痕
+
+
+# ------------------------------------------------------------------ G5/G8 对抗复核
+
+#: 长流（实现方）点名要求复核的两条：「G5 同因第二次升级」「G8 只记 reasons」——
+#: 这两处最容易按实现写松（只断「第二次变 BLOCKED」「minor 不改三态」就放过），
+#: 所以这里按**判据的反面**各打一组：不该升级的必须不升级、不该阻塞的必须不阻塞。
+
+
+def test_g5_different_reason_same_round_does_not_escalate():
+    """G5 按 `reason_key` 判同类：换了原因（哪怕同轮第二次）也不许升级。"""
+    st = _Store()
+    first = gates.evaluate(31, _pkg(), ExecResult(ok=False, error_category="test_fail",
+                                                  failed_criteria=["AC1"], error="炸"), st)
+    second = gates.evaluate(31, _pkg(), ExecResult(ok=False, error_category="compile",
+                                                   error="编译炸", files_changed=["out/x.py"]), st)
+    assert first.reason_key != second.reason_key
+    assert first.state is GateState.NEEDS_FIX
+    assert second.state is GateState.NEEDS_FIX          # 不同因 → 仍可重试
+    assert second.escalated is False and second.same_reason_count == 0
+
+
+def test_g5_same_reason_different_round_does_not_escalate(tmp_path):
+    """计数按轮次隔离：同一原因跨轮各第一次都要给 NEEDS_FIX，不许累加成 BLOCKED。"""
+    store = st_mod.Store(str(tmp_path / "g5.db"))
+    store.init_schema()
+    bad = ExecResult(ok=False, error_category="test_fail", failed_criteria=["AC1"], error="炸")
+    r32 = gates.evaluate(32, _pkg(), bad, store)
+    r33 = gates.evaluate(33, _pkg(), bad, store)
+    assert r32.state is GateState.NEEDS_FIX
+    assert r33.state is GateState.NEEDS_FIX
+    assert r33.same_reason_count == 0 and r33.escalated is False
+    store.close()
+
+
+def test_g5_counter_and_escalation_field_semantics():
+    """第二次同类 → BLOCKED，且 `same_reason_count` 是「历史次数、不含本次」。"""
+    st = _Store()
+    bad = ExecResult(ok=False, error_category="test_fail", failed_criteria=["AC1"], error="炸")
+    r1 = gates.evaluate(34, _pkg(), bad, st)
+    r2 = gates.evaluate(34, _pkg(), bad, st)
+    r3 = gates.evaluate(34, _pkg(), bad, st)
+    assert (r1.state, r1.escalated, r1.same_reason_count) == (GateState.NEEDS_FIX, False, 0)
+    assert (r2.state, r2.escalated, r2.same_reason_count) == (GateState.BLOCKED, True, 1)
+    assert (r3.state, r3.escalated, r3.same_reason_count) == (GateState.BLOCKED, True, 2)
+    assert all(r.reason_key == r1.reason_key for r in (r2, r3))
+
+
+def test_g8_minor_with_criterion_must_not_block():
+    """阻塞判据是 `severity in {major,blocker}` **且**有 criterion —— 不是「有 criterion 就阻塞」。"""
+    rep = gates.evaluate(35, _pkg(), _ok_exec(_pkg()), _Store(),
+                         reviews=[{"severity": "minor", "criterion": "AC1", "location": "x",
+                                   "issue": "措辞"}])
+    assert rep.state is GateState.PASS
+    assert rep.failing_criteria == []
+    assert any("G8" in r for r in rep.reasons)
+
+
+def test_g8_major_with_blank_criterion_must_not_block():
+    """criterion 只有空白 → 定位不到断言 → 不阻塞，但仍要留痕。"""
+    rep = gates.evaluate(36, _pkg(), _ok_exec(_pkg()), _Store(),
+                         reviews=[{"severity": "major", "criterion": "   ", "location": "段4",
+                                   "issue": "缺错误码"}])
+    assert rep.state is GateState.PASS
+    assert rep.failing_criteria == []
+    assert any("无 criterion" in r for r in rep.reasons)
+
+
+def test_g8_blocker_severity_is_treated_as_blocking():
+    """`blocker` 与 `major` 同级（D3-3.3 表里两个都算阻塞）。"""
+    rep = gates.evaluate(37, _pkg(), _ok_exec(_pkg()), _Store(),
+                         reviews=[{"severity": "blocker", "criterion": "AC1", "location": "段4",
+                                   "issue": "接口不可用"}])
+    assert rep.state is GateState.NEEDS_FIX
+    assert rep.failing_criteria == ["AC1"]
+
+
+def test_g8_is_short_circuited_when_an_earlier_gate_already_failed():
+    """D1-3 判定顺序是**短路**的：G1–G4 已有失败时不再折算 G8。
+
+    这条是我复核时长流没写到的边界：我原以为「G8 只记 reasons」在任何情况下都成立，
+    实测发现既有 G2 失败时评审条目根本不进 reasons。按 D1-3 这是**对的**（G7 也是同一规则），
+    这里把短路语义钉死，免得以后有人「顺手」把它改成总是折算。
+    评审留痕不受影响：pipeline 每次都 `persist_report()` 落 `reviews` 表（A22）。
+    """
+    st = _Store()
+    failing = ExecResult(ok=False, error_category="bogus", error="炸了", files_changed=["out/x.py"])
+    rep = gates.evaluate(38, _pkg(), failing, st, reviews="不是 JSON")
+    assert rep.reason_key == gates.make_reason_key("other", "out")     # 仍是 G2 的键
+    assert not any("G8" in r for r in rep.reasons)                     # 短路：G8 未参与
+    assert rep.state is GateState.NEEDS_FIX
+
+
+def test_g8_parse_failure_on_green_round_keeps_pass():
+    rep = gates.evaluate(39, _pkg(), _ok_exec(_pkg()), _Store(), reviews={"nothing": 1})
+    assert rep.state is GateState.PASS
+    assert rep.reason_key == ""
+    assert any("G8" in r for r in rep.reasons)
+
+
+def test_g8_mixed_reviews_block_only_on_the_blocking_entry():
+    rep = gates.evaluate(40, _pkg(), _ok_exec(_pkg()), _Store(), reviews=[
+        {"severity": "minor", "location": "段1", "issue": "措辞"},
+        {"severity": "major", "criterion": "AC1", "location": "段4", "issue": "缺错误码"},
+        {"severity": "major", "location": "段5", "issue": "无 criterion"},
+    ])
+    assert rep.state is GateState.NEEDS_FIX
+    assert rep.failing_criteria == ["AC1"]          # 有 criterion 的那条决定失败项
+    assert len(rep.reasons) >= 3                    # 三条都留痕
+
+
+def test_repeated_g8_blocker_escalates_to_blocked_via_g5():
+    """G8 阻塞也会走 G5 同因升级：第二次同类评审阻塞 → BLOCKED（不许永远停在 NEEDS_FIX）。"""
+    st = _Store()
+    review = [{"severity": "major", "criterion": "AC1", "location": "段4", "issue": "缺错误码"}]
+    r1 = gates.evaluate(41, _pkg(), _ok_exec(_pkg()), st, reviews=review)
+    r2 = gates.evaluate(41, _pkg(), _ok_exec(_pkg()), st, reviews=review)
+    assert r1.state is GateState.NEEDS_FIX
+    assert r2.state is GateState.BLOCKED and r2.escalated is True
 
 
 # ------------------------------------------------------------------ G1–G8 判定顺序
