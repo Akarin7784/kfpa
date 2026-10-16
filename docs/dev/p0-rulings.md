@@ -402,6 +402,56 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
    谁机器上残留了这个变量，都不许把台架的临时库顶掉。这是台架的硬要求（与 R-19/R-22 同级）。
 4. A12 的端口仍按 R-22.1：台架读 `KFPA_PG_PORT`，默认 `55440`，禁用 55432–55434。
 
+## R-26 A12 的真因：CLI 的配置查找依赖 cwd（不是 PG/DSN 问题）
+
+**实测（我在 main `0d84690` 上手动复现）**：
+
+```
+cwd = <任意非仓库目录>
+$ python -m kfpa round --design <repo>/examples/design-r1.md --round 2 --dry-run --json --workdir <tmp>/wd
+[core] 角色配置错误：角色配置不存在：config\models.yaml → rc=4
+$ python -m kfpa round ... --config <repo>/config/models.yaml     → rc=0（绿）
+```
+
+`init` 不需要角色表所以 rc=0；`round` 需要 `config/models.yaml`，**默认路径是相对 cwd 的字面量**
+→ 任何从别的目录调用的消费者（A12 台架、CI、用户在自己项目里调）都会挂在 rc=4。
+这才是 A12「PG 里没有任何表」的真因（台架把 round 判红后自然没数据），与 `KFPA_DB_URL` / DSN 无关。
+
+**裁决 R-26**：`config/models.yaml`（以及其它随包资源，如 `prompts/*.j2`）**必须能在任意 cwd 下定位**。
+解析顺序：
+
+1. `--config` 显式路径；
+2. 环境变量 `KFPA_CONFIG`；
+3. cwd 及其所有父目录下的 `config/models.yaml`；
+4. 包/仓库安装位置（由 `kfpa.__file__` 上溯，找到含 `config/models.yaml` 的目录）；
+5. 都没有 → 中文报错列出已试过的路径 + 退出码 4（**不猜、不回退到空配置**）。
+
+归属：磐石（`config.py` + `cli.py`）。同批做 R-25.1（`make_store` 优先级回退）。
+验收：在 `$env:TEMP` 下用绝对路径跑 `python -m kfpa round …` 必须 rc=0；
+A12 在独占端口上重跑应转为 PASS（不再是 SKIP）。
+
+## R-27 A12 的原始探针必须做驱动归一（PG 元组 vs SQLite 标量）
+
+**现象（我在独占端口 55441 上真跑 A12，R-26/R-25.1 修完后）**：两库终于都真写进去了
+（9 张表齐全、`package_hash` 与快照一致），只剩一条比较失败：
+
+```
+NG A12：票号一致 SQLite=['R1-001', …] PG=[['R1-001'], ['R1-002'], …]
+```
+
+**根因**：探针走原始 SQL。SQLite 驱动的行是标量，psycopg3 的行是**元组**。
+这是**台架的归一缺陷**，不是双驱动行为不一致——产品 API（`Store.list_tickets()`）两个驱动都返回
+`QATicket`，磐石已实测一致。
+
+**裁决 R-27**：
+
+1. A12 的比较必须在**归一之后**做：两侧统一成扁平 `list[str]`（长度 1 的元组/列表取首元素、
+   `None` 跳过、顺序排序）。**禁止**为了迁就探针去改产品代码。
+2. 台架的 PG 探针一律显式指定 `row_factory` 或读取后手动归一，不依赖驱动的默认行形状。
+3. 归一函数要有单测（喂元组 / 标量 / 混合三种输入）——这是最容易「修完这次、下次又踩」的地方。
+
+归属：镜鉴（`scripts/**`）。改完 A12 在独占端口上应转 **PASS**，P1 即 8/8 收口。
+
 ---
 
 ## 变更记录
@@ -421,3 +471,5 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 2.0 | 2026-10-16 | R-23 快车道承认不进 P1（P3 落库）；`diff_files` 三来源优先级（执行产物 → `--files` → `no_diff_source`） | Chief |
 | 2.1 | 2026-10-16 | R-24 账本角色断言只认实际调用 · compose 去固定 `container_name` + 台架独立项目名 · `fastlane check` 退出码 0 · `run_round(coverage=)` 形参名冻结 | Chief |
 | 2.2 | 2026-10-16 | R-25 存储优先级改回「显式 `--db` 优先于 `KFPA_DB_URL`」· 台架 A12 显式传 DSN · 台架子进程必须剥掉 `KFPA_DB_URL` | Chief |
+| 2.3 | 2026-10-16 | R-26 `config/models.yaml` 等随包资源必须能在任意 cwd 定位（A12 的真因）；归属磐石 | Chief |
+| 2.4 | 2026-10-16 | R-27 A12 探针必须做驱动归一（PG 元组 vs SQLite 标量），禁止改产品代码迁就探针 | Chief |
