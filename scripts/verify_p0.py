@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -230,6 +231,25 @@ def last_json_line(blob: str):
             except Exception:  # noqa: BLE001
                 continue
     return None
+
+
+def status_value(status: object) -> str:
+    """枚举或字符串统一取小写值（str(TicketStatus.CLOSED) 会得到 'TicketStatus.CLOSED'）。"""
+    return str(getattr(status, "value", status)).strip().lower()
+
+
+def _norm_key_part(text: object) -> str:
+    """D1-4 规范化：小写、压空白、路径分隔统一 /、剔除行号与时间戳。"""
+    s = str(text).lower().replace("\\", "/")
+    s = re.sub(r":\d+|#\d+|\d{10,}", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def spec_reason_key(category: str, target: str) -> str:
+    """D1-4：reason_key = sha1(f"{category}|{target}")[:12]。"""
+    return hashlib.sha1(
+        f"{_norm_key_part(category)}|{_norm_key_part(target)}".encode("utf-8")
+    ).hexdigest()[:12]
 
 
 def seed_ticket(store_mod, db: Path, *, ticket_id: str, round_no: int, impact: str,
@@ -462,12 +482,23 @@ def check_a3(ctx: Ctx, c: Check) -> None:
     if ev2["rc"] == EXIT_CONFIRM:
         c.fail("A3：关票后仍被硬规则拦停（退出码 3）—— 关闭状态没生效。")
     try:
-        t = store_mod.Store(str(db)).get_ticket(tid)
-        c.add(ok=t is not None and str(t.status).endswith("closed") and bool((t.answer or "").strip()),
-              note=f"R-6：重跑后票 {tid} status={getattr(t, 'status', None)} "
-                   f"answer={getattr(t, 'answer', None)!r}")
-        if t is None or not str(t.status).endswith("closed"):
+        st = store_mod.Store(str(db))
+        t = st.get_ticket(tid)
+        st_val = status_value(t.status) if t is not None else ""
+        c.add(ok=t is not None and st_val == "closed" and bool((t.answer or "").strip()),
+              note=f"R-6：重跑后票 {tid} status={st_val!r} answer={getattr(t, 'answer', None)!r}")
+        if t is None or st_val != "closed":
             c.fail("R-6：同票号重跑把 status 冲掉了（必须保留 status/answer）。")
+        # R-13：被拦停那轮 → tickets_open；关票放行后 → released
+        try:
+            rd = st.get_round(2)
+            r2 = status_value(rd.state) if rd is not None else ""
+        except Exception:  # noqa: BLE001
+            r2 = ""
+        c.add(ok=r2 == "released",
+              note=f"R-13：放行后 rounds.state(round 2) = {r2!r}（期望 'released'）")
+        if r2 != "released":
+            c.fail(f"R-13：高影响票清零并出包后，rounds.state 应为 released，实际 {r2!r}。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"get_ticket 异常：{type(exc).__name__}: {exc}")
         c.fail("Store.get_ticket 接口不可用（§3.2）。")
@@ -510,22 +541,23 @@ def check_a4(ctx: Ctx, c: Check) -> None:
         return st
 
     # --- 纯函数：G1 缺段 / G2 执行失败 / G3 失败断言 / G4 断言未映射 / G6 PASS
+    # 第 6 列 = D1-4 期望的 (category, target)，用于复算 reason_key；None = 只验态
     cases = [
         ("G1 缺段", 11, _complete_package(sc, 11, with_prohibitions=False),
          sc.ExecResult(ok=True, results={"AC-1": True, "AC-2": True}), "needs_fix", None),
         ("G2 执行失败", 12, _complete_package(sc, 12),
          sc.ExecResult(ok=False, error="mock 执行失败", error_category="apply_failed",
-                       executor="mock"), "needs_fix", "apply_failed"),
+                       executor="mock"), "needs_fix", ("apply_failed", "round")),
         ("G3 失败断言", 13, _complete_package(sc, 13),
          sc.ExecResult(ok=True, failed_criteria=["AC-1"], results={"AC-1": True, "AC-2": True},
                        executor="mock"), "needs_fix", None),
         ("G4 断言未映射", 14, _complete_package(sc, 14),
          sc.ExecResult(ok=True, results={"AC-1": True}, executor="mock"),
-         "needs_fix", "unmapped_criterion"),
+         "needs_fix", ("unmapped_criterion", "ac-2")),
         ("G6 全过", 15, _complete_package(sc, 15),
          sc.ExecResult(ok=True, results={"AC-1": True, "AC-2": True}, executor="mock"), "pass", None),
     ]
-    for label, rnd, pkg, ex, want, want_cat in cases:
+    for label, rnd, pkg, ex, want, want_key in cases:
         st = new_store(f"a4-{rnd}")
         try:
             rpt = gates_mod.evaluate(rnd, pkg, ex, st, attempt=1)
@@ -533,13 +565,17 @@ def check_a4(ctx: Ctx, c: Check) -> None:
             c.add(ok=got == want, note=f"{label} → state={got}（期望 {want}）")
             if got != want:
                 c.fail(f"D1-3 {label}：判定 {got} != {want}（reasons={rpt.reasons}）。")
-            if want_cat:
-                cat = getattr(rpt, "error_category", "") or ""
-                in_text = want_cat in " ".join(rpt.reasons or []) or want_cat in str(rpt.failing_criteria)
-                c.add(ok=(cat == want_cat) or in_text,
-                      note=f"{label} error_category={cat!r} reasons={rpt.reasons}")
-                if not (cat == want_cat or in_text):
-                    c.fail(f"D1-3 {label}：error_category 未体现 `{want_cat}`。")
+            key = getattr(rpt, "reason_key", "") or ""
+            if want_key:
+                expect = spec_reason_key(*want_key)
+                c.add(ok=key == expect,
+                      note=f"{label} reason_key={key!r}（D1-4 复算 {want_key} → {expect!r}）")
+                if key != expect:
+                    c.fail(f"D1-4 {label}：reason_key 与规范复算不符（实际 {key!r}，"
+                           f"期望 {expect!r}）—— 归一化键错会让同类失败计数打不中。")
+            elif want == "needs_fix":
+                c.add(ok=bool(re.fullmatch(r"[0-9a-f]{12}", key)),
+                      note=f"{label} reason_key={key!r}（非 PASS 必须落 12 位归一化键）")
         except Exception as exc:  # noqa: BLE001
             c.add(ok=False, note=f"{label} evaluate 异常：{type(exc).__name__}: {exc}")
             c.fail(f"D1-3：{label} 无法判定。")
@@ -705,20 +741,26 @@ try:
         "keyword": "\u4ee5\u4e0b\u8bbe\u8ba1\u5b58\u5728\u6b67\u4e49\uff0c\u8bf7\u4ea7\u51fa\u8cea\u554f\u7968\uff1a\nQA: design.md \u00a75.1 | A: \u7532 | B: \u4e59 | P: \u7532 | I: MEDIUM",
     }
     errs = {}
+    seen = {}
     for kind, prompt in prompts.items():
         try:
             a = llm.complete("ARCHITECT", "sys", prompt)
             b = llm.complete("ARCHITECT", "sys", prompt)
-            out["mock_prompt_kind"] = kind
-            out["mock_call_ok"] = True
-            out["mock_deterministic"] = (a == b)
-            out["mock_returns_str"] = isinstance(a, str)
-            out["mock_sample"] = str(a)[:200]
-            break
+            errs[kind] = None
+            seen[kind] = {"deterministic": (a == b), "sample": str(a)[:120], "raw": a}
         except Exception as e:
             errs[kind] = "%s: %s" % (type(e).__name__, e)
-    else:
-        out["mock_error"] = json.dumps(errs, ensure_ascii=False)
+    out["prompt_errors"] = {k: v for k, v in errs.items() if v}
+    out["prompt_ok"] = [k for k, v in errs.items() if not v]
+    out["mock_prompt_kind"] = ",".join(out["prompt_ok"])
+    out["mock_call_ok"] = bool(out["prompt_ok"])
+    if "d1_marker" in seen:
+        out["mock_deterministic"] = seen["d1_marker"]["deterministic"]
+        out["mock_returns_str"] = True
+        out["mock_sample"] = seen["d1_marker"]["sample"]
+    out["alias_same_output"] = (
+        "d1_marker" in seen and "r3_marker" in seen
+        and seen["d1_marker"]["raw"] == seen["r3_marker"]["raw"])
 except Exception as e:
     out["mock_error"] = "%s: %s" % (type(e).__name__, e)
 try:
@@ -766,12 +808,25 @@ print(json.dumps(out, ensure_ascii=False))
     c.add(ok=bool(data.get("roles_have_model")), note="每个角色都有 model 字段（唯一绑定点在 config）")
     c.add(ok=bool(data.get("mock_call_ok")),
           note=f"MockLLM.complete 可用 = {data.get('mock_call_ok')}"
-               f"（命中的 prompt 口径 = {data.get('mock_prompt_kind')}）")
+               f"（可用的 prompt 口径 = {data.get('mock_prompt_kind')}）")
     if data.get("mock_error"):
-        c.add(ok=False, note=f"MockLLM 调用异常（三种 prompt 口径全失败）：{data['mock_error']}")
-        c.fail("§3.3/D1-7：MockLLM 三种 marker/关键词口径都无法取得剧本输出"
-               "（marker 字面量 D1-7 `[KFPA:GEN_TICKETS]` 与 R-3 `KFPA_TASK=qa_tickets` 不一致时，"
-               "以两条都支持为准）。")
+        c.add(ok=False, note=f"MockLLM 调用异常：{data['mock_error']}")
+        c.fail("§3.3/D1-7：MockLLM 无法取得剧本输出。")
+    # R-17：规范 marker（KFPA_TASK=）与永久兼容别名（[KFPA:…]）都必须可用，且输出一致
+    ok_kinds = set(data.get("prompt_ok") or [])
+    for kind, label, ref in (("r3_marker", "规范 marker `KFPA_TASK=qa_tickets`", "R-17/§3.3"),
+                             ("d1_marker", "永久兼容别名 `[KFPA:GEN_TICKETS]`", "R-17/§3.3"),
+                             ("keyword", "关键词兜底（无 marker）", "R-3")):
+        ok = kind in ok_kinds
+        c.add(ok=ok, note=f"{ref}：{label} 可用 = {ok}"
+                          + ("" if ok else f"；错误 = {(data.get('prompt_errors') or {}).get(kind)}"))
+        if not ok:
+            c.fail(f"{ref}：{label} 不可用 —— "
+                   f"{(data.get('prompt_errors') or {}).get(kind)}")
+    c.add(ok=bool(data.get("alias_same_output")),
+          note=f"R-17：规范 marker 与别名输出一致 = {data.get('alias_same_output')}")
+    if not data.get("alias_same_output"):
+        c.fail("R-17：`KFPA_TASK=` 与 `[KFPA:…]` 两种 marker 的输出不一致（同义别名必须等价）。")
     c.add(ok=bool(data.get("mock_deterministic")),
           note=f"D1-7：MockLLM 同输入同输出 = {data.get('mock_deterministic')}")
     if data.get("mock_call_ok") and data.get("mock_deterministic") is False:
@@ -1065,6 +1120,23 @@ def check_a7_rules(ctx: Ctx, c: Check) -> None:
         c.fail(f"R-9：已关闭票重复提交退出码 {e2['rc']}，期望 0（R-1 已作废 1）。")
     c.add(ok=("跳过" in blob2 or "skip" in blob2.lower()),
           note="R-9：重复提交要打印「跳过 + 原因」")
+
+    # --- R-15：单张 close 遇已关闭票 → 幂等 0；batch-close 文件不存在 → 4
+    e3 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "close", "R1-921",
+                  "--answer", "再次确认：采用 A", "--db", str(db2)])
+    blob3 = e3["stdout"] + e3["stderr"]
+    c.add(cmd=e3["cmd"], rc=e3["rc"], ok=e3["rc"] == EXIT_PASS,
+          note="R-15：单张 close 撞已关闭票 → 幂等忽略 + 退出码 0",
+          stdout=excerpt(blob3, 300))
+    if e3["rc"] != EXIT_PASS:
+        c.fail(f"R-15：单张 `tickets close` 撞已关闭票退出码 {e3['rc']}，期望 0（幂等）。")
+
+    e4 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close",
+                  "--file", str(ctx.tmp / "no-such-answers.yaml"), "--db", str(db2)])
+    c.add(cmd=e4["cmd"], rc=e4["rc"], ok=e4["rc"] == EXIT_DEP,
+          note="R-15：batch-close 答案文件不存在 → 退出码 4（依赖/环境错误）")
+    if e4["rc"] != EXIT_DEP:
+        c.fail(f"R-15：答案文件不存在应退出码 4，实际 {e4['rc']}。")
 
     db3 = ctx.fresh_db("a72c")
     ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db3)])

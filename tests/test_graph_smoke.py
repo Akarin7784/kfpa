@@ -1,4 +1,4 @@
-"""A8 图冒烟（D1-12 约束 3）：LangGraph 编排层能编译、能跑通一轮 dry-run 得 PASS。
+"""A8 图冒烟（D1-12 约束 3 + R-14 冻结契约）：LangGraph 编排层能编译、能跑通一轮 dry-run 得 PASS。
 
 这条是 `p0-plan §4/A8` 的验收命令本体：`python -m pytest tests/test_graph_smoke.py`。
 
@@ -6,7 +6,13 @@
 处理原则 —— 本文件 skip（不把台架本身拖红），但 `scripts/verify_p0.py` 的 A8 断言会把
 skip 判成 **FAIL**：skip 不等于通过，验收照样不给绿。
 
-D1-12 的保险丝也在这里验：图只是编排层，跑不通不许影响纯函数核心（A1–A7 各自独立）。
+R-14 已把图接口冻结成：
+    build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
+                dry_run=True, injection="none", checkpointer=None)
+    invoke({"round_no", "design_text", "design_ref"}) -> dict
+    终止态含 state/tickets/task_package/exec_result/gate/snapshot/message
+    A8 断言：可编译；round_no==1、tickets 非空、task_package is not None、gate.state=="pass"；
+    **不断言 snapshot 的内容**（依赖 git 标签环境）。
 """
 
 from __future__ import annotations
@@ -20,6 +26,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+R14_NODES = ("gen_tickets", "guard_tickets", "build_package", "execute", "gate", "finalize")
+R14_FINAL_KEYS = ("state", "tickets", "task_package", "exec_result", "gate", "snapshot", "message")
+
 
 def _load(mod_name: str):
     try:
@@ -28,53 +37,46 @@ def _load(mod_name: str):
         pytest.skip(f"{mod_name} 未交付：{type(exc).__name__}: {exc}")
 
 
-def _bind_build_graph(build_graph, ctx: dict):
-    """按签名把可见的依赖喂给 build_graph()；未知参数不硬塞。"""
-    try:
-        sig = inspect.signature(build_graph)
-    except (TypeError, ValueError):
-        return {}
-    kwargs = {}
-    for name, param in sig.parameters.items():
-        if name in ctx:
-            kwargs[name] = ctx[name]
-        elif param.default is inspect.Parameter.empty and name in ("db", "db_path", "path"):
-            kwargs[name] = ctx["db_path"]
-    return kwargs
-
-
-def _state_value(result) -> str:
-    if result is None:
-        return ""
-    if isinstance(result, dict):
-        for key in ("state", "gate_state", "round_state"):
-            if result.get(key):
-                return str(result[key])
-        gate = result.get("gate")
-        if isinstance(gate, dict) and gate.get("state"):
-            return str(gate["state"])
-        return ""
-    for attr in ("state", "gate_state"):
-        val = getattr(result, attr, None)
-        if val is not None:
-            return str(getattr(val, "value", val))
-    return ""
-
-
-def test_build_graph_is_callable_and_compiles():
-    pipeline = _load("kfpa.pipeline")
+def _build_graph(pipeline):
     build_graph = getattr(pipeline, "build_graph", None)
     if build_graph is None:
         pytest.skip("build_graph 未交付（D1-12）：A8 由 scripts/verify_p0.py 判 FAIL")
-    assert callable(build_graph)
+    return build_graph
+
+
+def _gate_state(gate) -> str:
+    if gate is None:
+        return ""
+    if isinstance(gate, dict):
+        value = gate.get("state")
+    else:
+        value = getattr(gate, "state", None)
+    return str(getattr(value, "value", value) or "").lower()
+
+
+def test_build_graph_signature_matches_r14():
+    pipeline = _load("kfpa.pipeline")
+    build_graph = _build_graph(pipeline)
+
+    sig = inspect.signature(build_graph)
+    params = sig.parameters
+    kinds = {p.kind for p in params.values()}
+    assert kinds <= {inspect.Parameter.KEYWORD_ONLY}, "R-14：build_graph 必须是纯关键字参数"
+    for name in ("store", "llm", "executor"):
+        assert name in params, f"R-14：build_graph 缺必填参数 `{name}`"
+        assert params[name].default is inspect.Parameter.empty, f"`{name}` 必须无默认值"
+    for name in ("workdir", "max_attempts", "dry_run", "injection", "checkpointer"):
+        assert name in params, f"R-14：build_graph 缺参数 `{name}`"
+
+    assert getattr(pipeline, "GRAPH_NODES", None) == R14_NODES, \
+        f"R-14：GRAPH_NODES 必须等于 {R14_NODES}"
+    assert hasattr(pipeline, "RoundGraphState"), "R-14：缺 RoundGraphState 类型"
     assert hasattr(pipeline, "run_round"), "D1-12 约束 1：纯函数核心 run_round 必须保留"
 
 
 def test_build_graph_smoke_dry_run_passes(tmp_path):
     pipeline = _load("kfpa.pipeline")
-    build_graph = getattr(pipeline, "build_graph", None)
-    if build_graph is None:
-        pytest.skip("build_graph 未交付（D1-12）：A8 由 scripts/verify_p0.py 判 FAIL")
+    build_graph = _build_graph(pipeline)
 
     store_mod = importlib.import_module("kfpa.store")
     llm_mod = importlib.import_module("kfpa.llm")
@@ -86,46 +88,34 @@ def test_build_graph_smoke_dry_run_passes(tmp_path):
     store = store_mod.Store(str(db))
     store.init_schema()
     llm = llm_mod.build_llm(llm_mod.load_roles(), provider="mock")
-    executor = exec_mod.MockExecutor() if hasattr(exec_mod, "MockExecutor") else exec_mod.Executor()
+    executor = exec_mod.MockExecutor()
 
     design = ROOT / "examples/design-r1.md"
-    design_text = design.read_text(encoding="utf-8", errors="replace") if design.exists() else ""
+    assert design.exists(), "缺 examples/design-r1.md（D1-7 机读行）"
+    design_text = design.read_text(encoding="utf-8", errors="replace")
 
-    ctx = {"store": store, "llm": llm, "executor": executor, "exec": executor,
-           "workdir": str(work), "max_attempts": 3, "dry_run": True,
-           "db_path": str(db), "design_ref": "examples/design-r1.md"}
-    graph = build_graph(**_bind_build_graph(build_graph, ctx))
+    graph = build_graph(store=store, llm=llm, executor=executor, workdir=str(work),
+                        max_attempts=3, dry_run=True, injection="none")
     app = graph.compile() if hasattr(graph, "compile") else graph
     assert hasattr(app, "invoke"), "build_graph() 的返回值既不是图也不是可调用图"
 
-    states = [
-        {"round_no": 1, "design_text": design_text, "design_ref": "examples/design-r1.md"},
-        {"round": 1, "design_text": design_text, "design_ref": "examples/design-r1.md"},
-        {"round_no": 1, "design": design_text, "design_ref": "examples/design-r1.md"},
-    ]
-    result, errors = None, []
-    for state in states:
-        for style in ("plain", "config"):
-            try:
-                if style == "plain":
-                    result = app.invoke(state)
-                else:
-                    result = app.invoke(state, config={"configurable": {"thread_id": "smoke-1"}})
-                break
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{style} {sorted(state)}: {type(exc).__name__}: {exc}")
-        if result is not None:
-            break
-    assert result is not None, ("图冒烟 invoke 全部失败，需要长流给出 build_graph 的输入契约；"
-                               "失败记录：" + " | ".join(errors[:6]))
+    result = app.invoke({"round_no": 1, "design_text": design_text,
+                         "design_ref": "examples/design-r1.md"})
+    assert isinstance(result, dict), f"R-14：invoke 必须返回 dict，实际 {type(result).__name__}"
+    for key in R14_FINAL_KEYS:
+        assert key in result, f"R-14：终止态缺键 `{key}`"
+    assert result["round_no"] == 1
+    assert result["tickets"], "R-14：tickets 必须非空"
+    assert result["task_package"] is not None, "R-14：task_package 必须非空"
+    assert _gate_state(result["gate"]) == "pass", \
+        f"R-14：gate.state 应为 pass，实际 {_gate_state(result['gate'])!r}"
 
+    # 图跑完必须真的落库（图只是编排层，台账仍在自己 SQLite）
     con = sqlite3.connect(str(db))
     try:
-        rows = con.execute("select count(*) from snapshots").fetchone()[0]
+        snaps = con.execute("select count(*) from snapshots").fetchone()[0]
         gates = con.execute("select state from gate_reports").fetchall()
     finally:
         con.close()
-    assert rows >= 1, (f"图跑完了但 snapshots 无行：图没走到快照节点。result 状态 = "
-                       f"{_state_value(result)!r}")
-    assert any(str(g[0]).lower() == "pass" for g in gates), \
-        f"图冒烟未得到 PASS 态，gate_reports = {gates}"
+    assert any(str(g[0]).lower() == "pass" for g in gates), f"gate_reports = {gates}"
+    assert snaps >= 1, "图跑完 snapshots 应有行（本机无 git 标签时不强断言 tag）"
