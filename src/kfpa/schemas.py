@@ -1,4 +1,4 @@
-"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.2）。
+"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.3）。
 
 本文件由 Chief 冻结：**任何人不得直接修改**。需要变更时在群里提，
 由 Chief 升版后统一改，改完必须同步 docs/dev/p0-plan.md §3.1（P0）与 docs/dev/p1-plan.md §3.1（P1）。
@@ -10,6 +10,8 @@
       GateReport 增加 reason_key。
 - 1.2 依 docs/dev/p1-plan.md D3-3.1 增加 P1 三件：LedgerEntry（token 账本）、
       KnowledgeCandidate + CandidateStatus（沉淀闸门）、CoverageReport（G7 覆盖率门槛）。
+- 1.3 依 docs/dev/p2-plan.md D4-3.1 增加 P2 三件：Severity + ReviewFinding + ReviewReport
+      （异构评审位）、ReviewMetrics（同源盲区度量与通过判据）。
 
 设计约束：
 - 只用标准库（dataclasses / enum / json / hashlib），不吃第三方依赖，
@@ -26,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-CONTRACT_VERSION = "1.2"
+CONTRACT_VERSION = "1.3"
 
 # ---------------------------------------------------------------- 枚举
 
@@ -326,6 +328,76 @@ class CoverageReport:
         return self.line_rate >= self.threshold_line and self.critical_paths_ok
 
 
+# ---------------------------------------------------------------- P2 增量（契约 1.3）
+
+
+class Severity(str, Enum):
+    MAJOR = "major"
+    MINOR = "minor"
+    INFO = "info"
+
+
+@dataclass
+class ReviewFinding:
+    """评审位的一条发现（P2 D4-3.1）。"""
+
+    severity: Severity
+    location: str
+    issue: str
+    suggestion: str = ""
+    criterion: str = ""       # 对应验收断言 cid；空串 = 无法定位（G8 不阻塞）
+
+
+@dataclass
+class ReviewReport:
+    """一次评审的结果（P2 D4-3.3）。"""
+
+    round_no: int
+    provider: str             # mock_hetero | mock | litellm
+    model_ref: str            # 从 config/models.yaml 取，不许写死
+    context_id: str           # fresh context 标识（不得等于 ARCHITECT 的）
+    parse_ok: bool
+    verdict: str              # pass | fail | unknown
+    findings: list[ReviewFinding] = field(default_factory=list)
+    attempt: int = 1
+    created_at: float = field(default_factory=time.time)
+
+    def blockers(self) -> list[ReviewFinding]:
+        """G8：只有 major 且带 criterion 的发现才阻塞。"""
+        return [
+            f for f in self.findings
+            if f.severity is Severity.MAJOR and str(f.criterion or "").strip()
+        ]
+
+
+@dataclass
+class ReviewMetrics:
+    """同源盲区度量结果（P2 D4-3.4）。"""
+
+    corpus: str
+    total: int
+    missed: int
+    false_alarms: int
+    agreement: float
+    baseline_missed: int = 0
+    baseline_false_alarms: int = 0
+    baseline_agreement: float = 0.0
+
+    def miss_rate(self) -> float:
+        return 0.0 if self.total <= 0 else self.missed / self.total
+
+    def false_alarm_rate(self) -> float:
+        return 0.0 if self.total <= 0 else self.false_alarms / self.total
+
+    def passed(self) -> bool:
+        """P2 通过判据（D4-3.4）：漏检不增、误报不增、一致率不降。"""
+        return (
+            self.missed <= self.baseline_missed
+            and self.false_alarms <= self.baseline_false_alarms
+            and self.agreement >= self.baseline_agreement
+        )
+
+
 # ---------------------------------------------------------------- 工具
 
 
@@ -369,6 +441,10 @@ __all__ = [
     "CandidateStatus",
     "KnowledgeCandidate",
     "CoverageReport",
+    "Severity",
+    "ReviewFinding",
+    "ReviewReport",
+    "ReviewMetrics",
     "to_jsonable",
     "dumps",
 ]

@@ -12,7 +12,7 @@
 | 项 | 值 |
 |---|---|
 | 验收台架 | `scripts/verify_p0.py`（A1–A10 共 13 条断言）＋ `scripts/selfcheck_core.py`（磐石自检面，96 项，第二意见） |
-| 契约版本 | main `CONTRACT_VERSION 1.2`（P1 起，见 docs/dev/p1-plan.md §3.1）；裁决 D2 已到 **v1.7**（R-1 ~ R-20） |
+| 契约版本 | main `CONTRACT_VERSION 1.3`（P2 起，见 docs/dev/p2-plan.md §3.1）；裁决 D2 已到 **v2.5**（R-1 ~ R-28） |
 | 最近一次全量运行 | 2026-10-16 **clean env**（不设 `PYTHONIOENCODING`/`PYTHONUTF8`、stdout 重定向）@ `main@51b15b3` + 本分支：`verify_p0.py` → **13 条断言 PASS 13 / FAIL 0**、`rc=0`；`selfcheck_core.py` → **96 PASS / 0 FAIL**、`rc=0`；`pytest tests -q` → **35 passed**、`rc=0` |
 | 判定 | **P0 收口通过**（A1–A10 全绿，含 R-18/R-19 的编码健壮性） |
 | 上一轮（同一批分支，合并前） | `main@0195ed7` + `core@b6c6fb0` + `ui@7892ac3` + `pipeline@cad3ea2` → PASS 10 / FAIL 3；三条红同一根因 R-18，已由 `p0/core@b390596`（Chief 代补）闭合 |

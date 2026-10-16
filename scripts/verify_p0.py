@@ -42,9 +42,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: 台架已对齐的契约版本（main 已升 1.2，见 docs/dev/p1-plan.md D3-3.1）
-CONTRACT_VERSION_LATEST = "1.2"
-SUPPORTED_CONTRACT_VERSIONS = ("1.0", "1.1", "1.2")
+#: 台架已对齐的契约版本（main 已升 1.3，见 docs/dev/p2-plan.md D4-3.1）
+CONTRACT_VERSION_LATEST = "1.3"
+SUPPORTED_CONTRACT_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
 
 #: D1-5 / R-1 退出码表
 EXIT_PASS, EXIT_USAGE, EXIT_CONFIRM, EXIT_DEP, EXIT_IO, EXIT_NEEDS_FIX, EXIT_BLOCKED = \

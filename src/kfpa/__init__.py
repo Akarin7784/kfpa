@@ -6,7 +6,7 @@
 模型绑定一律走 config/models.yaml —— 见 docs/dev/p0-plan.md §3.5。
 """
 
-__version__ = "0.2.0"
-CONTRACT_VERSION = "1.2"
+__version__ = "0.3.0"
+CONTRACT_VERSION = "1.3"
 
 __all__ = ["__version__", "CONTRACT_VERSION"]
