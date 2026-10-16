@@ -24,11 +24,26 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def _repo_root() -> Path:
+    """仓库根（**搬运安全**）：从 `pyproject.toml` 往上找，不写死层级。
+
+    `parents[2]` 只在 `benchmarks/p3_store/` 下成立；搬进 `tests/` 后层级少一层、会指到仓库外
+    （界面与镜鉴都在这个坑里栽过）。向上找 `pyproject.toml` 两个位置都算得对。
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return here.parents[2]
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import kfpa.store as st  # noqa: E402
@@ -430,6 +445,13 @@ def test_register_plugin_commands_mounts_fastlane_and_rag(monkeypatch):
 
 
 # ---------------------------------------------------------------- 双驱动同签名对拍（有 PG 时）
+
+#: 本桩在**共享** PG 上的专用行前缀（含每次运行的随机段）。
+#: 共享 55440 上还有 A12/A26 在用这两张表 —— 整表 `DELETE` 会造出
+#: 「SQLite 有行、PG 空表」的错配假红，还会让用例之间产生顺序依赖。
+_PG_PREFIX = f"stub3-{uuid.uuid4().hex[:8]}-"
+
+
 def _pg_dsn() -> str:
     env = os.environ.get("KFPA_PG_PORT", "55440")
     return os.environ.get(st.DB_URL_ENV) or f"postgresql://kfpa:kfpa@127.0.0.1:{env}/kfpa"
@@ -442,51 +464,72 @@ def _pg_store():
         pytest.skip(f"无可用 PG（{type(exc).__name__}: {exc}）")
 
 
-def _wipe(store) -> None:
-    for table in ("fastlane_requests", "knowledge_samples"):
-        store._conn.execute(f"DELETE FROM {table}")
-    try:
-        store._conn.commit()
-    except Exception:
-        pass
+def _clean_own_rows(store) -> None:
+    """只删本桩自己写的行（按前缀），别人的数据一行不动。
+
+    占位符按驱动选（psycopg 要 `%s`、sqlite3 要 `?`）—— 镜鉴踩过的教训：用错占位符 +
+    `except: pass` 会让「安全清理」变成假的，只有真去查库才发现。这里**不许静默**，
+    清理失败就让它带着原始异常炸出来。残留自查：`benchmarks/p3_store/check_pg_residue.py`。
+    """
+    ph = "%s" if getattr(store, "name", "") == "postgres" else "?"
+    for table, column in (("fastlane_requests", "request_id"), ("knowledge_samples", "cid")):
+        store._conn.execute(f"DELETE FROM {table} WHERE {column} LIKE {ph}", (f"{_PG_PREFIX}%",))
+    store._conn.commit()
 
 
 def test_pg_driver_same_signature_and_same_semantics():
-    """同一条剧本跑 PG，逐字段与 SQLite 对齐（A12/A26 的存储侧前提）。"""
+    """同一条剧本跑 PG，逐字段与 SQLite 对齐（A12/A26 的存储侧前提）。
+
+    隔离口径：两侧都用 `stub3-<run>-` 前缀建行，只比对**自己的行**，结束时只清自己的行。
+    """
     pg = _pg_store()
     if pg.get_meta("schema_version") != st.SCHEMA_VERSION:
         pytest.skip("PG 库 schema 不是当前版本（先跑一次 init）")
     mem = st.Store(":memory:")
-    _wipe(pg)
-    for store in (pg, mem):
-        store.add_fastlane_request(_req("fl-1-1", diff_files=["a.py", "b.py"]))
-        store.add_fastlane_request(_req("fl-1-2", status=FastlaneStatus.ESCALATED))
-        store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
-        store.ack_fastlane_request("fl-1-2", by="panshi", batch_id="b-1")
-        store.ack_fastlane_request("fl-1-1", by="someone-else", batch_id="b-2")   # 幂等
-        # 长流 `_decide()` 的整对象写回口，两驱动必须一致
-        req = store.get_fastlane_request("fl-1-2")
-        req.summary = "改过"
-        store.update_fastlane_request(req)
-        store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_at=0.0, sampled_by="panshi",
-                                                   rate=0.2, passed=False))
+    rid1, rid2, cid = f"{_PG_PREFIX}fl-1-1", f"{_PG_PREFIX}fl-1-2", f"{_PG_PREFIX}K1"
+    _clean_own_rows(pg)          # 上一次同前缀的残留（理论上没有，清一下不贵）
+    try:
+        for store in (pg, mem):
+            store.add_fastlane_request(_req(rid1, diff_files=["a.py", "b.py"]))
+            store.add_fastlane_request(_req(rid2, status=FastlaneStatus.ESCALATED))
+            store.ack_fastlane_request(rid1, by="panshi", batch_id="b-1")
+            store.ack_fastlane_request(rid2, by="panshi", batch_id="b-1")
+            store.ack_fastlane_request(rid1, by="someone-else", batch_id="b-2")   # 幂等
+            # 长流 `_decide()` 的整对象写回口，两驱动必须一致
+            req = store.get_fastlane_request(rid2)
+            req.summary = "改过"
+            store.update_fastlane_request(req)
+            store.add_knowledge_sample(KnowledgeSample(cid=cid, sampled_at=0.0,
+                                                       sampled_by="panshi", rate=0.2, passed=False))
 
-    def snap(store):
-        return [
-            {k: str(v) for k, v in vars(r).items() if k != "decided_at"} |
-            {"decided_at_set": r.decided_at > 0}
-            for r in store.list_fastlane_requests()
-        ]
+        def snap(store):
+            # 前缀含随机段，两侧不同：比对前归一掉，其余字段逐字比
+            return [
+                {k: (str(v).replace(_PG_PREFIX, "") if k == "request_id" else str(v))
+                 for k, v in vars(r).items() if k != "decided_at"}
+                | {"decided_at_set": r.decided_at > 0}
+                for r in store.list_fastlane_requests()
+                if str(r.request_id).startswith(_PG_PREFIX)
+            ]
 
-    assert snap(pg) == snap(mem)
-    assert [(s.cid, s.passed, s.rate, s.sampled_by)
-            for s in pg.list_knowledge_samples()] == \
-           [(s.cid, s.passed, s.rate, s.sampled_by)
-            for s in mem.list_knowledge_samples()]
-    # PG 侧同样不许翻白 ESCALATED
-    assert pg.list_fastlane_requests(status="escalated")[0].decided_by == ""
-    with pytest.raises(KeyError):
-        pg.ack_fastlane_request("fl-9-9")
-    _wipe(pg)
-    pg.close()
-    mem.close()
+        def samples(store):
+            return [(s.cid.replace(_PG_PREFIX, ""), s.passed, s.rate, s.sampled_by)
+                    for s in store.list_knowledge_samples()
+                    if str(s.cid).startswith(_PG_PREFIX)]
+
+        assert snap(pg) == snap(mem)
+        assert samples(pg) == samples(mem)
+        # PG 侧同样不许翻白 ESCALATED
+        escalated = [r for r in pg.list_fastlane_requests(status="escalated")
+                     if r.request_id == rid2]
+        assert escalated and escalated[0].decided_by == ""
+        with pytest.raises(KeyError):
+            pg.ack_fastlane_request(f"{_PG_PREFIX}nope")
+        # 收尾必须是**真**清理：删完自己那批还能读回一批空
+        _clean_own_rows(pg)
+        assert not [r for r in pg.list_fastlane_requests()
+                    if r.request_id.startswith(_PG_PREFIX)]
+    finally:
+        _clean_own_rows(pg)
+        pg.close()
+        mem.close()
