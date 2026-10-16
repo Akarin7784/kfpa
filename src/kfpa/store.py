@@ -1,8 +1,11 @@
-"""SQLite 状态库（docs/dev/p0-plan.md §3.2）——六表：rounds / tickets / packages / gates / failures / snapshots。
+"""SQLite 状态库（docs/dev/p0-plan.md §3.2；DDL 严格照 docs/dev/p0-design-addendum.md D1-9）。
+
+表：`meta` + 六张业务表 —— rounds / tickets / task_packages / gate_reports / failures / snapshots。
 
 设计要点：
 - 只用标准库 `sqlite3`；`db_path=":memory:"` 必须可用（镜鉴的用例靠它隔离）。
-- JSON 字段一律走 `schemas.dumps`（sort_keys，稳定可复算）。
+- JSON 字段一律走 `schemas.dumps`（sort_keys，稳定可复算）；时间戳一律 Unix epoch 秒（UTC）。
+- `meta.schema_version = "1"`（D1-9）。
 - **不做业务判定**：门禁三态、硬规则（未关闭高影响票）都不在这里判，本模块只忠实读写。
 - 所有写操作立即 commit；`Store` 可作上下文管理器，也能手动 `close()`。
 """
@@ -32,72 +35,94 @@ from .schemas import (
     package_hash,
 )
 
+#: D1-9 的 schema 版本（写入 meta.schema_version）
+SCHEMA_VERSION = "1"
+
+#: D1-9 的 meta 表名
+META_TABLE = "meta"
+
+#: D1-9 的六张业务表
+BUSINESS_TABLES = (
+    "rounds",
+    "tickets",
+    "task_packages",
+    "gate_reports",
+    "failures",
+    "snapshots",
+)
+
+#: 建库后的完整表集合（含 meta），镜鉴可直接断言
+TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES)
+
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rounds (
-    round_no    INTEGER PRIMARY KEY,
-    design_ref  TEXT    NOT NULL DEFAULT '',
-    state       TEXT    NOT NULL,
-    created_at  REAL    NOT NULL,
-    updated_at  REAL    NOT NULL
+    round_no   INTEGER PRIMARY KEY,
+    design_ref TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
-    ticket_id            TEXT    PRIMARY KEY,
+    ticket_id            TEXT PRIMARY KEY,
     round_no             INTEGER NOT NULL,
-    location             TEXT    NOT NULL DEFAULT '',
-    option_a             TEXT    NOT NULL DEFAULT '',
-    option_b             TEXT    NOT NULL DEFAULT '',
-    architect_preference TEXT    NOT NULL DEFAULT '',
-    impact               TEXT    NOT NULL,
-    status               TEXT    NOT NULL,
+    location             TEXT NOT NULL,
+    option_a             TEXT NOT NULL,
+    option_b             TEXT NOT NULL,
+    architect_preference TEXT NOT NULL,
+    impact               TEXT NOT NULL,
+    status               TEXT NOT NULL,
     answer               TEXT,
-    created_at           REAL    NOT NULL
+    created_at           REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tickets_round        ON tickets(round_no);
-CREATE INDEX IF NOT EXISTS idx_tickets_open_high    ON tickets(round_no, impact, status);
+CREATE INDEX IF NOT EXISTS ix_tickets_round ON tickets(round_no, status, impact);
 
-CREATE TABLE IF NOT EXISTS packages (
+CREATE TABLE IF NOT EXISTS task_packages (
     round_no     INTEGER PRIMARY KEY,
-    package_hash TEXT    NOT NULL,
-    payload      TEXT    NOT NULL,
-    created_at   REAL    NOT NULL
+    package_hash TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS gates (
+CREATE TABLE IF NOT EXISTS gate_reports (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     round_no          INTEGER NOT NULL,
-    state             TEXT    NOT NULL,
-    reasons           TEXT    NOT NULL,
-    failing_criteria  TEXT    NOT NULL,
     attempt           INTEGER NOT NULL,
+    state             TEXT NOT NULL,
+    reason_key        TEXT NOT NULL DEFAULT '',
+    reasons           TEXT NOT NULL,
+    failing_criteria  TEXT NOT NULL,
     escalated         INTEGER NOT NULL DEFAULT 0,
     same_reason_count INTEGER NOT NULL DEFAULT 0,
-    created_at        REAL    NOT NULL
+    created_at        REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_gates_round ON gates(round_no);
+CREATE INDEX IF NOT EXISTS ix_gate_round ON gate_reports(round_no, attempt);
 
 CREATE TABLE IF NOT EXISTS failures (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     round_no      INTEGER NOT NULL,
     attempt       INTEGER NOT NULL,
-    reason        TEXT    NOT NULL,
-    avoid_pattern TEXT    NOT NULL DEFAULT '',
-    created_at    REAL    NOT NULL
+    reason        TEXT NOT NULL,
+    avoid_pattern TEXT NOT NULL,
+    reason_key    TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_failures_round_reason ON failures(round_no, reason);
+CREATE INDEX IF NOT EXISTS ix_failures_key ON failures(round_no, reason_key);
 
 CREATE TABLE IF NOT EXISTS snapshots (
     round_no     INTEGER PRIMARY KEY,
-    package_hash TEXT    NOT NULL DEFAULT '',
-    gate_state   TEXT    NOT NULL,
-    git_sha      TEXT    NOT NULL DEFAULT '',
-    tag          TEXT    NOT NULL DEFAULT '',
-    created_at   REAL    NOT NULL
+    package_hash TEXT NOT NULL,
+    gate_state   TEXT NOT NULL,
+    git_sha      TEXT NOT NULL DEFAULT '',
+    tag          TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL
 );
 """
-
-#: 契约里的六张表（镜鉴可直接用它断言建表完整性）
-TABLE_NAMES = ("rounds", "tickets", "packages", "gates", "failures", "snapshots")
 
 
 def _ticket_from_row(row: sqlite3.Row) -> QATicket:
@@ -136,7 +161,7 @@ def _package_from_payload(round_no: int, payload: str) -> TaskPackage:
 
 
 class Store:
-    """SQLite 持久化门面（签名见契约 §3.2，一个不多一个不少）。"""
+    """SQLite 持久化门面（签名见契约 §3.2，一个不多一个不少；表名照 D1-9）。"""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
@@ -149,8 +174,12 @@ class Store:
     # ------------------------------------------------------------ 生命周期
 
     def init_schema(self) -> None:
-        """建库建表（幂等，可反复调用）。"""
+        """建库建表（幂等）+ 写 `meta.schema_version`（D1-9）。"""
         self._conn.executescript(SCHEMA_SQL)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+            (SCHEMA_VERSION,),
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -167,11 +196,23 @@ class Store:
         self.close()
 
     def list_tables(self) -> list[str]:
-        """已建表名（供自检/验收用）。"""
+        """已建表名（含 meta），供自检/验收用。"""
         rows = self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
         return [r["name"] for r in rows]
+
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row["value"]
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        self._conn.commit()
 
     # ------------------------------------------------------------ 轮次
 
@@ -228,7 +269,7 @@ class Store:
         """新增票；**票号已存在时只刷新票面，保留 status/answer**。
 
         理由（硬规则相关）：`tickets close` 的人确认结果不能被重跑同轮次覆盖掉，
-        否则「关闭高影响票后重跑 round」会永远退化成 tickets_open。
+        否则「关闭高影响票后重跑 round」会永远退化成 tickets_open（D1-1 硬规则）。
         """
         now = time.time()
         existing = self.get_ticket(ticket.ticket_id)
@@ -311,7 +352,7 @@ class Store:
         return self.get_ticket(ticket_id)  # type: ignore[return-value]
 
     def list_open_high_tickets(self, round_no: int) -> list[QATicket]:
-        """未关闭的高影响票——非空时**不得**生成任务包（硬规则，判定在 pipeline）。"""
+        """未关闭的高影响票——非空时**不得**生成任务包（D1-1 硬规则，判定在 pipeline）。"""
         rows = self._conn.execute(
             """
             SELECT * FROM tickets
@@ -329,7 +370,7 @@ class Store:
         digest = package_hash(package)
         self._conn.execute(
             """
-            INSERT INTO packages(round_no, package_hash, payload, created_at)
+            INSERT INTO task_packages(round_no, package_hash, payload, created_at)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(round_no) DO UPDATE SET
                 package_hash = excluded.package_hash,
@@ -343,7 +384,7 @@ class Store:
 
     def get_package(self, round_no: int) -> Optional[TaskPackage]:
         row = self._conn.execute(
-            "SELECT * FROM packages WHERE round_no = ?", (round_no,)
+            "SELECT * FROM task_packages WHERE round_no = ?", (round_no,)
         ).fetchone()
         if row is None:
             return None
@@ -355,16 +396,17 @@ class Store:
         """追加一条门禁判定（attempt 之间并存，便于复盘收敛过程）。"""
         self._conn.execute(
             """
-            INSERT INTO gates(round_no, state, reasons, failing_criteria, attempt,
-                              escalated, same_reason_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO gate_reports(round_no, attempt, state, reason_key, reasons,
+                                     failing_criteria, escalated, same_reason_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 report.round_no,
+                report.attempt,
                 report.state.value,
+                getattr(report, "reason_key", "") or "",
                 dumps(list(report.reasons)),
                 dumps(list(report.failing_criteria)),
-                report.attempt,
                 1 if report.escalated else 0,
                 report.same_reason_count,
                 report.created_at or time.time(),
@@ -374,7 +416,7 @@ class Store:
 
     def list_gate_reports(self, round_no: int) -> list[GateReport]:
         rows = self._conn.execute(
-            "SELECT * FROM gates WHERE round_no = ? ORDER BY id", (round_no,)
+            "SELECT * FROM gate_reports WHERE round_no = ? ORDER BY id", (round_no,)
         ).fetchall()
         return [
             GateReport(
@@ -385,6 +427,7 @@ class Store:
                 attempt=r["attempt"],
                 escalated=bool(r["escalated"]),
                 same_reason_count=r["same_reason_count"],
+                reason_key=r["reason_key"],
                 created_at=r["created_at"],
             )
             for r in rows
@@ -395,14 +438,15 @@ class Store:
     def record_failure(self, failure: FailureRecord) -> None:
         self._conn.execute(
             """
-            INSERT INTO failures(round_no, attempt, reason, avoid_pattern, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO failures(round_no, attempt, reason, avoid_pattern, reason_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 failure.round_no,
                 failure.attempt,
                 failure.reason,
                 failure.avoid_pattern,
+                getattr(failure, "reason_key", "") or "",
                 failure.created_at or time.time(),
             ),
         )
@@ -422,21 +466,24 @@ class Store:
         return [r["avoid_pattern"] for r in rows]
 
     def count_same_failure(self, round_no: int, reason_key: str) -> int:
-        """同类失败计数（reason 精确匹配，**含已写入的当前条**）。
+        """同类失败计数（D1-4 / D1-5 判据 G5）。
 
-        与 §3.5 判据 4 配套：调用方先 `record_failure` 再计数，
-        返回 >= 2 即「同类失败 ≥2 次」→ BLOCKED + escalated。
+        - 匹配口径：先按 `failures.reason_key`（D1-4 归一化键，`sha1(category|target)[:12]`）匹配；
+          历史数据如果没写 reason_key（空串），退化为按 `reason` 精确匹配——兼容长流早期口径。
+        - **返回值是库里已有的条数**；D1-4 定义 `same_reason_count`（不含本次）应在**写入本次
+          FailureRecord 之前**调用，然后 `+1 >= 2` 判升级；若调用方习惯「先写后数」，则判 `>= 2`，
+          两种顺序等价，取哪个数写进 GateReport 由 gates 按 D1-4 决定。
         """
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM failures WHERE round_no = ? AND reason = ?",
-            (round_no, reason_key),
+            "SELECT COUNT(*) AS n FROM failures WHERE round_no = ? AND (reason_key = ? OR reason = ?)",
+            (round_no, reason_key, reason_key),
         ).fetchone()
         return int(row["n"])
 
     # ------------------------------------------------------------ 快照
 
     def save_snapshot(self, snapshot: Snapshot) -> None:
-        """每轮一条快照（同轮次覆盖）。"""
+        """每轮一条快照（同轮次覆盖）。D1-6：只有 PASS 轮带 tag，由 pipeline 决定。"""
         self._conn.execute(
             """
             INSERT INTO snapshots(round_no, package_hash, gate_state, git_sha, tag, created_at)
@@ -489,4 +536,12 @@ class Store:
         ]
 
 
-__all__ = ["Store", "SCHEMA_SQL", "TABLE_NAMES", "schemas"]
+__all__ = [
+    "Store",
+    "SCHEMA_SQL",
+    "SCHEMA_VERSION",
+    "TABLE_NAMES",
+    "BUSINESS_TABLES",
+    "META_TABLE",
+    "schemas",
+]

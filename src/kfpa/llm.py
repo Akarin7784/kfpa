@@ -1,8 +1,9 @@
-"""模型路由（docs/dev/p0-plan.md §3.3）：角色名 → LLM 实例。
+"""模型路由（docs/dev/p0-plan.md §3.3；Mock 剧本见 docs/dev/p0-design-addendum.md D1-7）。
 
 三类实现：
-- :class:`MockLLM` —— P0 验收路径：确定性、无网络、无 key、零第三方依赖；
-- :class:`LiteLLMAdapter` —— 惰性 import litellm，缺包时抛 RuntimeError（中文），绝不 ImportError 崩；
+- :class:`MockLLM` —— P0 验收路径：**不推理**，按 prompt 里的 KFPA marker 从输入文本抽机读行，
+  同一输入永远同一输出，零网络零 key 零第三方依赖；
+- :class:`LiteLLMAdapter` —— 惰性 import litellm，缺包/调用失败一律中文 RuntimeError，绝不 ImportError 崩；
 - `provider="mock"|"litellm"` 由 :func:`build_llm` 统一装配。
 
 铁律：本文件是**唯一**允许出现模型字符串的地方（且模型名一律从 models.yaml 的角色配置里取，
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
@@ -23,6 +25,38 @@ from .config import (
     normalize_role,
     role_config,
 )
+
+# ---------------------------------------------------------------- marker（D1-7）
+
+#: D1-7 冻结的三个 marker
+MARKER_GEN_TICKETS = "[KFPA:GEN_TICKETS]"
+MARKER_BUILD_PACKAGE = "[KFPA:BUILD_PACKAGE]"
+MARKER_REVIEW = "[KFPA:REVIEW]"
+
+#: marker → 允许的角色（marker 与 role 不匹配 → MockScriptError）
+MARKER_ROLE: dict[str, str] = {
+    MARKER_GEN_TICKETS: "ARCHITECT",
+    MARKER_BUILD_PACKAGE: "ARCHITECT",
+    MARKER_REVIEW: "REVIEWER",
+}
+
+#: 过渡期兼容别名（长流早期约定 KFPA_TASK=...，D1 marker 落地后应删除）
+MARKER_ALIASES: dict[str, str] = {
+    "kfpa_task=qa_tickets": MARKER_GEN_TICKETS,
+    "kfpa_task=task_package": MARKER_BUILD_PACKAGE,
+    "kfpa_task=review": MARKER_REVIEW,
+}
+
+#: 失败注入取值（D1-7）
+INJECTIONS: tuple[str, ...] = ("none", "apply_fail", "test_fail")
+
+#: 机读行前缀（D1-7）
+_TICKET_PREFIX = "QA:"
+_AVOID_PREFIX = "AVOID["
+
+
+class MockScriptError(RuntimeError):
+    """Mock 剧本错误（未知 marker / marker 与角色不匹配 / 注入值非法）——D1-7 禁止静默返回。"""
 
 
 @runtime_checkable
@@ -41,152 +75,201 @@ def load_roles(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, dict[
 
 # ---------------------------------------------------------------- Mock
 
-#: MockLLM 在 json_mode 下返回的固定剧本键（长流按这些键解析；改键 = 破坏契约，先在群里说）
-MOCK_TICKETS_KEY = "tickets"
-MOCK_PACKAGE_KEYS = ("feature", "goal", "acceptance", "boundaries",
-                     "interface_contract", "prohibitions", "feedback", "closed_tickets")
-
 
 class MockLLM:
-    """确定性 Mock：相同输入永远相同输出，绝不联网。
+    """确定性 Mock（D1-7）：按 marker 抽机读行，不推理、不联网、不要 key。
 
-    剧本选择规则（按 system+user 文本里的关键词）：
-    - 出现「質問票 / 歧义 / ticket / qa」→ 質問票 JSON；
-    - 出现「任务包 / 六段 / package」→ 任务包 JSON；
-    - json_mode 但都没命中 → 記質問票 JSON（一轮的第一步是转译出票）。
+    marker 与返回：
+    - ``[KFPA:GEN_TICKETS]``（ARCHITECT）→ 抽 ``QA:`` 行 → **JSON 数组**（无 ticket_id，票号由 pipeline 分配）；
+      无匹配行 → ``[]``；
+    - ``[KFPA:BUILD_PACKAGE]``（ARCHITECT）→ 抽 ``FEATURE/GOAL/AC/BOUND/IF/NO`` 行 → 六段 JSON，
+      ``feedback`` 由提示词里的 ``AVOID[`` 行填；
+    - ``[KFPA:REVIEW]``（REVIEWER）→ ``{"verdict","error_category","failed_criteria","reason"}``。
 
-    `high_impact=True` 时第一张票升为 high —— 供 A3「未关闭高影响票不得出任务包」构造用例，
-    默认 False，保证 A2 的一条命令能跑完整轮。
+    ``EMBEDDING`` 不需要 marker（RAG 属 P1），返回 8 维确定性伪向量。
     """
 
     name = "mock"
 
-    TICKET_KEYWORDS = ("質問票", "歧义", "ticket", "qa")
-    PACKAGE_KEYWORDS = ("任务包", "六段", "package")
-
-    def __init__(self, roles: Optional[Mapping[str, Any]] = None, high_impact: bool = False) -> None:
+    def __init__(
+        self,
+        roles: Optional[Mapping[str, Any]] = None,
+        injection: str = "none",
+    ) -> None:
         self.roles = dict(roles or {})
-        self.high_impact = bool(high_impact)
+        if injection not in INJECTIONS:
+            raise MockScriptError(
+                f"未知失败注入：{injection!r}（允许：{' / '.join(INJECTIONS)}）"
+            )
+        self.injection = injection
 
-    # -------------------------------------------------- 固定剧本
-
-    def tickets(self) -> list[dict[str, str]]:
-        """两张票：票面五要素齐全（票号/位置/两种解释/主BOT倾向 + 影响面）。"""
-        impacts = ("high", "medium") if self.high_impact else ("medium", "low")
-        return [
-            {
-                "ticket_id": "T-001",
-                "location": "§4 轮次生命周期 ② 主BOT 转译产出質問票",
-                "option_a": "每轮一次性产出全部質問票，攒批上呈人确认",
-                "option_b": "按模块分批产出質問票，分批上呈",
-                "architect_preference": "A —— 一次产出后攒批上呈，符合 §5.1 保护人的确认带宽",
-                "impact": impacts[0],
-            },
-            {
-                "ticket_id": "T-002",
-                "location": "§5.2 任务包第 6 段 回灌区",
-                "option_a": "只回灌上一轮失败原因与规避要求",
-                "option_b": "累积回灌全部历史失败原因",
-                "architect_preference": "A —— 只回灌上一轮，避免任务包上下文膨胀",
-                "impact": impacts[1],
-            },
-        ]
-
-    def task_package(self) -> dict[str, Any]:
-        """六段齐全的任务包（feedback 首轮为空占位，不计缺段）。"""
-        return {
-            "feature": "P0 最小闭环（mock 任务包）",
-            "goal": "按六段式任务包完成本轮编码任务（mock 剧本，用于离线 dry-run 验收）。",
-            "acceptance": [
-                {"cid": "AC1", "text": "任务包六段齐全且验收标准逐条可测"},
-                {"cid": "AC2", "text": "存在未关闭高影响票时不得生成任务包（退出码非零）"},
-                {"cid": "AC3", "text": "失败原因必须回灌到下一版任务包的回灌区"},
-            ],
-            "boundaries": [
-                "输入域：原始设计文本（Markdown）非空",
-                "异常流：设计文件缺失 → 中文报错，退出码非零",
-                "幂等：同轮次重跑不覆盖已关闭票的人工确认结果",
-            ],
-            "interface_contract": [
-                "run_round(round_no, design_text, design_ref, *, store, llm, executor, workdir, max_attempts=3, dry_run=True) -> RoundResult",
-                "Store.save_package(package: TaskPackage) -> str（返回 package_hash）",
-            ],
-            "prohibitions": [
-                "不许在 llm.py 之外出现模型字符串",
-                "不许绕过 Store 直接写 SQLite",
-                "不许引入 P0 范围外依赖（Dify / Langfuse / PR-Agent / PostgreSQL）",
-            ],
-            "feedback": [],
-            "closed_tickets": [],
-        }
-
-    # -------------------------------------------------- 补全
+    # -------------------------------------------------- 补全入口
 
     def complete(self, role: str, system: str, user: str, *, json_mode: bool = False) -> str:
         name = normalize_role(role)
-        text = f"{system}\n{user}".lower()
+        text = f"{system}\n{user}"
 
+        # EMBEDDING 是 RAG 接口（P1），不参与 marker 剧本。
         if name == "EMBEDDING":
             return self._embedding(text)
 
-        if name == "ARCHITECT":
-            wants_tickets = any(k.lower() in text for k in self.TICKET_KEYWORDS)
-            wants_package = any(k.lower() in text for k in self.PACKAGE_KEYWORDS)
-            if wants_package and not wants_tickets:
-                return self._json(self.task_package()) if json_mode else self._package_text()
-            return self._json({"tickets": self.tickets()}) if json_mode else self._tickets_text()
+        marker = self._find_marker(text)
+        expected = MARKER_ROLE[marker]
+        if name != expected:
+            raise MockScriptError(
+                f"marker {marker} 要求角色 {expected}，当前角色是 {name} → 检查提示词模板"
+            )
 
-        if name == "REVIEWER":
-            review = {
-                "reviews": [
-                    {
-                        "severity": "major",
-                        "location": "任务包 段4 接口契约",
-                        "issue": "接口签名与冻结契约的差异未被显式声明",
-                        "suggestion": "逐条对齐 docs/dev/p0-plan.md §3 后再放行",
-                    },
-                    {
-                        "severity": "minor",
-                        "location": "任务包 段5 禁止事项",
-                        "issue": "禁止事项未量化，无法门禁判定",
-                        "suggestion": "改写成可被 grep / 测试断言的条目",
-                    },
-                ],
+        if marker == MARKER_GEN_TICKETS:
+            return self._json(self._tickets_from_text(text))
+        if marker == MARKER_BUILD_PACKAGE:
+            return self._json(self._package_from_text(text))
+        return self._json(self._review_from_text(text))
+
+    # -------------------------------------------------- marker 识别
+
+    def _find_marker(self, text: str) -> str:
+        upper = text.upper()
+        found: list[str] = [m for m in MARKER_ROLE if m.upper() in upper]
+        lower = text.lower()
+        for alias, marker in MARKER_ALIASES.items():
+            if alias in lower and marker not in found:
+                found.append(marker)
+        if not found:
+            raise MockScriptError(
+                "MockLLM 未在提示词中找到 KFPA marker：需要 "
+                f"{MARKER_GEN_TICKETS} / {MARKER_BUILD_PACKAGE} / {MARKER_REVIEW}"
+                "（EMBEDDING 例外）→ 检查 prompt 模板是否带上 marker"
+            )
+        if len(found) > 1:
+            raise MockScriptError(f"MockLLM 提示词里同时出现多个 marker：{found} → 一次只放一个任务")
+        return found[0]
+
+    # -------------------------------------------------- 抽机读行（D1-7）
+
+    def _tickets_from_text(self, text: str) -> list[dict[str, str]]:
+        """抽 ``QA: <位置> | A: ... | B: ... | P: ... | I: HIGH|MEDIUM|LOW`` → 票面字典数组。
+
+        - 无 QA 行 → `[]`（D1-7 明确允许）；
+        - `I:` 缺失按 MEDIUM 兜底，其余字段缺失填空串（票面完整性由 pipeline 的
+          `QATicket.missing_fields()` 判定，Mock 不替它放水）；
+        - impact 一律转小写，可直接喂 `TicketImpact`。
+        """
+        tickets: list[dict[str, str]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line.upper().startswith(_TICKET_PREFIX):
+                continue
+            body = line.split(":", 1)[1] if ":" in line else ""
+            segments = [seg.strip() for seg in body.split("|")]
+            location = segments[0] if segments else ""
+            fields: dict[str, str] = {}
+            for seg in segments[1:]:
+                if ":" not in seg:
+                    continue
+                key, value = seg.split(":", 1)
+                fields[key.strip().upper()] = value.strip()
+            tickets.append(
+                {
+                    "location": location,
+                    "option_a": fields.get("A", ""),
+                    "option_b": fields.get("B", ""),
+                    "architect_preference": fields.get("P", ""),
+                    "impact": (fields.get("I") or "MEDIUM").lower(),
+                }
+            )
+        return tickets
+
+    def _package_from_text(self, text: str) -> dict[str, Any]:
+        """抽 FEATURE/GOAL/AC/BOUND/IF/NO 行 → 六段 JSON；feedback 取 ``AVOID[`` 行。"""
+        feature = ""
+        goal = ""
+        acceptance: list[str] = []
+        boundaries: list[str] = []
+        interface_contract: list[str] = []
+        prohibitions: list[str] = []
+        feedback: list[str] = []
+        closed_tickets: list[str] = []
+
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.upper().startswith(_AVOID_PREFIX):
+                feedback.append(line)
+                continue
+            match = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+            if match is None:
+                continue
+            key, value = match.group(1).upper(), match.group(2).strip()
+            if not value:
+                continue
+            if key == "FEATURE":
+                feature = value
+            elif key == "GOAL":
+                goal = value
+            elif key == "AC":
+                acceptance.append(value)
+            elif key == "BOUND":
+                boundaries.append(value)
+            elif key == "IF":
+                interface_contract.append(value)
+            elif key == "NO":
+                prohibitions.append(value)
+            elif key == "CLOSED":
+                closed_tickets.append(value)
+
+        return {
+            "feature": feature,
+            "goal": goal,
+            "acceptance": [
+                {"cid": f"AC{i}", "text": item} for i, item in enumerate(acceptance, 1)
+            ],
+            "boundaries": boundaries,
+            "interface_contract": interface_contract,
+            "prohibitions": prohibitions,
+            "feedback": feedback,
+            "closed_tickets": closed_tickets,
+        }
+
+    def _review_from_text(self, text: str) -> dict[str, Any]:
+        """评审剧本：默认 pass；`--inject apply_fail|test_fail` 时按注入返回 fail。"""
+        if self.injection == "none":
+            return {
+                "verdict": "pass",
+                "error_category": "",
+                "failed_criteria": [],
+                "reason": "mock 评审：未发现阻塞问题",
             }
-            return self._json(review) if json_mode else self._review_text()
+        first_cid = ""
+        for line in text.splitlines():
+            if line.strip().upper().startswith("AC:"):
+                first_cid = "AC1"
+                break
+        return {
+            "verdict": "fail",
+            "error_category": self.injection,
+            "failed_criteria": [first_cid] if first_cid else [],
+            "reason": f"mock 注入：{self.injection}",
+        }
 
-        # FLASH：执行结果由长流的 MockExecutor 产出；这里只给确定性占位文本。
-        payload = {"ok": True, "files_changed": [], "notes": "mock 剧本：未真实改动文件"}
-        return self._json(payload) if json_mode else self._flash_text()
-
-    # -------------------------------------------------- 内部工具
+    # -------------------------------------------------- 工具
 
     def _json(self, obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
     def _embedding(self, text: str) -> str:
-        """8 维确定性伪向量（RAG 属于 P1，P0 只保证接口形状可用）。"""
+        """8 维确定性伪向量（RAG 属 P1，P0 只保证接口形状可用）。"""
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         vec = [round(b / 255.0, 6) for b in digest[:8]]
         return self._json({"embedding": vec, "dim": len(vec), "mock": True})
 
-    def _tickets_text(self) -> str:
-        return "（mock）已转译设计，产出 2 张質問票，请攒批确认后放行。"
-
-    def _package_text(self) -> str:
-        return "（mock）已按六段式生成任务包。"
-
-    def _review_text(self) -> str:
-        return "（mock）评审完成：1 条 major、1 条 minor，详见 json_mode 输出。"
-
-    def _flash_text(self) -> str:
-        return "（mock）执行完成：未真实改动文件。"
-
 
 # ---------------------------------------------------------------- LiteLLM
 
+
 class LiteLLMAdapter:
-    """真实模型适配器（P1 起用）。惰性 import：缺包时报中文 RuntimeError，不崩。
+    """真实模型适配器。惰性 import：缺包 → 中文 RuntimeError（退出码 4 的语义来源）。
 
     模型名、温度等一律从角色配置读；`thinking` 开关由 LiteLLM 代理侧配置承担，这里透传不了就不传。
     """
@@ -202,11 +285,11 @@ class LiteLLMAdapter:
         spec = role_config(self.roles, name)
 
         try:
-            import litellm  # 惰性导入：P0 验收环境不需要装
+            import litellm  # 惰性导入：缺包时给中文提示而不是 ImportError 崩
         except ImportError as exc:
             raise RuntimeError(
-                "未安装 litellm：P0 验收请用 --provider mock；"
-                "接入真实模型需先让 Chief 统一安装（pip install litellm）"
+                "未安装 litellm：这是可选依赖缺失 → 请让 Chief 统一安装（pip install litellm），"
+                "或改用 --provider mock"
             ) from exc
 
         model = spec["model"]
@@ -215,8 +298,8 @@ class LiteLLMAdapter:
                 resp = litellm.embedding(model=model, input=[user])
             except Exception as exc:
                 raise RuntimeError(
-                    f"模型调用失败（角色 {name}，provider=litellm）：{type(exc).__name__}: {exc}；"
-                    "P0 验收请用 --provider mock"
+                    f"模型调用失败（角色 {name}，provider=litellm）：{type(exc).__name__}: {exc}"
+                    " → P0 验收请用 --provider mock"
                 ) from exc
             data = resp["data"][0]["embedding"]
             return json.dumps({"embedding": list(data), "dim": len(data)}, ensure_ascii=False)
@@ -239,8 +322,8 @@ class LiteLLMAdapter:
         except Exception as exc:
             # 无 key / 网络不通 / 模型名错，统一变中文 RuntimeError，CLI 不许裸崩。
             raise RuntimeError(
-                f"模型调用失败（角色 {name}，provider=litellm）：{type(exc).__name__}: {exc}；"
-                "P0 验收请用 --provider mock，或让 Chief 配好 key"
+                f"模型调用失败（角色 {name}，provider=litellm）：{type(exc).__name__}: {exc}"
+                " → P0 验收请用 --provider mock，或让 Chief 配好 key"
             ) from exc
         return resp.choices[0].message.content or ""
 
@@ -258,10 +341,15 @@ def build_llm(roles: Mapping[str, Any], provider: str = "mock", **kwargs: Any) -
 __all__ = [
     "LLM",
     "MockLLM",
+    "MockScriptError",
     "LiteLLMAdapter",
     "build_llm",
     "load_roles",
     "ROLE_NAMES",
-    "MOCK_TICKETS_KEY",
-    "MOCK_PACKAGE_KEYS",
+    "MARKER_GEN_TICKETS",
+    "MARKER_BUILD_PACKAGE",
+    "MARKER_REVIEW",
+    "MARKER_ROLE",
+    "MARKER_ALIASES",
+    "INJECTIONS",
 ]
