@@ -1,13 +1,19 @@
-"""模型路由（docs/dev/p0-plan.md §3.3；Mock 剧本见 docs/dev/p0-design-addendum.md D1-7）。
+"""模型路由（docs/dev/p0-plan.md §3.3；Mock 剧本见 D1-7 与 D2 裁决 R-3 / R-5 / R-10）。
 
 三类实现：
-- :class:`MockLLM` —— P0 验收路径：**不推理**，按 prompt 里的 KFPA marker 从输入文本抽机读行，
-  同一输入永远同一输出，零网络零 key 零第三方依赖；
-- :class:`LiteLLMAdapter` —— 惰性 import litellm，缺包/调用失败一律中文 RuntimeError，绝不 ImportError 崩；
+- :class:`MockLLM` —— P0 验收路径：**不推理**，按 prompt 里的 marker 或关键词选剧本、从输入文本抽机读行，
+  同一输入永远同一输出，零网络零 key；
+- :class:`LiteLLMAdapter` —— 惰性 import litellm，缺包/调用失败一律中文 RuntimeError（D2 R-7 / A9），
+  绝不裸抛 AuthenticationError，也绝不 ImportError 崩；
 - `provider="mock"|"litellm"` 由 :func:`build_llm` 统一装配。
 
-铁律：本文件是**唯一**允许出现模型字符串的地方（且模型名一律从 models.yaml 的角色配置里取，
-不写字面量），pipeline / gates / ui 只准用角色名。
+剧本选择优先级（D2 R-3，D1-7 的 `[KFPA:...]` marker 仍然兼容）：
+    1. `KFPA_TASK=qa_tickets` / `KFPA_TASK=task_package`（长流 prompt 里写的 marker，**优先**）
+    2. `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` / `[KFPA:REVIEW]`（D1-7 原 marker）
+    3. 关键词兜底（質問票/歧义/ticket/qa、任务包/六段/package）
+    4. 都没有 → `MockScriptError`（D1-7：禁止静默返回空串）
+
+铁律：模型字符串只能从 `config/models.yaml` 的角色配置里取，本文件不写任何字面量模型名。
 """
 
 from __future__ import annotations
@@ -26,37 +32,45 @@ from .config import (
     role_config,
 )
 
-# ---------------------------------------------------------------- marker（D1-7）
+# ---------------------------------------------------------------- marker
 
-#: D1-7 冻结的三个 marker
+#: D2 R-3：长流 prompt 里的 marker（优先）
+MARKER_TASK_QA = "KFPA_TASK=qa_tickets"
+MARKER_TASK_PACKAGE = "KFPA_TASK=task_package"
+
+#: D1-7 的标记（兼容保留）
 MARKER_GEN_TICKETS = "[KFPA:GEN_TICKETS]"
 MARKER_BUILD_PACKAGE = "[KFPA:BUILD_PACKAGE]"
 MARKER_REVIEW = "[KFPA:REVIEW]"
 
-#: marker → 允许的角色（marker 与 role 不匹配 → MockScriptError）
-MARKER_ROLE: dict[str, str] = {
-    MARKER_GEN_TICKETS: "ARCHITECT",
-    MARKER_BUILD_PACKAGE: "ARCHITECT",
-    MARKER_REVIEW: "REVIEWER",
-}
+#: 归一化后的剧本名
+SCRIPT_TICKETS = "tickets"
+SCRIPT_PACKAGE = "package"
+SCRIPT_REVIEW = "review"
 
-#: 过渡期兼容别名（长流早期约定 KFPA_TASK=...，D1 marker 落地后应删除）
-MARKER_ALIASES: dict[str, str] = {
-    "kfpa_task=qa_tickets": MARKER_GEN_TICKETS,
-    "kfpa_task=task_package": MARKER_BUILD_PACKAGE,
-    "kfpa_task=review": MARKER_REVIEW,
-}
+#: 识别输入 → (剧本名, 允许角色)
+_MARKER_TABLE: tuple[tuple[str, str, str], ...] = (
+    (MARKER_TASK_QA, SCRIPT_TICKETS, "ARCHITECT"),
+    (MARKER_TASK_PACKAGE, SCRIPT_PACKAGE, "ARCHITECT"),
+    (MARKER_GEN_TICKETS, SCRIPT_TICKETS, "ARCHITECT"),
+    (MARKER_BUILD_PACKAGE, SCRIPT_PACKAGE, "ARCHITECT"),
+    (MARKER_REVIEW, SCRIPT_REVIEW, "REVIEWER"),
+)
 
-#: 失败注入取值（D1-7）
-INJECTIONS: tuple[str, ...] = ("none", "apply_fail", "test_fail")
+#: 关键词兜底（D2 R-3）
+_TICKET_KEYWORDS = ("質問票", "歧义", "ticket", "qa")
+_PACKAGE_KEYWORDS = ("任务包", "六段", "package")
 
-#: 机读行前缀（D1-7）
+#: D2 R-10：失败注入值域
+INJECTIONS: tuple[str, ...] = ("none", "high_ticket", "apply_fail", "test_fail")
+
+#: D1-7 机读行前缀
 _TICKET_PREFIX = "QA:"
 _AVOID_PREFIX = "AVOID["
 
 
 class MockScriptError(RuntimeError):
-    """Mock 剧本错误（未知 marker / marker 与角色不匹配 / 注入值非法）——D1-7 禁止静默返回。"""
+    """Mock 剧本错误（未知 marker / marker 与角色不匹配 / 无 marker 且无关键词 / 注入值非法）。"""
 
 
 @runtime_checkable
@@ -77,16 +91,18 @@ def load_roles(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, dict[
 
 
 class MockLLM:
-    """确定性 Mock（D1-7）：按 marker 抽机读行，不推理、不联网、不要 key。
+    """确定性 Mock（D1-7 / D2 R-3）：抽机读行，不推理、不联网、不要 key。
 
-    marker 与返回：
-    - ``[KFPA:GEN_TICKETS]``（ARCHITECT）→ 抽 ``QA:`` 行 → **JSON 数组**（无 ticket_id，票号由 pipeline 分配）；
-      无匹配行 → ``[]``；
-    - ``[KFPA:BUILD_PACKAGE]``（ARCHITECT）→ 抽 ``FEATURE/GOAL/AC/BOUND/IF/NO`` 行 → 六段 JSON，
-      ``feedback`` 由提示词里的 ``AVOID[`` 行填；
-    - ``[KFPA:REVIEW]``（REVIEWER）→ ``{"verdict","error_category","failed_criteria","reason"}``。
+    返回结构（D2 R-3）：
+    - 質問票：``{"tickets":[{location,option_a,option_b,architect_preference,impact}...]}``
+      —— **不带 `ticket_id`**，票号由 pipeline 按 `R{round}-{seq:03d}` 分配（R-3 的 duplicate keyword 防护）；
+      无 QA 行 → ``{"tickets":[]}``；
+    - 任务包：``{feature,goal,acceptance:[{cid,text}],boundaries,interface_contract,prohibitions,
+      feedback,closed_tickets}``，`feedback` 由提示词里的 ``AVOID[`` 行填；
+    - 评审（D2 R-5）：``{"reviews":[{severity,location,issue,suggestion}...]}``，不参与 P0 门禁。
 
-    ``EMBEDDING`` 不需要 marker（RAG 属 P1），返回 8 维确定性伪向量。
+    `high_impact=True` 或 `injection="high_ticket"` 时首张票升为 HIGH（D2 R-10 的 A3 注入件）；
+    默认两张票 impact = medium/low，保证 A2 一条命令跑完整轮。
     """
 
     name = "mock"
@@ -95,6 +111,7 @@ class MockLLM:
         self,
         roles: Optional[Mapping[str, Any]] = None,
         injection: str = "none",
+        high_impact: bool = False,
     ) -> None:
         self.roles = dict(roles or {})
         if injection not in INJECTIONS:
@@ -102,6 +119,8 @@ class MockLLM:
                 f"未知失败注入：{injection!r}（允许：{' / '.join(INJECTIONS)}）"
             )
         self.injection = injection
+        # R-10：high_ticket 只影响 mock 剧本；两种接线口径都支持
+        self.high_impact = bool(high_impact or injection == "high_ticket")
 
     # -------------------------------------------------- 补全入口
 
@@ -113,37 +132,41 @@ class MockLLM:
         if name == "EMBEDDING":
             return self._embedding(text)
 
-        marker = self._find_marker(text)
-        expected = MARKER_ROLE[marker]
+        script, expected = self._select_script(text)
         if name != expected:
             raise MockScriptError(
-                f"marker {marker} 要求角色 {expected}，当前角色是 {name} → 检查提示词模板"
+                f"marker 对应的剧本是 {script}，要求角色 {expected}，当前角色是 {name} → 检查提示词模板"
             )
 
-        if marker == MARKER_GEN_TICKETS:
-            return self._json(self._tickets_from_text(text))
-        if marker == MARKER_BUILD_PACKAGE:
+        if script == SCRIPT_TICKETS:
+            return self._json({"tickets": self._tickets_from_text(text)})
+        if script == SCRIPT_PACKAGE:
             return self._json(self._package_from_text(text))
         return self._json(self._review_from_text(text))
 
-    # -------------------------------------------------- marker 识别
+    # -------------------------------------------------- 剧本选择（D2 R-3）
 
-    def _find_marker(self, text: str) -> str:
+    def _select_script(self, text: str) -> tuple[str, str]:
+        """marker 优先，关键词兜底；未知的 `[KFPA:` marker 仍然报错（D1-7）。"""
         upper = text.upper()
-        found: list[str] = [m for m in MARKER_ROLE if m.upper() in upper]
+        for marker, script, role in _MARKER_TABLE:
+            if marker.upper() in upper:
+                return script, role
+
+        # 出现了 KFPA 风格的 marker 但不认识 → 报错，别猜（D1-7）
+        if "[KFPA:" in upper or "KFPA_TASK=" in upper:
+            known = " / ".join(m for m, _, _ in _MARKER_TABLE)
+            raise MockScriptError(f"未知 KFPA marker → 检查提示词模板（已支持：{known}）")
+
         lower = text.lower()
-        for alias, marker in MARKER_ALIASES.items():
-            if alias in lower and marker not in found:
-                found.append(marker)
-        if not found:
-            raise MockScriptError(
-                "MockLLM 未在提示词中找到 KFPA marker：需要 "
-                f"{MARKER_GEN_TICKETS} / {MARKER_BUILD_PACKAGE} / {MARKER_REVIEW}"
-                "（EMBEDDING 例外）→ 检查 prompt 模板是否带上 marker"
-            )
-        if len(found) > 1:
-            raise MockScriptError(f"MockLLM 提示词里同时出现多个 marker：{found} → 一次只放一个任务")
-        return found[0]
+        if any(k.lower() in lower for k in _TICKET_KEYWORDS):
+            return SCRIPT_TICKETS, "ARCHITECT"
+        if any(k.lower() in lower for k in _PACKAGE_KEYWORDS):
+            return SCRIPT_PACKAGE, "ARCHITECT"
+        raise MockScriptError(
+            "MockLLM 既没有 marker 也没有可选的关键词 → 检查提示词模板"
+            f"（marker：{MARKER_TASK_QA} / {MARKER_TASK_PACKAGE}）"
+        )
 
     # -------------------------------------------------- 抽机读行（D1-7）
 
@@ -153,7 +176,8 @@ class MockLLM:
         - 无 QA 行 → `[]`（D1-7 明确允许）；
         - `I:` 缺失按 MEDIUM 兜底，其余字段缺失填空串（票面完整性由 pipeline 的
           `QATicket.missing_fields()` 判定，Mock 不替它放水）；
-        - impact 一律转小写，可直接喂 `TicketImpact`。
+        - impact 一律转小写，可直接喂 `TicketImpact`；
+        - **不带 `ticket_id`**（D2 R-3：票号由 pipeline 分配，避免 `QATicket(**raw)` duplicate keyword）。
         """
         tickets: list[dict[str, str]] = []
         for raw in text.splitlines():
@@ -178,10 +202,13 @@ class MockLLM:
                     "impact": (fields.get("I") or "MEDIUM").lower(),
                 }
             )
+
+        if self.high_impact and tickets:
+            tickets[0]["impact"] = "high"
         return tickets
 
     def _package_from_text(self, text: str) -> dict[str, Any]:
-        """抽 FEATURE/GOAL/AC/BOUND/IF/NO 行 → 六段 JSON；feedback 取 ``AVOID[`` 行。"""
+        """抽 FEATURE/GOAL/AC/BOUND/IF/NO 行 → 六段 JSON；feedback 取 ``AVOID[`` 行（D1-11）。"""
         feature = ""
         goal = ""
         acceptance: list[str] = []
@@ -233,25 +260,31 @@ class MockLLM:
         }
 
     def _review_from_text(self, text: str) -> dict[str, Any]:
-        """评审剧本：默认 pass；`--inject apply_fail|test_fail` 时按注入返回 fail。"""
-        if self.injection == "none":
-            return {
-                "verdict": "pass",
-                "error_category": "",
-                "failed_criteria": [],
-                "reason": "mock 评审：未发现阻塞问题",
-            }
-        first_cid = ""
-        for line in text.splitlines():
-            if line.strip().upper().startswith("AC:"):
-                first_cid = "AC1"
-                break
-        return {
-            "verdict": "fail",
-            "error_category": self.injection,
-            "failed_criteria": [first_cid] if first_cid else [],
-            "reason": f"mock 注入：{self.injection}",
-        }
+        """D2 R-5：返回 `{"reviews":[{severity,location,issue,suggestion}...]}`，不决定三态。"""
+        reviews = [
+            {
+                "severity": "major",
+                "location": "任务包 段4 接口契约",
+                "issue": "接口签名与冻结契约的差异未显式声明",
+                "suggestion": "逐条对齐 docs/dev/p0-plan.md §3 后再放行",
+            },
+            {
+                "severity": "minor",
+                "location": "任务包 段5 禁止事项",
+                "issue": "禁止事项未量化，无法门禁判定",
+                "suggestion": "改写成可被 grep / 测试断言的条目",
+            },
+        ]
+        if self.injection in ("apply_fail", "test_fail"):
+            reviews.append(
+                {
+                    "severity": "major",
+                    "location": "执行器",
+                    "issue": f"mock 注入：{self.injection}",
+                    "suggestion": "看门禁 FAILING 项与回灌区",
+                }
+            )
+        return {"reviews": reviews}
 
     # -------------------------------------------------- 工具
 
@@ -269,7 +302,7 @@ class MockLLM:
 
 
 class LiteLLMAdapter:
-    """真实模型适配器。惰性 import：缺包 → 中文 RuntimeError（退出码 4 的语义来源）。
+    """真实模型适配器（D2 R-7 / A9）：一切调用异常统一包成中文 `RuntimeError`。
 
     模型名、温度等一律从角色配置读；`thinking` 开关由 LiteLLM 代理侧配置承担，这里透传不了就不传。
     """
@@ -320,7 +353,7 @@ class LiteLLMAdapter:
         try:
             resp = litellm.completion(**call_kwargs)
         except Exception as exc:
-            # 无 key / 网络不通 / 模型名错，统一变中文 RuntimeError，CLI 不许裸崩。
+            # A9：无 key / 网络不通 / 模型名错，一律中文 RuntimeError 且提示 mock 路径。
             raise RuntimeError(
                 f"模型调用失败（角色 {name}，provider=litellm）：{type(exc).__name__}: {exc}"
                 " → P0 验收请用 --provider mock，或让 Chief 配好 key"
@@ -346,10 +379,13 @@ __all__ = [
     "build_llm",
     "load_roles",
     "ROLE_NAMES",
+    "MARKER_TASK_QA",
+    "MARKER_TASK_PACKAGE",
     "MARKER_GEN_TICKETS",
     "MARKER_BUILD_PACKAGE",
     "MARKER_REVIEW",
-    "MARKER_ROLE",
-    "MARKER_ALIASES",
+    "SCRIPT_TICKETS",
+    "SCRIPT_PACKAGE",
+    "SCRIPT_REVIEW",
     "INJECTIONS",
 ]

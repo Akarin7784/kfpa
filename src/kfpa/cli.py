@@ -42,16 +42,16 @@ GATE_EXIT_CODES: dict[GateState, int] = {
     GateState.BLOCKED: EXIT_BLOCKED,
 }
 
-EPILOG = """退出码（D1-5）：
-  0   PASS（并通过快照）
+EPILOG = """退出码（D1-5 / D2 R-1）：
+  0   PASS / 正常（含 --help、空库 history）
+  2   用法 / 参数错误（argparse 原生，不再占用其它含义）
+  3   等待人工确认（有未关闭高影响票；或该轮暂无门禁记录）
+  4   依赖 / 环境错误（可选包缺失、配置错误、设计文件不存在）
+  5   I/O 或数据库错误（含快照/标签缺失导致的回滚失败）
   10  NEEDS_FIX（未耗尽重试上限）
-  11  BLOCKED（升级主BOT）
-  3   存在未关闭的高影响質問票，拒绝生成任务包
-  2   用法/参数错误
-  4   依赖缺失（litellm / aider / streamlit 等未安装）
-  5   I/O 或数据库错误
+  11  BLOCKED（已升级主BOT）
 
-示例：
+示例（运行方式见 D2 R-2：$env:PYTHONPATH="src"; python -m kfpa ...）：
   kfpa init --db kfpa.db
   kfpa round --design examples/design-r1.md --round 1 --dry-run --db kfpa.db
   kfpa tickets list --db kfpa.db
@@ -66,8 +66,12 @@ def default_workdir(round_no: int) -> str:
     return str(Path("runs") / f"round-{round_no}")
 
 
+#: D2 R-10：注入件里与执行器相关、需要透传给 run_round 的值
+_EXECUTOR_INJECTIONS = ("apply_fail", "test_fail")
+
+
 def _exception_exit_code(exc: BaseException) -> int:
-    """异常 → D1-5 退出码：依赖缺失 4 / I/O 与数据库 5，其余归 5（基础层故障）。"""
+    """异常 → D1-5 / D2 R-1 退出码：依赖与环境 4，I/O 与数据库 5。"""
     if isinstance(exc, ImportError):
         return EXIT_DEP_MISSING
     text = str(exc)
@@ -100,8 +104,9 @@ def cmd_round(args: argparse.Namespace) -> int:
     """跑一轮：设计 → 質問票 → 任务包 → 执行 → 门禁 → 快照。"""
     design_path = Path(args.design)
     if not design_path.is_file():
+        # D2 R-1：4 = 依赖/环境错误，明确包含「设计文件不存在」。
         print(f"[core] 设计文件不存在：{design_path} → 检查 --design 路径", file=sys.stderr)
-        return EXIT_IO
+        return EXIT_DEP_MISSING
     try:
         design_text = design_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -147,10 +152,18 @@ def cmd_round(args: argparse.Namespace) -> int:
 
         try:
             roles = load_roles(args.config)
-            llm = build_llm(roles, provider=args.provider, injection=args.inject)
+            # D2 R-10：high_ticket 只改 mock 剧本（build_llm(..., high_impact=True)），
+            # apply_fail / test_fail 由 run_round(injection=...) 交给执行器。
+            llm = build_llm(
+                roles,
+                provider=args.provider,
+                injection=args.inject,
+                high_impact=(args.inject == "high_ticket"),
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            # D2 R-1：4 = 依赖/环境错误，明确包含「配置错误」。
             print(f"[core] 角色配置错误：{exc} → 检查 --config / models.yaml 并在仓库根目录运行", file=sys.stderr)
-            return _exception_exit_code(exc)
+            return EXIT_DEP_MISSING
 
         workdir = Path(args.workdir) if args.workdir else Path(default_workdir(args.round_no))
         try:
@@ -169,10 +182,13 @@ def cmd_round(args: argparse.Namespace) -> int:
                 "max_attempts": args.max_attempts,
                 "dry_run": args.dry_run,
             }
-            # injection 是 v1.1 新增形参；长流的实现若还没跟上，就不传（避免无谓的类型错误）。
+            # D2 R-10：只有执行器注入（apply_fail / test_fail）透传给 run_round；
+            # high_ticket 已在 build_llm 里作用于 mock 剧本，传给执行器无意义。
             try:
                 if "injection" in inspect.signature(run_round).parameters:
-                    call_kwargs["injection"] = args.inject
+                    call_kwargs["injection"] = (
+                        args.inject if args.inject in _EXECUTOR_INJECTIONS else "none"
+                    )
             except (TypeError, ValueError):  # pragma: no cover - 可调用对象的签名不可内省
                 pass
 
@@ -234,23 +250,11 @@ def cmd_round(args: argparse.Namespace) -> int:
 
 
 def _round_exit_code(result: Any) -> int:
-    """轮次结果 → D1-5 退出码。
+    """轮次结果 → D1-5 / D2 R-1 退出码。**映射只在本文件**（R-1：长流不另做 `round_exit_code()`）。
 
-    优先用 `pipeline.round_exit_code(result)`（长流实现，口径最权威）；
-    没有该函数时按「未关闭高影响票 → 3、门禁态 → 0/10/11、否则按轮次状态」兜底。
+    规则：未关闭高影响票 → 3；有门禁报告按门禁态（0 / 10 / 11）；
+    否则按轮次状态（SNAPSHOTTED → 0，TICKETS_OPEN → 3，BLOCKED → 11，其余视为未通过 → 10）。
     """
-    try:
-        from . import pipeline as pipeline_mod
-
-        fn = getattr(pipeline_mod, "round_exit_code", None)
-        if callable(fn):
-            try:
-                return int(fn(result))
-            except Exception:  # 坏实现不许拖垮 CLI，退回兜底
-                pass
-    except ImportError:
-        pass
-
     if getattr(result, "open_high_tickets", None) and result.open_high_tickets():
         return EXIT_HIGH_TICKET
     gate = getattr(result, "gate", None)
@@ -277,8 +281,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return EXIT_IO
 
     if not reports:
+        # D2 R-1：3 = 等待人工确认，明确包含「该轮暂无门禁记录」。
         print(f"[gate] 轮次 {args.round_no} 暂无门禁记录 → 先跑 kfpa round", file=sys.stderr)
-        return EXIT_IO
+        return EXIT_HIGH_TICKET
 
     last = reports[-1]
     print(
@@ -412,9 +417,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_round.add_argument("--provider", choices=["mock", "litellm"], default="mock", help="LLM 提供方（默认 mock）")
     p_round.add_argument(
         "--inject",
-        choices=["none", "apply_fail", "test_fail"],
+        choices=["none", "high_ticket", "apply_fail", "test_fail"],
         default="none",
-        help="失败注入（默认 none；供 A4 验收，D1-7）",
+        help="失败注入（默认 none；high_ticket 改 mock 剧本，apply_fail/test_fail 交执行器 —— D2 R-10）",
     )
     p_round.add_argument("--max-attempts", type=int, default=3, help="门禁重试上限（默认 3，D1-5）")
     p_round.add_argument("--json", action="store_true", help="最后输出单行 JSON（schemas.dumps(RoundResult)）")

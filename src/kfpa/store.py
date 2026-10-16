@@ -323,8 +323,13 @@ class Store:
         self,
         round_no: Optional[int] = None,
         status: Optional[TicketStatus] = None,
+        impact: Optional[TicketImpact] = None,
     ) -> list[QATicket]:
-        """按轮次 / 状态过滤（两者都可为 None = 不过滤），按 round_no、ticket_id 排序。"""
+        """按轮次 / 状态 / 影响面过滤（都可为 None = 不过滤），按 round_no、ticket_id 排序。
+
+        D2 R-8：`impact` 下推到 SQL `WHERE`（索引 `ix_tickets_round(round_no, status, impact)` 已覆盖），
+        界面不要自己本地过滤。这是方法签名变更，不是数据契约变更（`schemas.py` 不动、不升版本）。
+        """
         sql = "SELECT * FROM tickets"
         clauses: list[str] = []
         params: list[Any] = []
@@ -334,6 +339,9 @@ class Store:
         if status is not None:
             clauses.append("status = ?")
             params.append(TicketStatus(status).value)
+        if impact is not None:
+            clauses.append("impact = ?")
+            params.append(TicketImpact(impact).value)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY round_no, ticket_id"
