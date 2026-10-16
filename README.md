@@ -40,7 +40,32 @@
 
 ## 状态
 
-🚧 设计定稿，工程实现中。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
+✅ **P0 最小闭环已交付**（2026-10-16，main）：设计 → 質問票 → 人工确认 → 六段式任务包 → 执行器（mock）→ 门禁三态 → SQLite 落库 → 按轮快照，全程可**离线**验收（无网络、无 API key）。
+🚧 P1（PostgreSQL + Langfuse + PR-Agent + Streamlit 台账）进行中。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
+
+### 快速开始（clean env，无需 API key）
+
+```powershell
+$env:PYTHONPATH="src"                                                # 见 docs/dev/p0-rulings.md R-2
+python -m kfpa init --db kfpa.db
+python -m kfpa round --design examples/design-r1.md --round 1 --dry-run --db kfpa.db
+python -m kfpa tickets list --db kfpa.db                             # 質問票台账
+python -m kfpa tickets batch-close --file answers.yaml --db kfpa.db  # 攒批确认（格式见 D1-8）
+python -m kfpa round --design examples/design-r1.md --round 1 --dry-run --db kfpa.db
+python -m kfpa history --db kfpa.db                                  # 轮次快照
+```
+
+退出码（D1-5 / D2 R-1）：`0` 通过 · `2` 用法错误 · `3` 等待人工确认 · `4` 依赖/环境 · `5` I/O · `10` 需修复 · `11` 阻塞。
+
+### P0 验收结果（`main`，clean env 不设 `PYTHONIOENCODING`）
+
+| 台架 | 结果 |
+|---|---|
+| `python scripts/verify_p0.py` | **A1–A10 共 13 条断言 PASS 13 / FAIL 0 / SKIP 0** |
+| `python scripts/selfcheck_core.py` | **96 PASS / 0 FAIL** |
+| `python -m pytest tests -q` | **35 passed** |
+
+设计与裁决文档：[docs/dev/p0-plan.md](docs/dev/p0-plan.md)（施工图与 A1–A10）· [docs/dev/p0-design-addendum.md](docs/dev/p0-design-addendum.md)（D1 工程细节）· [docs/dev/p0-rulings.md](docs/dev/p0-rulings.md)（D2 裁决 R-1~R-19）· 验收报告 [docs/acceptance/p0-acceptance.md](docs/acceptance/p0-acceptance.md)。
 
 ## License
 
