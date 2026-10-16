@@ -272,3 +272,39 @@ def test_eval_cli_missing_seed_returns_4(tmp_path, capsys):
 
 def test_review_error_type_exists():
     assert issubclass(ReviewError, RuntimeError)
+
+
+# ---------------------------------------------------------------- T5/T6/T7 补充（R-30 搬运清单）
+
+
+def test_eval_cli_writes_out_file_with_frozen_top_level_shape(tmp_path):
+    """A21 的 CLI 路径：`--out` 真的落盘，且顶层是 D4 §3.6 冻结的六键。"""
+    from kfpa import cli
+    out = tmp_path / "eval.json"
+    rc = cli.main(["eval", "review", "--seed", str(SEED), "--out", str(out)])
+    assert rc == 0, f"`eval review --out` 应 rc=0，实际 {rc}"
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert {"corpus", "generated_at", "provider", "baseline_provider",
+            "metrics", "samples"} <= set(payload), f"顶层键不符：{sorted(payload)}"
+    assert isinstance(payload["generated_at"], (int, float)), "generated_at 必须是 epoch 数值"
+    assert len(payload["samples"]) == payload["metrics"]["total"]
+    for sample in payload["samples"]:
+        assert isinstance(sample.get("missed"), bool)
+        assert isinstance(sample.get("false_alarm"), bool)
+
+
+def test_load_seed_rejects_record_missing_required_keys(tmp_path):
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"feature": "缺 id 与 human_verdict"}, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    with pytest.raises(EvalError):
+        E.load_seed(bad)
+
+
+def test_review_and_eval_have_no_hardcoded_model_refs():
+    """T7：评审位的模型串只能来自 config，模块里不许写死厂家/模型名。"""
+    banned = ("gpt-", "claude-", "deepseek/", "qwen", "glm-")
+    for name in ("review.py", "eval.py"):
+        text = (REPO / "src" / "kfpa" / name).read_text(encoding="utf-8").lower()
+        hit = [b for b in banned if b in text]
+        assert not hit, f"{name} 里出现写死的模型串 {hit}"

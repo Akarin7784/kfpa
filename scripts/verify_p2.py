@@ -48,13 +48,17 @@ P2_FILES = {
     "migrations/0002_reviews.sql": "磐石",
 }
 
-#: D4 §3.5：覆盖率白名单（D3 R-22.4 + P2 追加 review.py/eval.py）
+#: D4 §3.5 + **R-32**：A20 门槛白名单 = 「clean env 能跑」的纯逻辑 9 个文件。
+#: 不含 `store/postgres.py`（需 Docker，clean env 永远 0%）、`ui/**`、`executor.py`、`scripts/**`。
 COVER_WHITELIST = (
     "src/kfpa/schemas.py", "src/kfpa/config.py", "src/kfpa/cli.py",
     "src/kfpa/gates.py", "src/kfpa/pipeline.py",
     "src/kfpa/review.py", "src/kfpa/eval.py",
+    "src/kfpa/store/__init__.py", "src/kfpa/store/sqlite.py",
 )
-COVER_WHITELIST_PREFIX = ("src/kfpa/store/",)
+COVER_WHITELIST_PREFIX: tuple[str, ...] = ()
+#: R-32.3：A20b —— 需外部服务的模块**只报告、不作门槛**；无 Docker 时显式 SKIP。
+COVER_EXTERNAL_FILES = ("src/kfpa/store/postgres.py",)
 COVER_THRESHOLD = 0.80
 
 #: reviews 表要求列（D4 §3.1 / §3.3）
@@ -239,22 +243,39 @@ def probe_sqlite(db: Path):
         con.close()
 
 
-def cover_rate(cov: dict) -> tuple[float, list[str], int]:
-    """按 D4 §3.5 白名单算加权行覆盖率：covered_lines / num_statements。"""
+def cover_stats(cov: dict, *, wanted: tuple[str, ...] = COVER_WHITELIST,
+                prefixes: tuple[str, ...] = COVER_WHITELIST_PREFIX) -> tuple[dict, dict]:
+    """R-32：按白名单聚合 `pytest --cov-report=json` 报告。
+
+    返回 `(per_file, agg)`：`per_file[name] = {"statements", "covered", "rate"}`，
+    `agg = {"covered": int, "statements": int, "rate": float, "picked": [name]}`。
+    加权口径 = 覆盖行 / 语句数（不是逐文件平均）；文件不在报告里 → 不进聚合（缺测文件由调用方点出）。
+    """
     files = cov.get("files") or {}
-    cov_lines = stmts = 0
-    picked = []
+    per_file: dict[str, dict] = {}
+    covered = stmts = 0
+    picked: list[str] = []
     for path, info in files.items():
-        norm = str(path).replace("\\", "/")
-        if not (norm.lstrip("./") in COVER_WHITELIST
-                or any(norm.lstrip("./").startswith(p) for p in COVER_WHITELIST_PREFIX)):
+        norm = str(path).replace("\\", "/").lstrip("./")
+        if not (norm in wanted or any(norm.startswith(p) for p in prefixes)):
             continue
-        summary = info.get("summary") or {}
-        cov_lines += int(summary.get("covered_lines", 0) or 0)
-        stmts += int(summary.get("num_statements", 0) or 0)
+        summary = (info or {}).get("summary") or {}
+        n = int(summary.get("num_statements", 0) or 0)
+        c = int(summary.get("covered_lines", 0) or 0)
+        per_file[norm] = {"statements": n, "covered": c,
+                          "rate": (c / n) if n else 0.0}
+        covered += c
+        stmts += n
         picked.append(norm)
-    rate = (cov_lines / stmts) if stmts else 0.0
-    return rate, sorted(picked), stmts
+    agg = {"covered": covered, "statements": stmts,
+           "rate": (covered / stmts) if stmts else 0.0, "picked": sorted(picked)}
+    return per_file, agg
+
+
+def cover_rate(cov: dict) -> tuple[float, list[str], int]:
+    """R-32 白名单加权行覆盖率（门槛口径）；保留三元组签名兼容原调用。"""
+    _, agg = cover_stats(cov)
+    return agg["rate"], agg["picked"], agg["statements"]
 
 
 # ------------------------------------------------------------------ A0
@@ -305,7 +326,10 @@ def check_a0(ctx: Ctx, c: Check) -> None:
 
 
 def check_a18(ctx: Ctx, c: Check) -> None:
-    """A18：按角色 provider（REVIEWER 走异构 mock_hetero；--provider 全局覆盖；未知 → 4）。"""
+    """A18：按角色 provider（REVIEWER 走异构 mock_hetero；--provider 全局覆盖）。
+
+    rc 口径按 **R-31**：未知值 → 2（用法错误）；合法但依赖/凭据缺失 → 4；I/O 与 DB → 5。
+    """
     note_missing(ctx, c, ("磐石", "长流"))
     llm, lerr = import_mod("kfpa.llm")
     cfg, cerr = import_mod("kfpa.config")
@@ -384,26 +408,40 @@ def check_a18(ctx: Ctx, c: Check) -> None:
         except Exception as exc:  # noqa: BLE001
             c.add(ok=False, note=f"读 reviews 异常：{type(exc).__name__}: {exc}")
 
-    # 未知 provider → 4 + 中文；litellm 全局覆盖可达
+    # R-31 三分口径：未知值 → 2（用法错误）；合法但缺依赖/凭据 → 4；I/O 与 DB → 5
     evu = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
                    "--round", "2", "--dry-run", "--provider", "nope", "--db", str(db),
                    "--workdir", str(work)])
     blobu = evu["stdout"] + evu["stderr"]
     c.add(cmd=evu["cmd"], rc=evu["rc"], stdout=evu["stdout"], stderr=evu["stderr"],
-          ok=evu["rc"] == EXIT_DEP and cjk(blobu),
-          note="A18：未知 provider → rc=4 + 中文")
-    if evu["rc"] != EXIT_DEP:
-        c.fail(f"A18：未知 provider 应 rc=4，实际 {evu['rc']}。")
+          ok=evu["rc"] == EXIT_USAGE,
+          note="A18：未知 provider 值 → rc=2（D1-5 用法错误，argparse choices 原生拒绝，不劫持）")
+    if evu["rc"] != EXIT_USAGE:
+        c.fail(f"A18（R-31）：未知 provider 应 rc=2（用法错误），实际 {evu['rc']}。")
+    if cjk(blobu):
+        c.add(ok=True, note="A18：未知 provider 的提示含中文")
+    else:
+        # R-31 表头要求「2 + 中文」，同段又要求「不劫持 argparse 原生」——
+        # argparse 的 choices 报错本身是英文，两条不可能同时满足。
+        # rc=2 是硬断言（产品行为正确），中文提示记为建议项，不判红。
+        c.warn("A18：未知 provider 的报错是 argparse 原生英文（无中文提示）。R-31 的「+中文」"
+               "与「不劫持 argparse 原生」冲突；如需中文，请 Chief 裁是否自定义 parser.error。")
 
+    # 合法 provider（litellm）但依赖/凭据缺失 → 4；必须跨环境确定：显式清空各厂家凭据。
     evl = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
                    "--round", "3", "--dry-run", "--provider", "litellm", "--json",
-                   "--db", str(db), "--workdir", str(work)], timeout=240)
+                   "--db", str(db), "--workdir", str(work)], timeout=240,
+                  env_over={"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": "",
+                            "DEEPSEEK_API_KEY": "", "GLM_API_KEY": "",
+                            "QWEN_API_KEY": "", "MOONSHOT_API_KEY": ""})
     blobr = evl["stdout"] + evl["stderr"]
-    c.add(cmd=evl["cmd"], rc=evl["rc"], stdout=evl["stdout"], stderr=evl["stderr"],
-          ok=evl["rc"] in (EXIT_PASS, EXIT_NEEDS_FIX, EXIT_BLOCKED, EXIT_DEP, EXIT_IO),
-          note="A18：`--provider litellm` 全局覆盖可达（无 key 时必须优雅失败，不许崩栈）")
+    c.add(cmd=evl["cmd"] + "    [凭据清空]", rc=evl["rc"], stdout=evl["stdout"],
+          stderr=evl["stderr"], ok=evl["rc"] == EXIT_DEP,
+          note="A18：合法 provider 但缺凭据 → rc=4（D1-5 依赖/环境错误；5 = I/O 与 DB，不许混用）")
+    if evl["rc"] != EXIT_DEP:
+        c.fail(f"A18（R-31）：`--provider litellm` 无凭据应 rc=4，实际 {evl['rc']}。")
     if "Traceback" in blobr:
-        c.fail("A18：`--provider litellm` 无 key 时抛裸栈（应中文提示 + rc=4/5）。")
+        c.fail("A18：`--provider litellm` 无凭据时抛裸栈（应中文提示 + rc=4）。")
 
 
 # ------------------------------------------------------------------ A19
@@ -486,11 +524,14 @@ def check_a19(ctx: Ctx, c: Check) -> None:
             c.add(ok=False, note=f"调用 {name} 异常：{type(exc).__name__}: {exc}")
 
 
-# ------------------------------------------------------------------ A20
+# ------------------------------------------------------------------ A20 / A20b
 
 
 def check_a20(ctx: Ctx, c: Check) -> None:
-    """A20：白名单行覆盖 ≥80% 且关键路径全绿 → G7 判 PASS。"""
+    """A20：R-32 纯逻辑白名单行覆盖 ≥80%，且达标报告交给产品 G7 必须放行。
+
+    A20b（同函数内，非门槛）：`store/postgres.py` 只报告，无 Docker 时显式 SKIP。
+    """
     cov_json = ctx.tmp / "coverage-p2.json"
     ev = ctx.run([ctx.python, "-m", "pytest", "--cov=kfpa",
                   "--cov-report=json:" + str(cov_json), "-q"], timeout=1800,
@@ -505,23 +546,85 @@ def check_a20(ctx: Ctx, c: Check) -> None:
     except Exception as exc:  # noqa: BLE001
         c.fail(f"A20：覆盖率 JSON 解析失败：{exc}")
         return
-    rate, picked, stmts = cover_rate(cov)
-    c.add(ok=bool(picked), note=f"A20：白名单命中的文件 = {picked}（语句数 {stmts}）")
-    total_rate = float((cov.get("totals") or {}).get("percent_covered", 0)) / 100.0
-    c.add(ok=True, note=f"A20：全仓库行覆盖率 = {total_rate:.1%}；白名单行覆盖率 = {rate:.1%}"
-                        f"（门槛 {COVER_THRESHOLD:.0%}）")
-    c.add(ok=rate >= COVER_THRESHOLD,
-          note=f"A20：白名单行覆盖率 {rate:.1%} >= {COVER_THRESHOLD:.0%}")
-    if rate < COVER_THRESHOLD:
-        c.fail(f"A20（P2 硬验收）：白名单行覆盖率 {rate:.1%} 未达 {COVER_THRESHOLD:.0%}"
-               "（缺测试的模块见上面命中的文件清单；ui/**、scripts/**、executor.py 不在门槛内）。")
 
-    # 关键路径 = A0（P0+P1 台架）全绿，合并进 coverage.json 交给 G7
+    per_file, agg = cover_stats(cov)
+    rate, picked, stmts = agg["rate"], agg["picked"], agg["statements"]
+    total_rate = float((cov.get("totals") or {}).get("percent_covered", 0)) / 100.0
+
+    # 白名单 9 个文件必须都出现在报告里：没出现 = 测试从没 import 过它（按 0 算，不许跳过）
+    missing = [f for f in COVER_WHITELIST if f not in per_file]
+    c.add(ok=not missing, note=f"A20：R-32 白名单文件全部出现在报告（缺 {missing or '无'}）")
+    if missing:
+        c.fail(f"A20：白名单文件未出现在覆盖率报告 = {missing}"
+               "（测试从没触达 → 覆盖按 0 计，不许当 SKIP 放过）。")
+
+    detail = "；".join(f"{Path(k).name} {v['rate']:.1%}({v['covered']}/{v['statements']})"
+                       for k, v in sorted(per_file.items()))
+    c.add(ok=bool(picked), note=f"A20：逐文件（R-32 口径）= {detail}")
+    c.add(ok=True, note=f"A20：全仓库行覆盖率 = {total_rate:.1%}；"
+                        f"R-32 纯逻辑白名单 = {rate:.1%}（{agg['covered']}/{stmts}，"
+                        f"门槛 {COVER_THRESHOLD:.0%}）")
+    c.add(ok=rate >= COVER_THRESHOLD,
+          note=f"A20：R-32 纯逻辑白名单行覆盖率 {rate:.1%} >= {COVER_THRESHOLD:.0%}")
+    if rate < COVER_THRESHOLD:
+        need = int(COVER_THRESHOLD * stmts) - agg["covered"]
+        gaps = sorted(((v["statements"] - v["covered"], k) for k, v in per_file.items()),
+                      reverse=True)
+        worst = "、".join(f"{Path(k).name} 缺 {n}" for n, k in gaps[:5] if n)
+        c.fail(f"A20（P2 硬验收）：R-32 纯逻辑白名单行覆盖率 {rate:.1%} < {COVER_THRESHOLD:.0%}，"
+               f"还差 +{max(need, 0)} 语句。逐文件缺口（大→小）：{worst or '无'}。"
+               "（`store/postgres.py` 已按 R-32 排除出门槛，只作 A20b 报告）")
+
+    # ---------------- A20b：需外部服务的模块，只报告、不作门槛（R-32.3）
+    ext_per, _ = cover_stats(cov, wanted=COVER_EXTERNAL_FILES, prefixes=())
+    if ext_per:
+        for k, v in sorted(ext_per.items()):
+            c.add(ok=True, note=f"A20b（报告项，非门槛）：{k} 行覆盖 {v['rate']:.1%}"
+                                f"（{v['covered']}/{v['statements']}）")
+    else:
+        c.add(ok=True, note="A20b（报告项，非门槛）：SKIP —— 报告里没有 store/postgres.py，"
+                            "clean env 无 Docker / 未跑 PG 路径；其覆盖由 A12 双库对拍保证")
+
+    # ---------------- R-32 门槛口径 vs 产品 G7 的 CORE_COVERAGE_*：必须同一套集合
+    gates_mod, gerr = import_mod("kfpa.gates")
+    if gates_mod is None:
+        c.add(ok=False, note=f"import kfpa.gates 失败：{gerr}")
+        c.fail("A20：`src/kfpa/gates.py` 不可导入，G7 口径无法核对。")
+    else:
+        in_scope = getattr(gates_mod, "in_core_coverage_scope", None)
+        if not callable(in_scope):
+            c.fail("A20：gates.in_core_coverage_scope 不存在，G7 白名单无法核对。")
+        else:
+            dropped = [f for f in COVER_WHITELIST if not in_scope(f)]
+            extra = [f for f in COVER_EXTERNAL_FILES if in_scope(f)]
+            g7_sel = [f for f in COVER_WHITELIST if in_scope(f)]
+            g7_rate = (sum(per_file[f]["covered"] for f in g7_sel)
+                       / sum(per_file[f]["statements"] for f in g7_sel)) if g7_sel else 0.0
+            c.add(ok=True, note=f"A20：产品 G7 当前口径（R-22.4 冻死）= {len(g7_sel)} 文件、"
+                                f"含 postgres={bool(extra)} → 行覆盖 {g7_rate:.1%}"
+                                f"（G7 判 {'PASS' if g7_rate >= COVER_THRESHOLD else 'FAIL'}）")
+            c.add(ok=not dropped and not extra,
+                  note=f"A20：R-32 门槛白名单与产品 G7 口径一致（差集：少算={dropped}，"
+                       f"多算={extra}）")
+            if dropped or extra:
+                c.fail("A20：R-32 门槛白名单与产品 G7 的 `CORE_COVERAGE_FILES/PREFIXES` 不是同一套集合"
+                       f"——G7 少算 {dropped}、多算 {extra}。后果：真实 `pytest --cov` 报告"
+                       f"（含 `store/postgres.py` 0%）喂给 G7 会判 FAIL（当前 G7 口径 {g7_rate:.1%}），"
+                       "「白名单达标 → G7 PASS」不成立。修法二选一："
+                       "① `gates.py` 白名单改成显式 `store/__init__.py`+`store/sqlite.py`（摘掉 "
+                       "`store/` 前缀）并补 `review.py`/`eval.py`；"
+                       "② CLI 调 `load_coverage_report(..., scope=R-32 白名单)`。归 长流/磐石，Chief 裁。")
+
+    # ---------------- 关键路径 = A0（P0+P1 台架）全绿 + 真实逐文件数字 → 交给 G7
+    # 不许把每个文件写成 100% 蒙过 G7：用报告里的真实 statements/covered 回填。
     merged = ctx.tmp / "merged-coverage.json"
     merged_payload = {
         "totals": {"percent_covered": rate * 100.0,
                    "whitelist_percent_covered": rate * 100.0},
-        "files": {p: {"summary": {"percent_covered": 100.0}} for p in picked},
+        "files": {k: {"summary": {"percent_covered": v["rate"] * 100.0,
+                                  "num_statements": v["statements"],
+                                  "covered_lines": v["covered"]}}
+                  for k, v in per_file.items()},
         "critical_paths_ok": True,
         "generated_by": "scripts/verify_p2.py A20",
         "whitelist_files": picked,
@@ -529,7 +632,7 @@ def check_a20(ctx: Ctx, c: Check) -> None:
     }
     merged.write_text(json.dumps(merged_payload, ensure_ascii=False, indent=2),
                       encoding="utf-8")
-    c.add(ok=True, note=f"A20：合并覆盖率报告（临时）= {merged}")
+    c.add(ok=True, note=f"A20：合并覆盖率报告（临时，真实逐文件数字）= {merged}")
     if ctx.coverage_out:
         target = Path(ctx.coverage_out)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -544,11 +647,22 @@ def check_a20(ctx: Ctx, c: Check) -> None:
     ev2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
                    "--round", "1", "--dry-run", "--json", "--coverage-json", str(merged),
                    "--db", str(db), "--workdir", str(work)])
-    c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
-          ok=ev2["rc"] == EXIT_PASS,
-          note="A20：白名单达标 + critical_paths_ok=true → G7 应判 PASS（rc=0）")
-    if ev2["rc"] != EXIT_PASS:
-        c.fail(f"A20：达标覆盖率报告下 rc={ev2['rc']}，期望 0（G7 应放行）。")
+    # 真实数字回填后：达标必须放行；未达标必须拦停（两个方向都断言，不许只验「放行」）
+    if rate >= COVER_THRESHOLD:
+        c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
+              ok=ev2["rc"] == EXIT_PASS,
+              note="A20：白名单达标 + critical_paths_ok=true → G7 应判 PASS（rc=0）")
+        if ev2["rc"] != EXIT_PASS:
+            c.fail(f"A20：达标覆盖率报告下 rc={ev2['rc']}，期望 0（G7 应放行）。")
+    else:
+        blob2 = ev2["stdout"] + ev2["stderr"]
+        c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
+              ok=ev2["rc"] != EXIT_PASS and "覆盖率" in blob2,
+              note=f"A20：白名单仅 {rate:.1%}（<{COVER_THRESHOLD:.0%}）→ G7 必须拦停"
+                   f"（rc={ev2['rc']}，NEEDS_FIX/BLOCKED 都算拦停）")
+        if ev2["rc"] == EXIT_PASS or "覆盖率" not in blob2:
+            c.fail(f"A20：未达标覆盖率报告下 rc={ev2['rc']}，G7 既没拦停也没报覆盖率："
+                   "不得在未达标时放行。")
 
 
 # ------------------------------------------------------------------ A21
@@ -884,12 +998,12 @@ def render(c: Check, verbose: bool) -> str:
 CHECKS = [
     ("A0", "P0/P1 不回归：verify_p0 13/13 + verify_p1 8/8（clean env）", "镜鉴",
      "p2-plan §6.2", check_a0),
-    ("A18", "按角色 provider：REVIEWER→mock_hetero；--provider 全局覆盖；未知→4", "磐石+长流",
+    ("A18", "按角色 provider：REVIEWER→mock_hetero；全局覆盖；未知→2、缺凭据→4（R-31）", "磐石+长流",
      "D4 §3.2、A18", check_a18),
     ("A19", "fresh context：context_id 每评不同且与架构位不同", "长流",
      "D4 §3.3、A19", check_a19),
-    ("A20", "覆盖率达标：白名单行覆盖 ≥80% + 关键路径全绿 → G7 PASS", "全员",
-     "D4 §3.5、A20", check_a20),
+    ("A20", "覆盖率达标：R-32 纯逻辑白名单 ≥80% + 关键路径全绿 → G7 PASS；A20b 报告 postgres.py", "全员",
+     "D4 §3.5、A20、R-31、R-32", check_a20),
     ("A21", "同源盲区度量：四项指标 + 两组对比 + 报告落盘 + 边界用例", "长流",
      "D4 §3.4、A21", check_a21),
     ("A22", "评审接入主循环 + G8 折算（major+criterion 才阻塞）+ reviews 留痕", "长流+磐石",

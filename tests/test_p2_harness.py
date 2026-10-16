@@ -39,7 +39,7 @@ def test_cover_rate_only_counts_whitelist():
     assert abs(rate - 0.8) < 1e-9
 
 
-def test_cover_rate_includes_store_package_and_p2_modules():
+def test_cover_rate_includes_explicit_store_sqlite_and_p2_modules():
     mod = _load_verify_p2()
     cov = _cov({
         "src/kfpa/store/sqlite.py": {"covered_lines": 90, "num_statements": 100},
@@ -69,3 +69,45 @@ def test_normalize_rows_matches_r27_contract():
     assert n(["a", "b"]) == ["a", "b"]
     assert n([("a",), "b", None]) == ["a", "b"]
     assert n([("ARCHITECT", 2)]) == [["ARCHITECT", 2]]
+
+
+# ---------------------------------------------------------------- R-32 白名单拆分
+
+
+def test_r32_whitelist_is_pure_logic_nine_files():
+    mod = _load_verify_p2()
+    assert set(mod.COVER_WHITELIST) == {
+        "src/kfpa/schemas.py", "src/kfpa/config.py", "src/kfpa/cli.py",
+        "src/kfpa/gates.py", "src/kfpa/pipeline.py",
+        "src/kfpa/review.py", "src/kfpa/eval.py",
+        "src/kfpa/store/__init__.py", "src/kfpa/store/sqlite.py",
+    }
+    # `store/` 前缀整包划进门槛的旧口径已经作废（那会把 postgres.py 拉进来）
+    assert mod.COVER_WHITELIST_PREFIX == ()
+    assert mod.COVER_THRESHOLD == 0.80
+
+
+def test_r32_postgres_is_reported_but_not_counted():
+    mod = _load_verify_p2()
+    cov = _cov({
+        "src/kfpa/store/postgres.py": {"covered_lines": 0, "num_statements": 196},
+        "src/kfpa/gates.py": {"covered_lines": 180, "num_statements": 200},
+    })
+    rate, picked, stmts = mod.cover_rate(cov)
+    assert picked == ["src/kfpa/gates.py"], "postgres.py 不许进 A20 门槛"
+    assert stmts == 200 and abs(rate - 0.9) < 1e-9
+
+    ext, _ = mod.cover_stats(cov, wanted=mod.COVER_EXTERNAL_FILES, prefixes=())
+    assert ext["src/kfpa/store/postgres.py"] == {"statements": 196, "covered": 0, "rate": 0.0}
+
+
+def test_cover_stats_reports_per_file_rates_for_owner_split():
+    mod = _load_verify_p2()
+    cov = _cov({
+        "src/kfpa/cli.py": {"covered_lines": 219, "num_statements": 323},
+        "src/kfpa/gates.py": {"covered_lines": 72, "num_statements": 201},
+    })
+    per_file, agg = mod.cover_stats(cov)
+    assert per_file["src/kfpa/gates.py"]["covered"] == 72
+    assert per_file["src/kfpa/gates.py"]["statements"] == 201
+    assert agg["covered"] == 291 and agg["statements"] == 524
