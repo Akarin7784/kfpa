@@ -618,9 +618,14 @@ def check_a23(ctx: Ctx, c: Check) -> None:
     if db is None:
         return
 
-    plan = ctx.cli("fastlane", "plan", "--round", "1", db=db)
+    # R-23 diff 来源三优先级：**不给 `--files` → `no_diff_source` → ESCALATED**，
+    # 只有带 `--files`（第二来源）才登记出可承认的 PENDING；先各造一条，两个语义都验。
+    plan_esc = ctx.cli("fastlane", "plan", "--round", "2", db=db)
+    c.add(cmd=plan_esc["cmd"], rc=plan_esc["rc"], stdout=plan_esc["stdout"], stderr=plan_esc["stderr"],
+          note="A23：`fastlane plan --round 2`（不给 `--files`，R-23 第三来源）")
+    plan = ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py", db=db)
     c.add(cmd=plan["cmd"], rc=plan["rc"], stdout=plan["stdout"], stderr=plan["stderr"],
-          ok=plan["rc"] == EXIT_PASS, note="A23：`fastlane plan --round 1` 登记")
+          ok=plan["rc"] == EXIT_PASS, note="A23：`fastlane plan --round 1 --files …` 登记（第二来源）")
     if plan["rc"] != EXIT_PASS:
         c.fail(f"A23：`fastlane plan` rc={plan['rc']} → 长流 `fastlane.py` 的 register()/磐石挂载。")
         return
@@ -635,7 +640,17 @@ def check_a23(ctx: Ctx, c: Check) -> None:
     if not rows:
         c.fail("A23：plan 之后表里没有行 → 登记没落库。")
         return
-    first = rows[0]
+    by_status = {str(r.get("status")): r for r in rows}
+    c.add(ok="escalated" in by_status,
+          note=f"A23：不给 `--files` 的那条状态 = {by_status.get('escalated', {}).get('status')!r}"
+               "（R-23：`no_diff_source` → ESCALATED，不许默认放行）")
+    if "escalated" not in by_status:
+        c.fail("A23：R-23 第三来源（`no_diff_source`）没有让请求升级 —— 不给 diff 依据就不许当快车道。")
+    if "pending" not in by_status:
+        c.fail(f"A23：带 `--files` 的登记没产出 pending 行（实际状态集 {sorted(by_status)}）"
+               " —— 没有可承认样本，后续幂等/批次都无从验证。")
+        return
+    first = by_status["pending"]
 
     # R-34：acks.yaml 冻结形状先断（坏输入不许被静默吞掉），再走正常承认流程
     _r34_acks_schema(ctx, c, db)
@@ -667,16 +682,17 @@ def check_a23(ctx: Ctx, c: Check) -> None:
     if len(_fastlane_rows(db)) != n_before or same.get("decided_by") != "reviewer":
         c.fail("A23：重复承认不幂等（写了新行或覆盖了首次 decided_by/decided_at）。")
 
-    # 攒批承认：同批共享 batch_id
-    ctx.cli("fastlane", "plan", "--round", "2", db=db)
+    # 攒批承认：同批共享 batch_id（R-34 冻结形状 `acks: [{request_id, note?}]`）
+    ctx.cli("fastlane", "plan", "--round", "3", "--files", "src/kfpa/gates.py", db=db)
     pending = [r for r in _fastlane_rows(db) if str(r.get("status")) == "pending"]
     acks = ctx.tmp / "acks.yaml"
-    acks.write_text("\n".join(f"{r['request_id']}: yes" for r in pending) + "\n",
+    acks.write_text("acks:\n"
+                    + "".join(f"  - request_id: {r['request_id']}\n    note: 同批承认\n" for r in pending),
                     encoding="utf-8")
     if pending:
         batch = ctx.cli("fastlane", "batch-ack", "--file", str(acks), "--by", "boss", db=db)
         c.add(cmd=batch["cmd"], rc=batch["rc"], stdout=batch["stdout"], stderr=batch["stderr"],
-              ok=batch["rc"] == EXIT_PASS, note=f"A23：batch-ack {len(pending)} 条")
+              ok=batch["rc"] == EXIT_PASS, note=f"A23：batch-ack {len(pending)} 条（冻结 YAML 形状）")
         approved = [r for r in _fastlane_rows(db)
                     if r["request_id"] in {p["request_id"] for p in pending}
                     and str(r.get("status")) == "approved"]
@@ -958,24 +974,25 @@ def check_a25(ctx: Ctx, c: Check) -> None:
                     c.add(ok=not int(hit[0][1]), note=f"A25：留痕 passed 列 = {hit[0][1]}（期望假=不过）")
                     c.add(ok=str(hit[0][2]) == "verify_p3",
                           note=f"A25：留痕 sampled_by = {hit[0][2]!r}（期望 verify_p3，可追责）")
-                # 回避模式：内容要进回避清单（写成 kind=avoid 的候选）。找不到列表 API 就只报可见。
-                lister = next((getattr(store, n) for n in
-                               ("list_candidates", "list_knowledge_candidates", "candidates")
-                               if callable(getattr(store, n, None))), None)
-                if lister is None:
-                    c.warn("A25：store 没暴露候选列表 API，回避模式清单未独立核（内容级验证见 A26 回灌）。")
+                # 回避模式：内容要进回避清单。实测实现把它落成 **FailureRecord.avoid_pattern**
+                # （`store.list_avoid_patterns()` 的存储面），不是 kind=avoid 的候选 —— 断言跟存储面走。
+                avoid_fn = getattr(store, "list_avoid_patterns", None)
+                if not callable(avoid_fn):
+                    c.warn("A25：store 没暴露 `list_avoid_patterns()`，回避清单未独立核"
+                           "（内容级验证见 A26 回灌）。")
                 else:
                     try:
-                        avoid = [x for x in lister()
-                                 if str(getattr(getattr(x, "kind", ""), "value", getattr(x, "kind", "")))
-                                 == "avoid" and str(getattr(x, "content", "")) == "c"]
+                        patterns = [str(x) for x in avoid_fn()]
+                        round_patterns = [str(x) for x in avoid_fn(int(after.round_no))]
                     except Exception as exc:  # noqa: BLE001
-                        avoid = []
-                        c.add(ok=False, note=f"列表候选抛 {type(exc).__name__}: {exc}")
-                    c.add(ok=bool(avoid),
-                          note=f"A25：抽检不过写入回避模式 kind=avoid 候选 = {len(avoid)} 条")
-                    if not avoid:
-                        c.fail("A25：抽检 passed=False 没把内容写进回避模式清单（D5 §3.3）。")
+                        patterns, round_patterns = [], []
+                        c.add(ok=False, note=f"list_avoid_patterns 抛 {type(exc).__name__}: {exc}")
+                    c.add(ok="c" in patterns,
+                          note=f"A25：抽检不过写入回避清单 = {patterns}（应含候选内容 'c'）")
+                    if "c" not in patterns:
+                        c.fail("A25：抽检 `passed=False` 没把内容写进回避模式清单（D5 §3.3 负知识闭环）。")
+                    c.add(ok="c" in round_patterns,
+                          note=f"A25：按候选轮次 {after.round_no} 过滤的回避清单 = {round_patterns}")
             store.close()
 
     # CLI 面：list / report 可跑，且 report 落盘
@@ -1187,11 +1204,20 @@ def check_a27(ctx: Ctx, c: Check) -> None:
     if payload1 is not None:
         hits = payload1.get("hits") if isinstance(payload1, dict) else payload1
         hits = hits or []
+        # 实测形状：`provider` 在**顶层**（`{"provider":"local","fallback":true,"hits":[…]}`）；
+        # 逐条也允许带 provider —— 两处其一标 local 即算「降级可见」。
+        top_provider = str((payload1.get("provider") if isinstance(payload1, dict) else "") or "")
         providers = {str((h or {}).get("provider")) for h in hits if isinstance(h, dict)}
-        c.add(ok=("local" in providers) or not hits,
-              note=f"A27：命中 {len(hits)} 条，provider 集合 = {providers or '（无命中）'}")
-        if hits and "local" not in providers:
-            c.fail(f"A27：回退结果没有标 provider=local（实际 {providers}）→ 会把回退伪装成 Dify。")
+        marked_local = top_provider == "local" or "local" in providers
+        c.add(ok=marked_local or not hits,
+              note=f"A27：命中 {len(hits)} 条；顶层 provider={top_provider!r}，"
+                   f"逐条 provider 集合 = {providers or '（无）'}")
+        if hits and not marked_local:
+            c.fail(f"A27：回退结果没有标 provider=local（顶层={top_provider!r}，逐条={providers}）"
+                   " → 会把回退伪装成 Dify。")
+        fallback = payload1.get("fallback") if isinstance(payload1, dict) else None
+        c.add(ok=fallback is not False,
+              note=f"A27：`fallback` 标志 = {fallback!r}（不许在有回退时自称非回退）")
         second = ctx.cli("rag", "search", q, "--json", db=db,
                          env_over={"DIFY_API_URL": "", "DIFY_API_KEY": ""})
         p2 = last_json_line(second["stdout"])
@@ -1199,16 +1225,20 @@ def check_a27(ctx: Ctx, c: Check) -> None:
         if p2 != payload1:
             c.fail("A27：同输入两次检索结果不一致（排序不稳定）。")
 
-    # 配了 URL 但缺 key → rc=4 + 中文（不是 5、不是裸崩）
+    # 配了 URL 但缺 key → 期望 rc=4 + 中文（不是 5、不是裸崩）
+    # 口径提示：D5 §3.5 说「未配置或未装依赖 → rc=4」，同时又把「本地回退」定为验收路径；
+    # 实现把「URL 有、key 空」也归为「未配置」→ 回退 rc=0。台架按 **A27 验收行**（未配凭据 → rc=4）断，
+    # 这条冲突已报 Chief 裁决；裁决前不放水。
     missing_key = ctx.cli("rag", "search", q, "--json", db=db,
                           env_over={"DIFY_API_URL": "https://dify.invalid/v1",
                                     "DIFY_API_KEY": ""})
     blob = (missing_key["stdout"] or "") + (missing_key["stderr"] or "")
     c.add(cmd=missing_key["cmd"], rc=missing_key["rc"], stdout=missing_key["stdout"],
           stderr=missing_key["stderr"], ok=missing_key["rc"] == EXIT_DEP and cjk(blob),
-          note="A27：有 URL 无 key → rc=4 + 中文")
+          note="A27：有 URL 无 key → rc=4 + 中文（A27 验收行；D5 §3.5 与此处不自洽，待裁）")
     if missing_key["rc"] != EXIT_DEP:
-        c.fail(f"A27：缺凭据应 rc=4，实际 {missing_key['rc']}（R-31 三分）。")
+        c.fail(f"A27：缺凭据应 rc=4，实际 {missing_key['rc']}（R-31 三分）—— 实测实现把它当"
+               "「未配置」直接回退 rc=0；按 A27 验收行这是口径差，等 Chief 裁「部分配置算不算意图走 Dify」。")
     if "Traceback" in blob:
         c.fail("A27：缺凭据时抛裸栈（应中文提示 + rc=4）。")
 
