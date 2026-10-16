@@ -20,8 +20,11 @@ from typing import Optional, Protocol, runtime_checkable
 
 from ..schemas import (
     FailureRecord,
+    FastlaneRequest,
+    FastlaneStatus,
     GateReport,
     KnowledgeCandidate,
+    KnowledgeSample,
     LedgerEntry,
     QATicket,
     ReviewReport,
@@ -39,8 +42,10 @@ from .sqlite import (
     P0_SCHEMA_VERSION,
     P1_SCHEMA_VERSION,
     P2_SCHEMA_VERSION,
+    P3_SCHEMA_VERSION,
     P1_TABLE_NAMES,
     P2_TABLE_NAMES,
+    P3_TABLE_NAMES,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     TABLE_NAMES,
@@ -113,6 +118,27 @@ class StoreProtocol(Protocol):
     # ---- P2：评审留痕（D4-3.3 / A19）
     def add_review_report(self, report: ReviewReport) -> None: ...
     def list_review_reports(self, round_no: Optional[int] = None) -> list[ReviewReport]: ...
+
+    # ---- P3：快车道落库与攒批承认（D5-3.2 / A23）
+    def add_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest: ...
+    def get_fastlane_request(self, request_id: str) -> Optional[FastlaneRequest]: ...
+    def list_fastlane_requests(
+        self,
+        status: Optional[FastlaneStatus | str] = None,
+        round_no: Optional[int] = None,
+    ) -> list[FastlaneRequest]: ...
+    def ack_fastlane_request(
+        self,
+        request_id: str,
+        by: str = "",
+        status: FastlaneStatus | str = FastlaneStatus.APPROVED,
+        batch_id: str = "",
+        note: str = "",
+    ) -> FastlaneRequest: ...
+
+    # ---- P3：人工抽检留痕（D5-3.3 / A25）
+    def add_knowledge_sample(self, sample: KnowledgeSample) -> KnowledgeSample: ...
+    def list_knowledge_samples(self, cid: Optional[str] = None) -> list[KnowledgeSample]: ...
 
 
 def mask_dsn(dsn: str) -> str:
@@ -189,12 +215,13 @@ __all__ = [
     "P0_SCHEMA_VERSION",
     "P1_SCHEMA_VERSION",
     "P2_SCHEMA_VERSION",
-    "P1_SCHEMA_VERSION",
+    "P3_SCHEMA_VERSION",
     "TABLE_NAMES",
     "ALL_TABLE_NAMES",
     "BUSINESS_TABLES",
     "P1_TABLE_NAMES",
     "P2_TABLE_NAMES",
+    "P3_TABLE_NAMES",
     "META_TABLE",
 ]
 

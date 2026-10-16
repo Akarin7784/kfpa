@@ -99,11 +99,15 @@ def test_postgres_detection_and_migrations_dir():
 def test_constants_and_protocol():
     check = st.Store(":memory:")
     assert isinstance(check, st.StoreProtocol)
-    assert st.SCHEMA_VERSION == st.P2_SCHEMA_VERSION == "3"
+    # P3（D5-3.1）升到 "4"；P2 常量 "3" 保留为历史口径。
+    assert st.SCHEMA_VERSION == st.P3_SCHEMA_VERSION == "4"
     assert st.P0_SCHEMA_VERSION == "1" and st.P1_SCHEMA_VERSION == "2"
+    assert st.P2_SCHEMA_VERSION == "3"
     assert len(st.BUSINESS_TABLES) == 6 and len(st.TABLE_NAMES) == 7
     assert st.P1_TABLE_NAMES == ("ledger", "knowledge") and st.P2_TABLE_NAMES == ("reviews",)
-    assert set(st.ALL_TABLE_NAMES) == set(st.TABLE_NAMES) | {"ledger", "knowledge", "reviews"}
+    assert st.P3_TABLE_NAMES == ("fastlane_requests", "knowledge_samples")
+    assert set(st.ALL_TABLE_NAMES) == set(st.TABLE_NAMES) | {
+        "ledger", "knowledge", "reviews", "fastlane_requests", "knowledge_samples"}
     assert st.META_TABLE == "meta" and st.DB_URL_ENV == "KFPA_DB_URL"
 
 

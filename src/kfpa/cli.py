@@ -257,11 +257,13 @@ def cmd_round(args: argparse.Namespace) -> int:
             # R-22.3：只有显式给报告才启用 G7；没给就跳过、不得判红。
             coverage = None
             if args.coverage_json:
-                from .gates import load_coverage_report
+                from .gates import GatesError, load_coverage_report
 
                 try:
                     coverage = load_coverage_report(args.coverage_json)
-                except (OSError, ValueError) as exc:
+                except (OSError, ValueError, GatesError) as exc:
+                    # D5 §5（#51 报的死分支）：load_coverage_report 抛的是 GatesError（RuntimeError 子类），
+                    # 只捕 (OSError, ValueError) 时这里永远不执行。三个都捕，中文提示与 rc=4 才真的生效。
                     print(
                         f"[core] 覆盖率报告不可用：{args.coverage_json}：{exc} → "
                         "用 `pytest --cov=kfpa --cov-report=json` 生成后再传（退出码 4）",
@@ -456,23 +458,97 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- 解析
 
 
+#: `argparse._SubParsersAction`（私有类名不进源码：用一次探针取 type）
+_SUBPARSERS_CLASS = type(argparse.ArgumentParser(prog="_kfpa_probe").add_subparsers())
+
+
+def _existing_group(subparsers: Any, name: str) -> Optional[tuple[Any, Optional[Any]]]:
+    """找同级里已存在的同名子命令组 → `(parser, sub_action)`；没有则 None。
+
+    `_SubParsersAction.choices` 就是 `name → parser` 的映射（argparse 公开可读）。
+    """
+    choices = getattr(subparsers, "choices", None)
+    parser = choices.get(name) if isinstance(choices, dict) else None
+    if parser is None:
+        return None
+    for action in getattr(parser, "_actions", []):
+        if isinstance(action, _SUBPARSERS_CLASS):
+            return parser, action
+    return None
+
+
+class _GroupProxy:
+    """让后注册的插件把自己的子命令**并入已存在的同名组**（P3 D5 §3.2）。
+
+    背景：P1 的 `kfpa.impact.register()` 已经建了 `fastlane` 组（`fastlane check`，A16/R-23.2），
+    P3 的 `kfpa.fastlane.register()` 还要往同一组里加 `plan/list/ack/batch-ack/show`。
+    argparse 的 `add_parser("fastlane")` 撞名会直接抛 `conflicting subparser`，
+    结果是整组 P3 命令消失、或把 P1 的 `check` 顶掉（P2 的 `kfpa.eval` 漏挂是同类事故）。
+
+    这里给后注册的插件一个视图：`add_parser(<组名>)` 命中已存在的组时返回它的组代理，
+    `add_subparsers()` 返回**已有的** sub-action，其余属性转发给原 parser ——
+    于是插件的 `register()` 一行都不用改，子命令就进同一个组（`dest` 沿用先建组的 `fastlane_cmd`）。
+    """
+
+    def __init__(self, subparsers: Any, group: Optional[str]) -> None:
+        self._subparsers = subparsers
+        self._group = group
+
+    def add_parser(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        if self._group is None or name != self._group:
+            return self._subparsers.add_parser(name, *args, **kwargs)
+        existing = _existing_group(self._subparsers, name)
+        if existing is None:
+            return self._subparsers.add_parser(name, *args, **kwargs)
+        parser, sub = existing
+        return _ExistingGroupParser(parser, sub)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._subparsers, item)
+
+
+class _ExistingGroupParser:
+    """已存在组的 parser 代理：`add_subparsers()` 回已有的 sub-action，其余转发。"""
+
+    def __init__(self, parser: Any, sub: Optional[Any]) -> None:
+        self._parser = parser
+        self._sub = sub
+
+    def add_subparsers(self, *args: Any, **kwargs: Any) -> Any:
+        if self._sub is not None:
+            return self._sub
+        return self._parser.add_subparsers(*args, **kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._parser, item)
+
+
 def _register_plugin_commands(subparsers: Any) -> None:
-    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3）：
-    `tickets`（界面）、`ledger` / `knowledge`（长流）、`fastlane`（长流 impact）。
+    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3 + P3 D5）：
+    `tickets`（界面）、`ledger` / `knowledge`（长流）、`fastlane`（长流 P3）、
+    `rag`（长流 P3 检索）、`impact`、`eval`（P2 同源盲区度量）。
 
     每个模块导出 `register(subparsers)`；模块缺失时静默跳过（P0 core-only 环境仍可用），
     模块存在但挂载失败时打警告——**不许让一个坏插件拖垮整个 CLI**。
+
+    第三条（P3 新增）是「组名」：`None` = 自己建组；给了名字 = **并入该组**（组由先注册的
+    `kfpa.impact` 建，`fastlane check` + P3 五条命令共存一个 `fastlane` 组，见 `_GroupProxy`）。
+
+    P3 教训（D5 §1）：`fastlane` / `rag` 的 `register()` 写好了不等于 `kfpa fastlane` 存在——
+    P2 的 `kfpa.eval` 就漏挂过，A21 的 CLI 路径直接跑不通。实现方交付前必须自己跑 `--help` 自证。
     """
     builtins_list = [
-        ("kfpa.ui.cli", ".ui"),
-        ("kfpa.ledger", ".ledger"),
-        ("kfpa.knowledge", ".knowledge"),
-        ("kfpa.impact", ".impact"),
-        ("kfpa.eval", ".eval"),          # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
+        ("kfpa.ui.cli", ".ui", None),
+        ("kfpa.ledger", ".ledger", None),
+        ("kfpa.knowledge", ".knowledge", None),
+        ("kfpa.impact", ".impact", None),          # P1 D3-3.6：`fastlane check`（先建组，做锚）
+        ("kfpa.eval", ".eval", None),              # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
+        ("kfpa.fastlane", ".fastlane", "fastlane"),  # P3 D5-3.2：并入上面的 `fastlane` 组
+        ("kfpa.rag", ".rag", None),                # P3 D5-3.5：`kfpa rag search`
     ]
     import importlib
 
-    for module_name, short in builtins_list:
+    for module_name, short, group in builtins_list:
         try:
             module = importlib.import_module(module_name, package=__package__)
         except ImportError:
@@ -484,7 +560,9 @@ def _register_plugin_commands(subparsers: Any) -> None:
         if not callable(register):
             continue
         try:
-            register(subparsers)
+            # 只有「并入已存在组」的插件拿到代理；其余插件拿到的还是原来的 subparsers 对象
+            # （零行为变化——P0/P1/P2 的挂载路径不受影响）。
+            register(_GroupProxy(subparsers, group) if group else subparsers)
         except Exception as exc:
             print(f"[kfpa] 警告：{short} 子命令注册失败：{exc}", file=sys.stderr)
 

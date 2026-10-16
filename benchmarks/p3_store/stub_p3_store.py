@@ -1,0 +1,412 @@
+"""P3 `p3/store` 的实现方桩（R-30：实现方桩落 `benchmarks/**`，由镜鉴搬进 `tests/**`）。
+
+覆盖对象（D5-3.2 / D5-3.3 里归我的一侧）：
+
+1. `store/sqlite.py` 的 P3 新方法逐分支：登记（新建 / pending 覆盖 / **已决不覆盖**）、
+   查询（`get` / `list` 两种过滤 / 稳定排序）、承认（幂等、`ESCALATED`/`REJECTED` 不可翻白、
+   `batch_id` 同批共享、缺行 `KeyError`）、抽检留痕（append-only、`sampled_at` 兜底、坏 JSON 容错）。
+2. `store/__init__.py`：`P3_SCHEMA_VERSION` / `P3_TABLE_NAMES` 导出、`StoreProtocol` 新增签名可运行时检查。
+3. 双驱动**同签名对拍**：`KFPA_DB_URL`/`KFPA_PG_PORT` 有真 PG 时跑同一条剧本，两边记录逐字段一致
+   （`store/postgres.py` 按 R-32 不算 A20 门槛，但 A12/A26 要过，故此处默认尝试、无 PG 则显式 SKIP）。
+
+跑法（干净环境）::
+
+    $env:PYTHONPATH="src"
+    python -m pytest benchmarks/p3_store/stub_p3_store.py -q
+
+有 PG 时::
+
+    $env:KFPA_DB_URL="postgresql://kfpa:kfpa@127.0.0.1:55440/kfpa"
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import kfpa.store as st  # noqa: E402
+from kfpa.schemas import FastlaneRequest, FastlaneStatus, KnowledgeSample  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_db_url(monkeypatch):
+    """A20 是 clean env：本机残留 KFPA_DB_URL 不许把这些 SQLite 用例顶成 PG（R-25.1/R-25.3）。"""
+    monkeypatch.delenv(st.DB_URL_ENV, raising=False)
+    yield
+
+
+def _req(rid: str, round_no: int = 1, status: FastlaneStatus = FastlaneStatus.PENDING,
+         **kw) -> FastlaneRequest:
+    base = dict(
+        request_id=rid,
+        round_no=round_no,
+        summary=f"微型规格 {rid}",
+        diff_files=["src/kfpa/x.py"],
+        touched_modules=["x"],
+        status=status,
+    )
+    base.update(kw)
+    return FastlaneRequest(**base)
+
+
+# ---------------------------------------------------------------- 常量与守卫（R-20/R-21）
+
+def test_p3_constants_and_schema_version():
+    """D5-3.1：schema 升 4，P0/P1/P2 常量不动，P3 表名单冻结。"""
+    assert st.SCHEMA_VERSION == st.P3_SCHEMA_VERSION == "4"
+    assert (st.P0_SCHEMA_VERSION, st.P1_SCHEMA_VERSION, st.P2_SCHEMA_VERSION) == ("1", "2", "3")
+    assert st.P3_TABLE_NAMES == ("fastlane_requests", "knowledge_samples")
+    assert set(st.ALL_TABLE_NAMES) == set(st.TABLE_NAMES) | {
+        "ledger", "knowledge", "reviews", "fastlane_requests", "knowledge_samples"}
+    store = st.Store(":memory:")
+    assert store.get_meta("schema_version") == "4"
+    assert set(st.ALL_TABLE_NAMES) <= set(store.list_tables())
+    store.close()
+
+
+def test_protocol_declares_p3_signatures():
+    """`StoreProtocol` 必须声明 P3 六个方法（否则 PG 驱动漏实现也不会被发现）。"""
+    store = st.Store(":memory:")
+    assert isinstance(store, st.StoreProtocol)
+    for name in ("add_fastlane_request", "get_fastlane_request", "list_fastlane_requests",
+                 "ack_fastlane_request", "add_knowledge_sample", "list_knowledge_samples"):
+        assert callable(getattr(store, name, None)), name
+    store.close()
+
+
+# ---------------------------------------------------------------- 登记语义
+
+def test_add_fastlane_request_roundtrip_and_json_lists():
+    store = st.Store(":memory:")
+    got = store.add_fastlane_request(_req("fl-1-1", diff_files=["a.py", "b.py"],
+                                          touched_modules=["m1"]))
+    assert got.request_id == "fl-1-1" and got.round_no == 1
+    assert got.diff_files == ["a.py", "b.py"] and got.touched_modules == ["m1"]
+    assert got.status is FastlaneStatus.PENDING and got.decided_at == 0.0
+    assert got.new_interface is False and got.new_data_model is False
+    assert got.judged_fastlane() is True
+
+    fresh = store.get_fastlane_request("fl-1-1")
+    assert fresh == got
+    assert store.get_fastlane_request("nope") is None
+    store.close()
+
+
+def test_add_fastlane_request_is_idempotent_for_pending():
+    """重跑 plan：pending 行可被覆盖（幂等重跑），但不新增行。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1", summary="旧"))
+    store.add_fastlane_request(_req("fl-1-1", summary="新"))
+    rows = store.list_fastlane_requests()
+    assert len(rows) == 1 and rows[0].summary == "新"
+    store.close()
+
+
+def test_replan_never_clobbers_decided_row():
+    """A23 核心：已决行的 status/batch_id/decided_by/decided_at 是审计留痕，重跑 plan 不许抹。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1", summary="旧"))
+    acked = store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
+    assert acked.status is FastlaneStatus.APPROVED
+
+    store.add_fastlane_request(_req("fl-1-1", summary="重跑"))
+    again = store.get_fastlane_request("fl-1-1")
+    assert again.summary == "旧"                       # 覆盖被 WHERE 挡住
+    assert again.status is FastlaneStatus.APPROVED
+    assert again.batch_id == "b-1" and again.decided_by == "panshi"
+    assert again.decided_at == acked.decided_at
+    store.close()
+
+
+def test_list_fastlane_requests_filters_and_order():
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-2-2", round_no=2))
+    store.add_fastlane_request(_req("fl-1-2", round_no=1))
+    store.add_fastlane_request(_req("fl-1-1", round_no=1))
+    store.add_fastlane_request(_req("fl-1-3", round_no=1, status=FastlaneStatus.ESCALATED))
+
+    assert [r.request_id for r in store.list_fastlane_requests()] == [
+        "fl-1-1", "fl-1-2", "fl-1-3", "fl-2-2"]
+    assert [r.request_id for r in store.list_fastlane_requests(round_no=1)] == [
+        "fl-1-1", "fl-1-2", "fl-1-3"]
+    # status 同时接受枚举与裸字符串（str Enum）
+    assert [r.request_id for r in store.list_fastlane_requests(
+        status=FastlaneStatus.PENDING, round_no=1)] == ["fl-1-1", "fl-1-2"]
+    assert [r.request_id for r in store.list_fastlane_requests(status="pending")] == [
+        "fl-1-1", "fl-1-2", "fl-2-2"]
+    assert store.list_fastlane_requests(status="rejected") == []
+    store.close()
+
+
+# ---------------------------------------------------------------- 承认语义（A23 三条硬断言）
+
+def test_ack_writes_audit_fields_and_sets_time():
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    acked = store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="batch-a")
+    assert acked.status is FastlaneStatus.APPROVED
+    assert acked.decided_by == "panshi" and acked.batch_id == "batch-a"
+    assert acked.decided_at > 0
+    store.close()
+
+
+def test_ack_is_idempotent_and_keeps_first_decision():
+    """重复承认：不重复写行、不覆盖首次 decided_by/decided_at，返回原记录。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    first = store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
+    second = store.ack_fastlane_request("fl-1-1", by="someone-else", batch_id="b-2")
+    assert second.decided_by == "panshi" and second.batch_id == "b-1"
+    assert second.decided_at == first.decided_at
+    assert len(store.list_fastlane_requests()) == 1       # 没有第二次写行
+    store.close()
+
+
+def test_batch_ack_shares_batch_id():
+    store = st.Store(":memory:")
+    for rid in ("fl-1-1", "fl-1-2"):
+        store.add_fastlane_request(_req(rid))
+    for rid in ("fl-1-1", "fl-1-2"):
+        store.ack_fastlane_request(rid, by="panshi", batch_id="batch-2026-10-17")
+    got = store.list_fastlane_requests(status=FastlaneStatus.APPROVED)
+    assert {r.batch_id for r in got} == {"batch-2026-10-17"}
+    store.close()
+
+
+@pytest.mark.parametrize("frozen", [FastlaneStatus.ESCALATED, FastlaneStatus.REJECTED])
+def test_escalated_or_rejected_cannot_be_flipped_to_approved(frozen):
+    """A23：`ESCALATED`/`REJECTED` 不可被 ack 翻成 `APPROVED`（要翻必须新开请求）。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1", status=frozen))
+    got = store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-x")
+    assert got.status is frozen
+    assert got.decided_by == "" and got.batch_id == "" and got.decided_at == 0.0
+    store.close()
+
+
+def test_reject_and_escalate_transitions_from_pending():
+    """pending 行可以被人工判成 rejected/escalated（三态之外的两态是合法终态）。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    rejected = store.ack_fastlane_request("fl-1-1", by="panshi",
+                                          status=FastlaneStatus.REJECTED, note="越界")
+    assert rejected.status is FastlaneStatus.REJECTED
+    assert rejected.decided_by == "panshi" and rejected.note == "越界"
+    assert rejected.escalations() == []          # 判据本身仍全真，人工拒绝是另一回事
+    store.close()
+
+
+def test_ack_missing_request_raises_keyerror_in_chinese():
+    store = st.Store(":memory:")
+    with pytest.raises(KeyError) as ei:
+        store.ack_fastlane_request("fl-9-9")
+    assert "快车道请求不存在" in str(ei.value)
+    store.close()
+
+
+def test_escalations_names_failing_criteria():
+    """D5-3.2「不许只给布尔」：escalations 指名是哪条判据，且不满足时 judged_fastlane 为假。"""
+    req = _req("fl-1-1", new_interface=True, new_data_model=True,
+               touched_modules=["m1", "m2"])
+    assert req.judged_fastlane() is False
+    assert req.escalations() == ["new_interface", "new_data_model", "touched_modules>1"]
+    store = st.Store(":memory:")
+    store.add_fastlane_request(req)
+    stored = store.get_fastlane_request("fl-1-1")
+    assert stored.escalations() == ["new_interface", "new_data_model", "touched_modules>1"]
+    store.close()
+
+
+# ---------------------------------------------------------------- 抽检留痕
+
+def test_knowledge_samples_append_only_and_filters():
+    store = st.Store(":memory:")
+    s1 = store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_by="panshi",
+                                                    rate=0.2, passed=True))
+    assert s1.cid == "K1" and s1.passed is True and s1.rate == 0.2 and s1.sampled_at > 0
+    store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_by="panshi",
+                                               rate=0.2, passed=False))
+    store.add_knowledge_sample(KnowledgeSample(cid="K2", sampled_by="panshi",
+                                               rate=0.1, passed=True))
+    assert len(store.list_knowledge_samples()) == 3          # append-only：同 cid 多行
+    k1 = store.list_knowledge_samples("K1")
+    assert [x.passed for x in k1] == [True, False]           # 按 sampled_at, id 稳定排序
+    assert [x.cid for x in store.list_knowledge_samples("K2")] == ["K2"]
+    assert store.list_knowledge_samples("K9") == []
+    store.close()
+
+
+def test_knowledge_sample_sampled_at_fallback():
+    """`sampled_at=0` 由存储层补当前时间（调用方不必自己取 time），避免留痕出现 0 时刻。"""
+    store = st.Store(":memory:")
+    got = store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_at=0.0))
+    assert got.sampled_at > 0
+    store.close()
+
+
+def test_bad_json_columns_degrade_to_empty_list():
+    """坏数据不许炸读路径：手工塞非法 JSON，读回来是空列表（宽容解析口径同 P2 severity）。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    store._conn.execute("UPDATE fastlane_requests SET diff_files = ?, touched_modules = ? "
+                        "WHERE request_id = ?", ("{oops", "not-json", "fl-1-1"))
+    store._conn.commit()
+    got = store.get_fastlane_request("fl-1-1")
+    assert got.diff_files == [] and got.touched_modules == []
+    # JSON 合法但不是列表 → 同样退化成空列表
+    store._conn.execute("UPDATE fastlane_requests SET diff_files = ? WHERE request_id = ?",
+                        (json.dumps({"a": 1}), "fl-1-1"))
+    store._conn.commit()
+    assert store.get_fastlane_request("fl-1-1").diff_files == []
+    store.close()
+
+
+# ---------------------------------------------------------------- cli 插件并入同一子命令组（D5 §1）
+
+def test_cli_group_merge_keeps_p1_and_p3_commands():
+    """P1 的 `fastlane check` 与 P3 的五条命令必须共存一个 `fastlane` 组（不许撞名丢命令）。"""
+    import argparse
+
+    import kfpa.cli as cli
+
+    parser = argparse.ArgumentParser(prog="kfpa")
+    root = parser.add_subparsers(dest="command")
+    # 模拟 P1 的 impact.register()：先建 `fastlane` 组 + `check`
+    group = root.add_parser("fastlane")
+    sub = group.add_subparsers(dest="fastlane_cmd", required=True)
+    sub.add_parser("check")
+
+    # 模拟 P3 的 fastlane.register()（写法与 impact 相同）：经代理应并入同一组
+    view = cli._GroupProxy(root, "fastlane")
+    same_group = view.add_parser("fastlane")
+    same_sub = same_group.add_subparsers(dest="fastlane_cmd", required=True)
+    for name in ("plan", "list", "ack", "batch-ack", "show"):
+        same_sub.add_parser(name)
+
+    assert cli._existing_group(root, "fastlane") == (group, sub)
+    assert list(sub.choices) == ["check", "plan", "list", "ack", "batch-ack", "show"]
+    assert parser.parse_args(["fastlane", "check"]).fastlane_cmd == "check"
+    assert parser.parse_args(["fastlane", "plan"]).fastlane_cmd == "plan"
+    # 非组名 → 照常新建；组不存在 → 照常新建；没有 sub-action 的裸 parser → add_subparsers 转发
+    assert view.add_parser("other").prog == "kfpa other"
+    fresh = argparse.ArgumentParser().add_subparsers(dest="command")
+    assert cli._existing_group(fresh, "fastlane") is None
+    assert cli._GroupProxy(fresh, "fastlane").add_parser("fastlane").prog.endswith("fastlane")
+    assert cli._GroupProxy(fresh, None).add_parser("plain").prog.endswith("plain")
+    bare = cli._ExistingGroupParser(root.add_parser("bare"), None)
+    assert bare.add_subparsers(dest="x") is not None
+    assert bare.prog.endswith("bare")          # __getattr__ 转发
+
+
+def test_register_plugin_commands_mounts_fastlane_and_rag(monkeypatch):
+    """`_register_plugin_commands` 真的把 `kfpa.fastlane` / `kfpa.rag` 挂上去（D5 §1）。"""
+    import argparse
+    import importlib
+    import types
+
+    import kfpa.cli as cli
+
+    def _impact(subparsers):
+        parser = subparsers.add_parser("fastlane")
+        sub = parser.add_subparsers(dest="fastlane_cmd", required=True)
+        sub.add_parser("check")
+
+    def _fastlane(subparsers):
+        parser = subparsers.add_parser("fastlane")
+        sub = parser.add_subparsers(dest="fastlane_cmd", required=True)
+        sub.add_parser("plan")
+
+    def _rag(subparsers):
+        sp = subparsers.add_parser("rag")
+        sp.add_argument("query", nargs="?", default="")
+
+    modules = {}
+    for name, register in (("kfpa.impact", _impact), ("kfpa.fastlane", _fastlane),
+                           ("kfpa.rag", _rag)):
+        mod = types.ModuleType(name)
+        mod.register = register
+        modules[name] = mod
+
+    real_import = importlib.import_module
+
+    def fake_import(name, package=None):
+        if name in modules:
+            return modules[name]
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    try:
+        parser = argparse.ArgumentParser(prog="kfpa")
+        root = parser.add_subparsers(dest="command")
+        cli._register_plugin_commands(root)
+        assert {"fastlane", "rag"} <= set(root.choices)
+        assert list(root.choices["fastlane"]._actions[-1].choices) == ["check", "plan"]
+        assert parser.parse_args(["rag", "x"]).query == "x"
+    finally:
+        monkeypatch.setattr(importlib, "import_module", real_import)
+
+
+# ---------------------------------------------------------------- 双驱动同签名对拍（有 PG 时）
+def _pg_dsn() -> str:
+    env = os.environ.get("KFPA_PG_PORT", "55440")
+    return os.environ.get(st.DB_URL_ENV) or f"postgresql://kfpa:kfpa@127.0.0.1:{env}/kfpa"
+
+
+def _pg_store():
+    try:
+        return st.make_store(_pg_dsn())
+    except Exception as exc:  # 无 Docker / 无 psycopg → 显式 SKIP（报告里可见）
+        pytest.skip(f"无可用 PG（{type(exc).__name__}: {exc}）")
+
+
+def _wipe(store) -> None:
+    for table in ("fastlane_requests", "knowledge_samples"):
+        store._conn.execute(f"DELETE FROM {table}")
+    try:
+        store._conn.commit()
+    except Exception:
+        pass
+
+
+def test_pg_driver_same_signature_and_same_semantics():
+    """同一条剧本跑 PG，逐字段与 SQLite 对齐（A12/A26 的存储侧前提）。"""
+    pg = _pg_store()
+    if pg.get_meta("schema_version") != st.SCHEMA_VERSION:
+        pytest.skip("PG 库 schema 不是当前版本（先跑一次 init）")
+    mem = st.Store(":memory:")
+    _wipe(pg)
+    for store in (pg, mem):
+        store.add_fastlane_request(_req("fl-1-1", diff_files=["a.py", "b.py"]))
+        store.add_fastlane_request(_req("fl-1-2", status=FastlaneStatus.ESCALATED))
+        store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
+        store.ack_fastlane_request("fl-1-2", by="panshi", batch_id="b-1")
+        store.ack_fastlane_request("fl-1-1", by="someone-else", batch_id="b-2")   # 幂等
+        store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_at=0.0, sampled_by="panshi",
+                                                   rate=0.2, passed=False))
+
+    def snap(store):
+        return [
+            {k: str(v) for k, v in vars(r).items() if k != "decided_at"} |
+            {"decided_at_set": r.decided_at > 0}
+            for r in store.list_fastlane_requests()
+        ]
+
+    assert snap(pg) == snap(mem)
+    assert [(s.cid, s.passed, s.rate, s.sampled_by)
+            for s in pg.list_knowledge_samples()] == \
+           [(s.cid, s.passed, s.rate, s.sampled_by)
+            for s in mem.list_knowledge_samples()]
+    # PG 侧同样不许翻白 ESCALATED
+    assert pg.list_fastlane_requests(status="escalated")[0].decided_by == ""
+    with pytest.raises(KeyError):
+        pg.ack_fastlane_request("fl-9-9")
+    _wipe(pg)
+    pg.close()
+    mem.close()

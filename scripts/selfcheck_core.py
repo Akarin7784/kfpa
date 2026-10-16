@@ -19,7 +19,8 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from kfpa.store import (Store, TABLE_NAMES, BUSINESS_TABLES, SCHEMA_VERSION,
-                        P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION)
+                        P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION,
+                        P3_SCHEMA_VERSION)
 from kfpa.schemas import (QATicket, TicketImpact, TicketStatus, Round, RoundState, TaskPackage,
                           AcceptanceCriterion, GateReport, GateState, FailureRecord, Snapshot, package_hash)
 from kfpa.llm import (build_llm, MockLLM, MockScriptError, MARKER_TASK_QA, MARKER_TASK_PACKAGE,
@@ -48,10 +49,12 @@ AVOID[test_fail] AC1：上次失败——断言未通过
 
 # ---------- Store：D1-9 结构 + D2 R-8 过滤
 # 【镜鉴补丁·P1】schema_version 不写死：D3 把它从 "1" 升到 "2"，断言改为跟 SCHEMA_VERSION 常量对齐。
+# 【磐石 P3 同批同步·R-20/R-21】D5-3.1 升到 "4"：合法集必须加 P3_SCHEMA_VERSION，
+# 否则升版守卫自己会红（P2 的教训：漏一处算升版未完成）。
 s = Store(":memory:")
 check("D1-9 七表齐全（meta + 六业务表）", set(TABLE_NAMES) <= set(s.list_tables()), s.list_tables())
 check("BUSINESS_TABLES 六张", len(BUSINESS_TABLES) == 6)
-check("SCHEMA_VERSION 合法（P0/P1/P2 常量之一）", SCHEMA_VERSION in (P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION), SCHEMA_VERSION)
+check("SCHEMA_VERSION 合法（P0/P1/P2/P3 常量之一）", SCHEMA_VERSION in (P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION, P3_SCHEMA_VERSION), SCHEMA_VERSION)
 check("meta.schema_version 与 SCHEMA_VERSION 一致", s.get_meta("schema_version") == SCHEMA_VERSION)
 s.set_meta("schema_version", SCHEMA_VERSION)
 check("set_meta 幂等", s.get_meta("schema_version") == SCHEMA_VERSION)
