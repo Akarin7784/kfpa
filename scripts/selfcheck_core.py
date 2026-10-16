@@ -18,7 +18,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from kfpa.store import Store, TABLE_NAMES, BUSINESS_TABLES, SCHEMA_VERSION
+from kfpa.store import (Store, TABLE_NAMES, BUSINESS_TABLES, SCHEMA_VERSION,
+                        P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION)
 from kfpa.schemas import (QATicket, TicketImpact, TicketStatus, Round, RoundState, TaskPackage,
                           AcceptanceCriterion, GateReport, GateState, FailureRecord, Snapshot, package_hash)
 from kfpa.llm import (build_llm, MockLLM, MockScriptError, MARKER_TASK_QA, MARKER_TASK_PACKAGE,
@@ -50,7 +51,7 @@ AVOID[test_fail] AC1：上次失败——断言未通过
 s = Store(":memory:")
 check("D1-9 七表齐全（meta + 六业务表）", set(TABLE_NAMES) <= set(s.list_tables()), s.list_tables())
 check("BUSINESS_TABLES 六张", len(BUSINESS_TABLES) == 6)
-check("SCHEMA_VERSION 合法（P0=1 / P1=2）", SCHEMA_VERSION in ("1", "2"), SCHEMA_VERSION)
+check("SCHEMA_VERSION 合法（P0/P1/P2 常量之一）", SCHEMA_VERSION in (P0_SCHEMA_VERSION, P1_SCHEMA_VERSION, P2_SCHEMA_VERSION), SCHEMA_VERSION)
 check("meta.schema_version 与 SCHEMA_VERSION 一致", s.get_meta("schema_version") == SCHEMA_VERSION)
 s.set_meta("schema_version", SCHEMA_VERSION)
 check("set_meta 幂等", s.get_meta("schema_version") == SCHEMA_VERSION)
@@ -361,12 +362,18 @@ try:
             code = cli.main(["round", "--design", design, "--round", "5", "--db", db, "--inject", inject])
             expected_injection = inject if inject in ("apply_fail", "test_fail") else "none"
             expected_high = inject == "high_ticket"
+            # P2：`build_llm()` 现在返回按角色路由的 RoleRoutingLLM；ARCHITECT 的档位要从
+            # 路由器里取（`adapter_for("ARCHITECT")`），旧的直接 getattr(llm, "high_impact") 不再成立。
+            routed_llm = captured.get("llm")
+            if hasattr(routed_llm, "adapter_for"):
+                routed_llm = routed_llm.adapter_for("ARCHITECT")
+            got_high = getattr(routed_llm, "high_impact", None)
             check(
                 f"R-10 CLI 接线 --inject {inject}",
                 code == 3
                 and captured.get("injection") == expected_injection
-                and getattr(captured.get("llm"), "high_impact", None) is expected_high,
-                f"code={code} injection={captured.get('injection')} high_impact={getattr(captured.get('llm'), 'high_impact', None)}",
+                and got_high is expected_high,
+                f"code={code} injection={captured.get('injection')} high_impact={got_high}",
             )
         check("R-10 默认 workdir = runs/round-5（D1-10）", captured.get("workdir", "").replace("\\", "/").endswith("runs/round-5"), captured.get("workdir"))
         check("R-10 默认 executor 是 MockExecutor", getattr(captured.get("executor"), "name", "") == "mock")

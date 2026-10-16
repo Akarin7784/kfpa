@@ -177,12 +177,18 @@ def cmd_round(args: argparse.Namespace) -> int:
             roles = load_roles(args.config)
             # D2 R-10：high_ticket 只改 mock 剧本（build_llm(..., high_impact=True)），
             # apply_fail / test_fail 由 run_round(injection=...) 交给执行器。
+            # D4-3.2：--provider 不传（None）= 按角色解析（REVIEWER → mock_hetero）；传了则全局覆盖。
             llm = build_llm(
                 roles,
                 provider=args.provider,
                 injection=args.inject,
                 high_impact=(args.inject == "high_ticket"),
             )
+            if args.provider is None and hasattr(llm, "provider_for"):
+                routed = ", ".join(
+                    f"{name}={llm.provider_for(name)}" for name in ("ARCHITECT", "REVIEWER", "FLASH")
+                )
+                print(f"[core] provider 路由：{routed}", file=sys.stderr)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             # D2 R-1：4 = 依赖/环境错误，明确包含「配置错误」。
             print(f"[core] 角色配置错误：{exc} → 检查 --config / models.yaml 并在仓库根目录运行", file=sys.stderr)
@@ -497,7 +503,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_round.add_argument("--db", default="kfpa.db", help="SQLite 路径（默认 kfpa.db）")
     p_round.add_argument("--workdir", default="", help="执行器工作目录（默认 runs/round-{n}，D1-10）")
     p_round.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"角色配置（默认 {DEFAULT_CONFIG_PATH}）")
-    p_round.add_argument("--provider", choices=["mock", "litellm"], default="mock", help="LLM 提供方（默认 mock）")
+    p_round.add_argument(
+        "--provider",
+        choices=["mock", "mock_hetero", "litellm"],
+        default=None,
+        help="LLM 提供方（不传 = 按角色配置解析：REVIEWER 默认 mock_hetero；传了则全局覆盖）",
+    )
     p_round.add_argument(
         "--inject",
         choices=["none", "high_ticket", "apply_fail", "test_fail"],
