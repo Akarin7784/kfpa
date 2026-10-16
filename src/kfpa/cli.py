@@ -239,6 +239,17 @@ def cmd_round(args: argparse.Namespace) -> int:
             if "roles" in params:
                 call_kwargs["roles"] = roles
 
+            # P2 D4-3.3：把 REVIEWER 实际用的 provider / model_ref 传给 pipeline 作**记录**字段
+            # （真调用仍由注入的 llm 决定；不编造，model_ref 一律从 config 的 REVIEWER.model 取）。
+            if "review_provider" in params:
+                call_kwargs["review_provider"] = (
+                    llm.provider_for("REVIEWER")
+                    if hasattr(llm, "provider_for")
+                    else (args.provider or "mock_hetero")
+                )
+            if "review_model_ref" in params:
+                call_kwargs["review_model_ref"] = str((roles.get("REVIEWER") or {}).get("model") or "")
+
             # R-22.3：只有显式给报告才启用 G7；没给就跳过、不得判红。
             coverage = None
             if args.coverage_json:

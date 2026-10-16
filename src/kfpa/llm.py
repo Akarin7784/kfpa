@@ -365,28 +365,53 @@ class MockHeteroLLM:
     # -------------------------------------------------- 内部
 
     def _findings_from_text(self, text: str) -> list[dict[str, str]]:
+        """抽缺陷标记 → findings（D4-3.4 与长流种子集共用的机读形状）。
+
+        主口径（长流 `benchmarks/review/seed.jsonl` 用的）：标记**嵌在六段正文里**
+        ``[DEFECT:<kind>] <criterion>: <描述>``，例如
+        ``[DEFECT:missing_error_code] AC2: 接口契约只写了成功返回，没写错误码``。
+        criterion 为空（`[DEFECT:kind]: 描述`）时按「无法定位」处理，G8 不阻塞。
+
+        兼容口径：行首 `DEFECT: <criterion> | location: … | kind: …`（早期形状）。
+
+        **没有缺陷标记时返回空列表**（长流要求：默认剧本必须 verdict=pass + findings=[]，
+        否则会把 P0/P1 的 happy path 判红）。
+        """
         findings: list[dict[str, str]] = []
+        pattern = re.compile(r"\[DEFECT:([^\]]+)\]\s*([^:\s]*)\s*:?\s*(.*)")
         for raw in text.splitlines():
             line = raw.strip()
-            if not line.upper().startswith(_DEFECT_PREFIX):
+            matched = pattern.search(line)
+            if matched is not None:
+                kind, criterion, desc = matched.group(1).strip(), matched.group(2).strip(), matched.group(3).strip()
+                findings.append(
+                    {
+                        "severity": "major",
+                        "location": "任务包",
+                        "issue": f"[{kind}] {desc}".strip(),
+                        "suggestion": "按 criterion 修正后重跑",
+                        "criterion": criterion,
+                    }
+                )
                 continue
-            body = line.split(":", 1)[1]
-            segments = [seg.strip() for seg in body.split("|")]
-            criterion = segments[0] if segments else ""
-            fields: dict[str, str] = {}
-            for seg in segments[1:]:
-                if ":" in seg:
-                    key, value = seg.split(":", 1)
-                    fields[key.strip().lower()] = value.strip()
-            findings.append(
-                {
-                    "severity": "major",
-                    "location": fields.get("location", "任务包"),
-                    "issue": fields.get("kind", "异构评审发现的问题"),
-                    "suggestion": fields.get("suggestion", "按 criterion 修正后重跑"),
-                    "criterion": criterion,
-                }
-            )
+            if line.upper().startswith(_DEFECT_PREFIX):  # 早期行首形状
+                body = line.split(":", 1)[1]
+                segments = [seg.strip() for seg in body.split("|")]
+                criterion = segments[0] if segments else ""
+                fields: dict[str, str] = {}
+                for seg in segments[1:]:
+                    if ":" in seg:
+                        key, value = seg.split(":", 1)
+                        fields[key.strip().lower()] = value.strip()
+                findings.append(
+                    {
+                        "severity": "major",
+                        "location": fields.get("location", "任务包"),
+                        "issue": fields.get("kind", "异构评审发现的问题"),
+                        "suggestion": fields.get("suggestion", "按 criterion 修正后重跑"),
+                        "criterion": criterion,
+                    }
+                )
         return findings
 
     def _apply_injection(self, findings: list[dict[str, str]]) -> None:
