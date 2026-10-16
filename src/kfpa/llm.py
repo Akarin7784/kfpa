@@ -10,7 +10,7 @@
 剧本选择优先级（D2 R-17 / R-3）：
     1. `KFPA_TASK=qa_tickets` / `KFPA_TASK=task_package` —— **唯一规范 marker**（长流 prompt 里写的）；
     2. `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` / `[KFPA:REVIEW]` —— D1-7 的 **永久兼容别名**
-       （R-17 明令：不许以「过渡期」为由删除；别名与规范 marker 都必须有测试覆盖）；
+       （R-17：别名永久有效、不得删除；别名与规范 marker 都必须有测试覆盖）；
     3. 关键词兜底（質問票/歧义/ticket/qa、任务包/六段/package）；
     4. 都没有 → `MockScriptError`（D1-7：禁止静默返回空串）。
 
