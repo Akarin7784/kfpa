@@ -1274,20 +1274,37 @@ def check_a27(ctx: Ctx, c: Check) -> None:
         if p2 != payload1:
             c.fail("A27：同输入两次检索结果不一致（排序不稳定）。")
 
-    # 配了 URL 但缺 key → 期望 rc=4 + 中文（不是 5、不是裸崩）
-    # 口径提示：D5 §3.5 说「未配置或未装依赖 → rc=4」，同时又把「本地回退」定为验收路径；
-    # 实现把「URL 有、key 空」也归为「未配置」→ 回退 rc=0。台架按 **A27 验收行**（未配凭据 → rc=4）断，
-    # 这条冲突已报 Chief 裁决；裁决前不放水。
-    missing_key = ctx.cli("rag", "search", q, "--json", db=db,
+    # R-36 三态（Chief 裁定，取代 A27 旧验收行「未配凭据 → rc=4」的读法）：
+    #   auto/local 缺凭据 → 本地回退 rc=0 + provider="local"；
+    #   **显式 --provider dify** 缺凭据 → rc=4 + 中文（打码）；配了凭据但 HTTP 错 → rc=5。
+    # 先断 auto：URL 有、key 空，但**没显式要 dify** → 必须回退成功，不许当失败。
+    auto_partial = ctx.cli("rag", "search", q, "--json", db=db,
+                           env_over={"DIFY_API_URL": "https://dify.invalid/v1",
+                                     "DIFY_API_KEY": ""})
+    auto_payload = last_json_line(auto_partial["stdout"])
+    auto_provider = str((auto_payload or {}).get("provider") or "")
+    c.add(cmd=auto_partial["cmd"], rc=auto_partial["rc"], stdout=auto_partial["stdout"],
+          stderr=auto_partial["stderr"],
+          ok=auto_partial["rc"] == EXIT_PASS and auto_provider == "local",
+          note=f"R-36：auto 且只有 URL、没 key → rc={auto_partial['rc']} + provider={auto_provider!r}"
+               "（回退是验收路径，不许当失败）")
+    if auto_partial["rc"] != EXIT_PASS or auto_provider != "local":
+        c.fail(f"R-36：`auto` 下缺凭据应本地回退 rc=0 且 provider=local，实际 "
+               f"rc={auto_partial['rc']}、provider={auto_provider!r}。")
+
+    # 再断显式 dify：这才该 rc=4 + 中文（不是 5、不是裸崩）
+    missing_key = ctx.cli("rag", "search", q, "--json", "--provider", "dify", db=db,
                           env_over={"DIFY_API_URL": "https://dify.invalid/v1",
                                     "DIFY_API_KEY": ""})
     blob = (missing_key["stdout"] or "") + (missing_key["stderr"] or "")
     c.add(cmd=missing_key["cmd"], rc=missing_key["rc"], stdout=missing_key["stdout"],
           stderr=missing_key["stderr"], ok=missing_key["rc"] == EXIT_DEP and cjk(blob),
-          note="A27：有 URL 无 key → rc=4 + 中文（A27 验收行；D5 §3.5 与此处不自洽，待裁）")
+          note="R-36：显式 `--provider dify` 缺凭据 → rc=4 + 中文")
     if missing_key["rc"] != EXIT_DEP:
-        c.fail(f"A27：缺凭据应 rc=4，实际 {missing_key['rc']}（R-31 三分）—— 实测实现把它当"
-               "「未配置」直接回退 rc=0；按 A27 验收行这是口径差，等 Chief 裁「部分配置算不算意图走 Dify」。")
+        c.fail(f"R-36：显式 `--provider dify` 缺凭据应 rc=4，实际 {missing_key['rc']}"
+               "（R-31 三分：缺依赖/凭据 = 4）。")
+    if not cjk(blob):
+        c.fail("A27：缺凭据报错没有中文提示（R-18 口径）。")
     if "Traceback" in blob:
         c.fail("A27：缺凭据时抛裸栈（应中文提示 + rc=4）。")
 
