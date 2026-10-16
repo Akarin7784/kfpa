@@ -203,6 +203,48 @@ def test_batch_ack_flags_actor_mismatch():
     assert "decided_by" in result["unverified"][0]["reason"]
 
 
+def test_batch_ack_treats_idempotent_replay_as_success_but_reports_it():
+    """D5 §3.2 幂等：二次承认保留首次 decided_by —— 这不许被当成「回读失败」（真实集成跑抓到过假红）。"""
+    prior = req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="alice", decided_at=1700000000.0)
+    runner = make_runner([("batch-ack", Proc(0, "已承认")),
+                          ("list", Proc(0, _updated_listing(decided_by="alice", batch_id="flb-1-1")))])
+    result = fp.batch_ack([prior], ["fl-1-1"], by="bob", typed_count=1, runner=runner)
+    assert result["ok"] is True and result["verified"] is True and result["unverified"] == []
+    assert result["replayed"] and "幂等保留首次留痕" in result["replayed"][0]["reason"]
+    assert result["decided_by"] == "alice" and result["batch_id"] == "flb-1-1"
+
+
+def test_batch_ack_preserving_an_unknown_prior_actor_is_still_unverified():
+    """此前没决定过、回读却是别人写的 → 仍不许报成功（别把「幂等」当万能挡箭牌）。"""
+    rows = [req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="bob", decided_at=1.0)]
+    runner = make_runner([("batch-ack", Proc(0, "ok")), ("list", Proc(0, _updated_listing(decided_by="carol")))])
+    result = fp.batch_ack(rows, ["fl-1-1"], by="alice", typed_count=1, runner=runner)
+    assert result["ok"] is False and result["verified"] is False
+    assert result["replayed"] == [] and result["unverified"]
+
+
+def test_batch_ack_flags_batch_id_drift_on_replay():
+    """镜鉴的边界洞：回读人**对上**但 `batch_id` 被换 → 台账被别的东西改过，不许算确认成功。"""
+    prior = req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="alice", decided_at=1700000000.0)
+    runner = make_runner([("batch-ack", Proc(0, "已承认")),
+                          ("list", Proc(0, _updated_listing(decided_by="alice", batch_id="flb-DIFFERENT")))])
+    result = fp.batch_ack([prior], ["fl-1-1"], by="bob", typed_count=1, runner=runner)
+    assert result["ok"] is False and result["verified"] is False
+    assert result["replayed"] == []
+    assert "batch_id" in result["unverified"][0]["reason"]
+
+
+def test_batch_ack_flags_decided_at_drift_on_replay():
+    """同一承认人、同一批次，但首次 `decided_at` 被改写 → 同样不算确认成功。"""
+    prior = req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="alice", decided_at=1700000000.0)
+    runner = make_runner([("batch-ack", Proc(0, "已承认")),
+                          ("list", Proc(0, _updated_listing(decided_by="alice", batch_id="flb-1-1",
+                                                            decided_at=1700009999.0)))])
+    result = fp.batch_ack([prior], ["fl-1-1"], by="bob", typed_count=1, runner=runner)
+    assert result["ok"] is False and result["replayed"] == []
+    assert "decided_at" in result["unverified"][0]["reason"]
+
+
 def test_list_requests_reports_missing_subcommand():
     rows, hint = fp.list_requests(runner=make_runner([("list", Proc(2, "", "invalid choice"))]))
     assert rows == [] and hint == fp.FASTLANE_MISSING_HINT
@@ -301,16 +343,33 @@ def test_normalize_sample_from_dataclass_and_review_row():
     assert hit["rate"] == 0.1 and hit["passed"] is None
 
 
-def test_load_overview_parses_candidates_and_sample():
+def _knowledge_report(*, samples=None, avoid=None, threshold=0.8, counts=None) -> str:
+    return json.dumps({
+        "threshold": threshold,
+        "counts": counts if counts is not None else {"quarantine": 1, "promoted": 0, "dropped": 1},
+        "samples": samples if samples is not None else [
+            {"cid": "K1", "sample_rate": 0.2, "sampled_by": "alice", "passed": False, "sampled_at": 1700000000.0}
+        ],
+        "avoid_patterns": avoid if avoid is not None else ["K1 的坑"],
+        "sampled": 1, "pending_sample": [], "dropped_cids": ["K3"], "promoted_cids": [],
+    }, ensure_ascii=False)
+
+
+def test_load_overview_parses_candidates_queue_and_traces():
     payload = {
         "candidates": [{"cid": "K1", "round_no": 1, "kind": "success", "content": "c",
                         "confidence": 0.9, "status": "quarantine", "reused_by": []}],
-        "sample": [{"cid": "K1", "sample_rate": 0.05}],
+        "pending_sample": [{"cid": "K1", "kind": "success", "status": "quarantine",
+                            "confidence": 0.9, "sample_rate": 0.05}],
     }
-    runner = make_runner([("list", Proc(0, json.dumps(payload)))])
+    runner = make_runner([("report", Proc(0, _knowledge_report())), ("list", Proc(0, json.dumps(payload)))])
     data = kp.load_overview(runner=runner)
-    assert data["hint"] == "" and len(data["candidates"]) == 1 and len(data["samples"]) == 1
-    assert data["samples"][0]["cid"] == "K1"
+    assert data["hint"] == "" and len(data["candidates"]) == 1
+    # 队列来自 list 的 pending_sample，留痕来自 report 的 samples（真集成跑发现 list 里看不到留痕）
+    assert data["queue"][0]["cid"] == "K1" and data["queue"][0]["confidence"] == 0.9
+    assert data["samples"][0]["cid"] == "K1" and data["samples"][0]["passed"] is False
+    assert data["report"]["threshold"] == 0.8
+    assert [x for x in runner.calls if "report" in x]
 
 
 def test_load_overview_degrades_without_inventing_rows():
@@ -320,33 +379,48 @@ def test_load_overview_degrades_without_inventing_rows():
     assert missing["candidates"] == [] and "退出码 2" in missing["hint"]
 
 
-def test_knowledge_reports_and_headless(tmp_path):
+def test_load_overview_survives_a_broken_report_command():
+    """report 出口坏了只该缺留痕/回避模式，候选与队列照旧可读，且必须给中文提示。"""
+    payload = {"candidates": [{"cid": "K1", "status": "quarantine", "confidence": 0.9,
+                               "round_no": 1, "kind": "success", "content": "c"}], "pending_sample": []}
+    runner = make_runner([("report", Proc(2, "", "invalid choice")), ("list", Proc(0, json.dumps(payload)))])
+    data = kp.load_overview(runner=runner)
+    assert len(data["candidates"]) == 1 and data["samples"] == []
+    assert "knowledge report" in data["hint"] and "退出码 2" in data["hint"]
+
+
+def test_knowledge_reports_use_report_counts_and_avoid_patterns(tmp_path):
     overview = kp.load_overview(
-        runner=make_runner(
-            [("list", Proc(0, json.dumps({
+        runner=make_runner([
+            ("report", Proc(0, _knowledge_report(counts={"quarantine": 5, "promoted": 2, "dropped": 3}))),
+            ("list", Proc(0, json.dumps({
                 "candidates": [
                     {"cid": "K1", "round_no": 1, "kind": "success", "content": "c", "confidence": 0.9,
                      "status": "quarantine", "reused_by": []},
                     {"cid": "K3", "round_no": 2, "kind": "avoid", "content": "坑", "confidence": 0.2,
                      "status": "dropped"},
                 ],
-                "sample": [{"cid": "K1", "sample_rate": 0.05, "sampled_by": "alice", "passed": False}],
-            })))]
-        )
+                "pending_sample": [{"cid": "K1", "sample_rate": 0.05, "confidence": 0.9}],
+            }))),
+        ])
     )
     written = kp.write_reports(overview, out_dir=tmp_path)
     assert sorted(Path(f).name for f in written["files"]) == ["knowledge-report.html", "knowledge-report.md"]
-    body = (tmp_path / "knowledge-report.html").read_text(encoding="utf-8").lower()
+    body = (tmp_path / "knowledge-report.html").read_text(encoding="utf-8")
+    lowered = body.lower()
     for forbidden in ("http://", "https://", "<script", "<link", "cdn.", "src="):
-        assert forbidden not in body, forbidden
+        assert forbidden not in lowered, forbidden
     assert "@media print" in body
+    assert "回避模式" in body and "K1 的坑" in body and "knowledge_samples" in body
     summary = kp.render_headless(overview=overview, out_dir=str(tmp_path))
-    assert summary["rows"] == 2 and summary["counts"]["quarantine"] == 1
-    assert summary["counts"]["dropped"] == 1 and summary["samples"] == 1
+    # 计数以实现方 report 的 counts 为准（不是按候选反推）
+    assert summary["counts"] == {"quarantine": 5, "promoted": 2, "dropped": 3, "unknown": 0}
+    assert summary["queue"] == 1 and summary["samples"] == 1 and summary["avoid_patterns"] == 1
 
 
 def test_knowledge_main_with_fake_runner(tmp_path):
-    runner = make_runner([("list", Proc(0, json.dumps({"candidates": [], "sample": []})))])
+    runner = make_runner([("report", Proc(0, _knowledge_report(samples=[], avoid=[], counts={}))),
+                          ("list", Proc(0, json.dumps({"candidates": [], "pending_sample": []})))])
     assert kp.main(["--db", "x.db", "--out-dir", str(tmp_path), "--json"], runner=runner) == 0
     assert (tmp_path / "knowledge-report.md").exists()
 
