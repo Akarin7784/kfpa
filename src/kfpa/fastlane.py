@@ -372,7 +372,12 @@ def _bracket_ids(value: str) -> list[str]:
 
 
 def _parse_acks(text: str, *, strict: bool) -> list[str]:
-    """承认清单解析（R-34）：`strict=True` 时任何形状违规都抛 `FastlaneError`（CLI → rc=2）。"""
+    """承认清单解析（R-34/R-36）：`strict=True` 时任何形状违规都抛 `FastlaneError`（CLI → rc=2）。
+
+    例外是**列表键存在但不是 list**（`acks: fl-1-1`）这一种：它**任何模式都抛**——静默返回
+    空清单正是这个坏形状溜进写库的原因（Chief 在 main 上复现过 rc=0 真承认一条）。宽松模式
+    只对「缺键 / 空清单 / 无可识别条目」保留不抛的旧兼容行为。
+    """
     raw = str(text or "").strip()
     out: list[str] = []
 
@@ -380,6 +385,10 @@ def _parse_acks(text: str, *, strict: bool) -> list[str]:
         if strict:
             raise FastlaneError(f"{message} → {_SHAPE_HINT}；rc=2")
         return out
+
+    def hard(message: str) -> list[str]:
+        """列表键不是 list：宽松模式也抛，绝不静默吞（R-36 第三种坏形状）。"""
+        raise FastlaneError(f"{message} → {_SHAPE_HINT}；rc=2")
 
     def from_sequence(items: Any, where: str) -> list[str]:
         ids, ok = _ids_from_list(list(items))
@@ -404,7 +413,7 @@ def _parse_acks(text: str, *, strict: bool) -> list[str]:
                 for key in _LIST_KEYS:
                     if key in payload:
                         if not isinstance(payload[key], list):
-                            return fail(
+                            return hard(
                                 f"[fastlane] `{key}` 必须是列表（收到 "
                                 f"{type(payload[key]).__name__}：`{payload[key]}`）"
                             )
@@ -427,7 +436,7 @@ def _parse_acks(text: str, *, strict: bool) -> list[str]:
         for key in _LIST_KEYS:
             if key in loaded:
                 if not isinstance(loaded[key], list):
-                    return fail(
+                    return hard(
                         f"[fastlane] `{key}` 必须是列表（收到 "
                         f"{type(loaded[key]).__name__}：`{loaded[key]}`）"
                     )
@@ -451,7 +460,7 @@ def _parse_acks(text: str, *, strict: bool) -> list[str]:
                 text_line = value
             elif key in _LIST_KEYS:
                 if not value.startswith("["):  # `acks: fl-1-1` 是坏形状，不是一条 id
-                    return fail(f"[fastlane] `{key}:` 后面必须是列表（收到 `{value}`）")
+                    return hard(f"[fastlane] `{key}:` 后面必须是列表（收到 `{value}`）")
                 for item in _bracket_ids(value):
                     if item not in out:
                         out.append(item)
@@ -468,7 +477,8 @@ def _parse_acks(text: str, *, strict: bool) -> list[str]:
 def parse_ack_file(text: str) -> list[str]:
     """宽松解析（兼容旧调用）：形状非法时给空清单，不抛异常。
 
-    冻结形状与坏形状口径见 `_parse_acks`；CLI 一律走 `load_ack_ids()`（严格 → rc=2）。
+    唯一例外是 **`acks`（等列表键）存在但不是 list** —— 那种形状一律抛 `FastlaneError`
+    （见 `_parse_acks`：静默返回空清单正是 `acks: fl-1-1` 溜进写库的路径）。CLI 走 `load_ack_ids()`。
     """
     return _parse_acks(text, strict=False)
 

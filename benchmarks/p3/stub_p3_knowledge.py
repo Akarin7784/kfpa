@@ -477,8 +477,16 @@ def run_fastlane() -> None:
         expect(f"R-34 坏形状 → 中文 + rc=2：{label}", raised)
     expect("R-34：内联列表 `acks: [fl-1-1, fl-1-2]` 合法",
            fastlane.load_ack_ids("acks: [fl-1-1, fl-1-2]") == ["fl-1-1", "fl-1-2"])
-    expect("宽松入口 parse_ack_file 对坏形状不抛异常（只给空清单）",
-           fastlane.parse_ack_file("acks: fl-1-1\n") == [])
+    # R-36：列表键存在但不是 list —— **宽松入口也抛**，绝不静默吞（曾溜进写库的那条）
+    raised_lenient = False
+    try:
+        fastlane.parse_ack_file("acks: fl-1-1\n")
+    except fastlane.FastlaneError as exc:
+        raised_lenient = "rc=2" in str(exc) and "必须是列表" in str(exc)
+    expect("R-36：宽松入口 parse_ack_file 对「acks 是标量」也抛（绝不静默吞）", raised_lenient)
+    expect("宽松入口对其余坏形状仍只给空清单、不抛（旧兼容）",
+           fastlane.parse_ack_file("note: 只有注释\n") == []
+           and fastlane.parse_ack_file("acks: []\n") == [])
 
     spec = fastlane.micro_spec(FastlaneRequest(request_id="fl-8-1", round_no=8, summary="小改"))
     expect("微型规格渲染（含 request_id 与三判据）",
