@@ -464,6 +464,7 @@ def _register_plugin_commands(subparsers: Any) -> None:
         ("kfpa.ledger", ".ledger"),
         ("kfpa.knowledge", ".knowledge"),
         ("kfpa.impact", ".impact"),
+        ("kfpa.eval", ".eval"),          # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
     ]
     import importlib
 
