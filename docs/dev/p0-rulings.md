@@ -243,6 +243,30 @@ CI/验收台架只要捕获输出，就会把**全绿判成全红**（或反过�
 4. **对台架的要求**：镜鉴的 A1/A7 此前报 `rc=0`，说明台架跑的时候吞掉了这层（设了变量或换了解码）。
    请在不设 `PYTHONIOENCODING` 的条件下补跑 A1/A7/A10——这类「环境相关的假绿」比功能缺陷更危险。
 
+## R-19 R-18 的兜底必须覆盖独立脚本（台架自己也要能跑）
+
+**现象（我在合并后的 main 上跑最终验收时抓到）**：`cli.main()` 补上 R-18 兜底后 CLI 四条命令全绿，但
+
+```
+$ python scripts/verify_p0.py
+  File "…\Lib\encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   → rc=1
+```
+
+**根因**：`scripts/**` 是独立可执行脚本，**不经过 `cli.main()`**，拿不到那层兜底。
+
+**裁决 R-19**：
+
+1. `scripts/**` 下每个可直接执行的脚本，必须在 `main()` 最前做与 R-18.1 等价的 stdio 兜底
+   （`sys.stdout` / `sys.stderr` 都 `reconfigure(encoding="utf-8", errors="replace")`，try/except 包住）；
+   可以各自实现，也可以集中到 `scripts/_stdio.py` 供 import。
+2. 归属：`scripts/**` 归镜鉴。修完必须贴一条**不设 `PYTHONIOENCODING`** 的复现证据
+   （`python scripts/verify_p0.py *> out.txt; $LASTEXITCODE`）。
+3. 同样适用于将来任何新增的独立脚本（`scripts/*.py`、运维小工具）。
+   验收口径：**clean env（不设 `PYTHONIOENCODING`、stdout 重定向）下 rc 符合预期且输出无 `UnicodeEncodeError`**。
+4. 测退出码的姿势统一为「先重定向到文件再读 `$LASTEXITCODE`」：PowerShell 里
+   `python … | Select-Object -First 1` 会掐断上游，把 rc 污染成 0（我踩过，差点把未知票号读成 0）。
+
 ---
 
 ## 变更记录
@@ -255,3 +279,4 @@ CI/验收台架只要捕获输出，就会把**全绿判成全红**（或反过�
 | 1.3 | 2026-10-16 | R-13 放行判据（仅 HIGH 阻塞）· R-14 LangGraph state 契约与 `build_graph()` 签名 · R-15 界面小口径与 shim 处置 · R-16 集成预演纪律 | Chief |
 | 1.4 | 2026-10-16 | R-17 marker 规范（`KFPA_TASK=` 为准，`[KFPA:…]` 永久兼容别名）· D1-7 加口径标注 | Chief |
 | 1.5 | 2026-10-16 | R-18 中文输出在非 UTF-8 控制台/重定向下必须不崩（新增验收 A10；R-2b 运行约定补充） | Chief |
+| 1.6 | 2026-10-16 | R-19 R-18 兜底必须覆盖独立脚本（`scripts/**` 自己也要能在 clean env 下跑）| Chief |
