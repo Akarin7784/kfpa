@@ -317,41 +317,72 @@ def test_bad_json_columns_degrade_to_empty_list():
     store.close()
 
 
-# ---------------------------------------------------------------- cli 插件并入同一子命令组（D5 §1）
+# ---------------------------------------------------------------- cli 插件组（R-34）
 
-def test_cli_group_merge_keeps_p1_and_p3_commands():
-    """P1 的 `fastlane check` 与 P3 的五条命令必须共存一个 `fastlane` 组（不许撞名丢命令）。"""
+def test_fastlane_group_is_owned_by_fastlane_module():
+    """R-34 终态：`fastlane` 组由 `kfpa.fastlane` 独占，六条命令共存，`impact` 不再有 CLI。"""
     import argparse
 
     import kfpa.cli as cli
+    import kfpa.impact as impact
 
-    parser = argparse.ArgumentParser(prog="kfpa")
-    root = parser.add_subparsers(dest="command")
-    # 模拟 P1 的 impact.register()：先建 `fastlane` 组 + `check`
-    group = root.add_parser("fastlane")
-    sub = group.add_subparsers(dest="fastlane_cmd", required=True)
-    sub.add_parser("check")
+    parser = cli.build_parser()
+    root = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)][-1]
+    assert set(root.choices) >= {"fastlane", "rag", "knowledge", "eval"}
+    assert "impact" not in root.choices          # 从来就没有 `kfpa impact` 组，R-34 后也不许有
+    assert list(root.choices["fastlane"]._actions[-1].choices) == [
+        "check", "plan", "list", "ack", "batch-ack", "show"]
+    assert parser.parse_args(["fastlane", "check", "--round", "1"]).fastlane_cmd == "check"
+    assert parser.parse_args(["fastlane", "plan", "--round", "1"]).fastlane_cmd == "plan"
+    # 镜鉴的抢注探针口径：进程内调 impact.register() 必须不再抢注 `fastlane`
+    probe = argparse.ArgumentParser(prog="probe").add_subparsers(dest="command")
+    assert impact.register(probe) is None
+    assert "fastlane" not in probe.choices
+    # `check` 收敛成 `register_check(sub)` 供 owner 复用（挂进调用方给的组）
+    owner = argparse.ArgumentParser(prog="kfpa").add_subparsers(dest="command")
+    group = owner.add_parser("fastlane")
+    impact.register_check(group.add_subparsers(dest="fastlane_cmd", required=True))
+    assert list(owner.choices["fastlane"]._actions[-1].choices) == ["check"]
 
-    # 模拟 P3 的 fastlane.register()（写法与 impact 相同）：经代理应并入同一组
-    view = cli._GroupProxy(root, "fastlane")
-    same_group = view.add_parser("fastlane")
-    same_sub = same_group.add_subparsers(dest="fastlane_cmd", required=True)
-    for name in ("plan", "list", "ack", "batch-ack", "show"):
-        same_sub.add_parser(name)
 
-    assert cli._existing_group(root, "fastlane") == (group, sub)
-    assert list(sub.choices) == ["check", "plan", "list", "ack", "batch-ack", "show"]
-    assert parser.parse_args(["fastlane", "check"]).fastlane_cmd == "check"
-    assert parser.parse_args(["fastlane", "plan"]).fastlane_cmd == "plan"
-    # 非组名 → 照常新建；组不存在 → 照常新建；没有 sub-action 的裸 parser → add_subparsers 转发
-    assert view.add_parser("other").prog == "kfpa other"
-    fresh = argparse.ArgumentParser().add_subparsers(dest="command")
-    assert cli._existing_group(fresh, "fastlane") is None
-    assert cli._GroupProxy(fresh, "fastlane").add_parser("fastlane").prog.endswith("fastlane")
-    assert cli._GroupProxy(fresh, None).add_parser("plain").prog.endswith("plain")
-    bare = cli._ExistingGroupParser(root.add_parser("bare"), None)
-    assert bare.add_subparsers(dest="x") is not None
-    assert bare.prog.endswith("bare")          # __getattr__ 转发
+def test_duplicate_plugin_group_is_loud(monkeypatch, capsys):
+    """R-34：插件再注册同名组 → 中文报错 + 退出码 2（不许静默并入、不许只警告后继续）。"""
+    import argparse
+    import importlib
+    import types
+
+    import kfpa.cli as cli
+
+    def _first(subparsers):
+        subparsers.add_parser("fastlane")
+
+    def _dup(subparsers):
+        subparsers.add_parser("fastlane")     # 抢注同名组 → 必须响亮失败
+
+    modules = {}
+    for name, register in (("kfpa.fastlane", _first), ("kfpa.rag", _dup)):
+        mod = types.ModuleType(name)
+        mod.register = register
+        modules[name] = mod
+
+    real_import = importlib.import_module
+
+    def fake_import(name, package=None):
+        if name in modules:
+            return modules[name]
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    try:
+        parser = argparse.ArgumentParser(prog="kfpa")
+        root = parser.add_subparsers(dest="command")
+        with pytest.raises(SystemExit) as ei:
+            cli._register_plugin_commands(root)
+        assert ei.value.code == cli.EXIT_USAGE == 2
+        err = capsys.readouterr().err
+        assert "错误" in err and "已被注册" in err and "fastlane" in err
+    finally:
+        monkeypatch.setattr(importlib, "import_module", real_import)
 
 
 def test_register_plugin_commands_mounts_fastlane_and_rag(monkeypatch):
@@ -362,23 +393,18 @@ def test_register_plugin_commands_mounts_fastlane_and_rag(monkeypatch):
 
     import kfpa.cli as cli
 
-    def _impact(subparsers):
-        parser = subparsers.add_parser("fastlane")
-        sub = parser.add_subparsers(dest="fastlane_cmd", required=True)
-        sub.add_parser("check")
-
     def _fastlane(subparsers):
         parser = subparsers.add_parser("fastlane")
         sub = parser.add_subparsers(dest="fastlane_cmd", required=True)
-        sub.add_parser("plan")
+        for name in ("check", "plan", "list", "ack", "batch-ack", "show"):
+            sub.add_parser(name)
 
     def _rag(subparsers):
         sp = subparsers.add_parser("rag")
         sp.add_argument("query", nargs="?", default="")
 
     modules = {}
-    for name, register in (("kfpa.impact", _impact), ("kfpa.fastlane", _fastlane),
-                           ("kfpa.rag", _rag)):
+    for name, register in (("kfpa.fastlane", _fastlane), ("kfpa.rag", _rag)):
         mod = types.ModuleType(name)
         mod.register = register
         modules[name] = mod
@@ -396,7 +422,8 @@ def test_register_plugin_commands_mounts_fastlane_and_rag(monkeypatch):
         root = parser.add_subparsers(dest="command")
         cli._register_plugin_commands(root)
         assert {"fastlane", "rag"} <= set(root.choices)
-        assert list(root.choices["fastlane"]._actions[-1].choices) == ["check", "plan"]
+        assert list(root.choices["fastlane"]._actions[-1].choices) == [
+            "check", "plan", "list", "ack", "batch-ack", "show"]
         assert parser.parse_args(["rag", "x"]).query == "x"
     finally:
         monkeypatch.setattr(importlib, "import_module", real_import)

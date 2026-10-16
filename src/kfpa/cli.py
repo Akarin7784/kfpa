@@ -458,97 +458,59 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- 解析
 
 
-#: `argparse._SubParsersAction`（私有类名不进源码：用一次探针取 type）
-_SUBPARSERS_CLASS = type(argparse.ArgumentParser(prog="_kfpa_probe").add_subparsers())
+class PluginGroupConflict(RuntimeError):
+    """插件试图注册一个**已存在**的子命令组（R-34：响亮报错，不许静默并入）。"""
 
 
-def _existing_group(subparsers: Any, name: str) -> Optional[tuple[Any, Optional[Any]]]:
-    """找同级里已存在的同名子命令组 → `(parser, sub_action)`；没有则 None。
+class _SubparsersGuard:
+    """传给插件 `register()` 的 subparsers 视图：**重名组直接报错**，其余原样转发。
 
-    `_SubParsersAction.choices` 就是 `name → parser` 的映射（argparse 公开可读）。
-    """
-    choices = getattr(subparsers, "choices", None)
-    parser = choices.get(name) if isinstance(choices, dict) else None
-    if parser is None:
-        return None
-    for action in getattr(parser, "_actions", []):
-        if isinstance(action, _SUBPARSERS_CLASS):
-            return parser, action
-    return None
-
-
-class _GroupProxy:
-    """让后注册的插件把自己的子命令**并入已存在的同名组**（P3 D5 §3.2）。
-
-    背景：P1 的 `kfpa.impact.register()` 已经建了 `fastlane` 组（`fastlane check`，A16/R-23.2），
-    P3 的 `kfpa.fastlane.register()` 还要往同一组里加 `plan/list/ack/batch-ack/show`。
-    argparse 的 `add_parser("fastlane")` 撞名会直接抛 `conflicting subparser`，
-    结果是整组 P3 命令消失、或把 P1 的 `check` 顶掉（P2 的 `kfpa.eval` 漏挂是同类事故）。
-
-    这里给后注册的插件一个视图：`add_parser(<组名>)` 命中已存在的组时返回它的组代理，
-    `add_subparsers()` 返回**已有的** sub-action，其余属性转发给原 parser ——
-    于是插件的 `register()` 一行都不用改，子命令就进同一个组（`dest` 沿用先建组的 `fastlane_cmd`）。
+    R-34 的教训：`fastlane` 组曾被 `kfpa.impact` 与 `kfpa.fastlane` 两个模块抢注，
+    而当时 argparse 的 `conflicting subparser` 被降级成一句 stderr 警告后继续跑，
+    结果是「命令悄悄少一半」——与 P2 漏挂 `kfpa.eval` 是同一类雷。现在同名注册一律硬失败。
     """
 
-    def __init__(self, subparsers: Any, group: Optional[str]) -> None:
+    def __init__(self, subparsers: Any) -> None:
         self._subparsers = subparsers
-        self._group = group
 
     def add_parser(self, name: str, *args: Any, **kwargs: Any) -> Any:
-        if self._group is None or name != self._group:
-            return self._subparsers.add_parser(name, *args, **kwargs)
-        existing = _existing_group(self._subparsers, name)
-        if existing is None:
-            return self._subparsers.add_parser(name, *args, **kwargs)
-        parser, sub = existing
-        return _ExistingGroupParser(parser, sub)
+        choices = getattr(self._subparsers, "choices", None)
+        if isinstance(choices, dict) and name in choices:
+            raise PluginGroupConflict(
+                f"子命令组 `{name}` 已被注册 → 一个组只能有一个 owner（R-34：`fastlane` 归 "
+                "`kfpa.fastlane`）；请把你那条子命令挂进 owner 的组，不要新建同名组"
+            )
+        return self._subparsers.add_parser(name, *args, **kwargs)
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self._subparsers, item)
 
 
-class _ExistingGroupParser:
-    """已存在组的 parser 代理：`add_subparsers()` 回已有的 sub-action，其余转发。"""
-
-    def __init__(self, parser: Any, sub: Optional[Any]) -> None:
-        self._parser = parser
-        self._sub = sub
-
-    def add_subparsers(self, *args: Any, **kwargs: Any) -> Any:
-        if self._sub is not None:
-            return self._sub
-        return self._parser.add_subparsers(*args, **kwargs)
-
-    def __getattr__(self, item: str) -> Any:
-        return getattr(self._parser, item)
-
-
 def _register_plugin_commands(subparsers: Any) -> None:
-    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3 + P3 D5）：
-    `tickets`（界面）、`ledger` / `knowledge`（长流）、`fastlane`（长流 P3）、
-    `rag`（长流 P3 检索）、`impact`、`eval`（P2 同源盲区度量）。
+    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3 + P2 D4 + P3 D5）：
+    `tickets`（界面）、`ledger` / `knowledge`（长流）、`eval`（P2）、
+    `fastlane`（长流 P3，R-34 起**唯一 owner**，含 P1 的 `check`）、`rag`（长流 P3 检索）。
 
     每个模块导出 `register(subparsers)`；模块缺失时静默跳过（P0 core-only 环境仍可用），
     模块存在但挂载失败时打警告——**不许让一个坏插件拖垮整个 CLI**。
 
-    第三条（P3 新增）是「组名」：`None` = 自己建组；给了名字 = **并入该组**（组由先注册的
-    `kfpa.impact` 建，`fastlane check` + P3 五条命令共存一个 `fastlane` 组，见 `_GroupProxy`）。
+    **例外是重名组**（R-34）：插件再注册一个已存在的组名 → 中文报错 + 退出码 2，硬失败。
+    静默并入/静默跳过都会让「命令少一半」藏在一次警告里，那正是 P2 踩过的坑。
 
     P3 教训（D5 §1）：`fastlane` / `rag` 的 `register()` 写好了不等于 `kfpa fastlane` 存在——
     P2 的 `kfpa.eval` 就漏挂过，A21 的 CLI 路径直接跑不通。实现方交付前必须自己跑 `--help` 自证。
     """
     builtins_list = [
-        ("kfpa.ui.cli", ".ui", None),
-        ("kfpa.ledger", ".ledger", None),
-        ("kfpa.knowledge", ".knowledge", None),
-        ("kfpa.impact", ".impact", None),          # P1 D3-3.6：`fastlane check`（先建组，做锚）
-        ("kfpa.eval", ".eval", None),              # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
-        ("kfpa.fastlane", ".fastlane", "fastlane"),  # P3 D5-3.2：并入上面的 `fastlane` 组
-        ("kfpa.rag", ".rag", None),                # P3 D5-3.5：`kfpa rag search`
+        ("kfpa.ui.cli", ".ui"),
+        ("kfpa.ledger", ".ledger"),
+        ("kfpa.knowledge", ".knowledge"),
+        ("kfpa.eval", ".eval"),          # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
+        ("kfpa.fastlane", ".fastlane"),  # P3 D5-3.2 / R-34：`fastlane` 组的唯一 owner（含 `check`）
+        ("kfpa.rag", ".rag"),            # P3 D5-3.5：`kfpa rag search`
     ]
     import importlib
 
-    for module_name, short, group in builtins_list:
+    for module_name, short in builtins_list:
         try:
             module = importlib.import_module(module_name, package=__package__)
         except ImportError:
@@ -560,9 +522,11 @@ def _register_plugin_commands(subparsers: Any) -> None:
         if not callable(register):
             continue
         try:
-            # 只有「并入已存在组」的插件拿到代理；其余插件拿到的还是原来的 subparsers 对象
-            # （零行为变化——P0/P1/P2 的挂载路径不受影响）。
-            register(_GroupProxy(subparsers, group) if group else subparsers)
+            register(_SubparsersGuard(subparsers))
+        except PluginGroupConflict as exc:
+            # 响亮失败：不许把「命令少一半」降级成一句警告（R-34）。
+            print(f"[kfpa] 错误：{short} 注册了重复的子命令组：{exc}", file=sys.stderr)
+            raise SystemExit(EXIT_USAGE) from exc
         except Exception as exc:
             print(f"[kfpa] 警告：{short} 子命令注册失败：{exc}", file=sys.stderr)
 
