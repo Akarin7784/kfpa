@@ -215,9 +215,12 @@ Flash 越笨，规约必须越精确。六段式模板（Jinja2 渲染）：
 - [x] **P0 懒人版**：LiteLLM + Aider + SQLite + Dify，一天跑通第一轮（设计→質問票→确认→编码→门禁）
   —— 已交付（2026-10-16）：SQLite + LangGraph 编排 + mock 执行器跑通全链，离线可验收；
   真实 LiteLLM/Aider/Dify 为惰性可选适配器。实现与裁决见 `docs/dev/p0-*.md`，验收见 `docs/acceptance/p0-acceptance.md`。
-- [ ] **P1 正经版**：PostgreSQL + Langfuse + PR-Agent + Streamlit 質問票台账
-- [ ] **P2 评审位异构化**：接入第二个模型 API，消化同源盲区债务
+- [x] **P1 正经版**：PostgreSQL + Langfuse + PR-Agent + Streamlit 質問票台账
+  —— 已交付（2026-10-16）：双库对拍、token 账本、checkpoint、G7 门槛、Streamlit 台账；见 `docs/dev/p1-plan.md`（D3）与 `docs/acceptance/p1-acceptance.md`。
+- [x] **P2 评审位异构化**：接入第二个模型 API，消化同源盲区债务
+  —— 已交付（2026-10-17，main `be4da48`）：按角色 provider、fresh context、G8 折算、同源盲区度量（异构漏检 0 vs 同源 12）、覆盖率债清偿（R-32 纯逻辑白名单 90.7%）；见 `docs/dev/p2-plan.md`（D4，契约 1.3）与 `docs/acceptance/p2-acceptance.md`。
 - [ ] **P3 快车道 + 沉淀闸门全量落地**，验证八成维护长尾的消化能力
+  —— 进行中（2026-10-17 开工）：快车道承认落库 + 沉淀闸门全量 + 负知识闭环 + 本地回退检索（RAG）；契约见 `docs/dev/p3-plan.md`（D5，契约 1.4 / schema 4）。
 
 ## 9. 非目标（Non-Goals)
 

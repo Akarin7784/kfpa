@@ -30,9 +30,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: D4 §3.1：P2 用契约 1.3
-CONTRACT_VERSION_LATEST = "1.3"
-SUPPORTED_CONTRACT_VERSIONS = ("1.3",)
+#: D4 §3.1：P2 用契约 1.3 起；P3 升 1.4（D5 §3.1），台架同批接受
+CONTRACT_VERSION_LATEST = "1.4"
+SUPPORTED_CONTRACT_VERSIONS = ("1.3", "1.4")
 
 EXIT_PASS, EXIT_USAGE, EXIT_CONFIRM, EXIT_DEP, EXIT_IO, EXIT_NEEDS_FIX, EXIT_BLOCKED = \
     0, 2, 3, 4, 5, 10, 11

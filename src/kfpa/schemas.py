@@ -1,4 +1,4 @@
-"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.3）。
+"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.4）。
 
 本文件由 Chief 冻结：**任何人不得直接修改**。需要变更时在群里提，
 由 Chief 升版后统一改，改完必须同步 docs/dev/p0-plan.md §3.1（P0）与 docs/dev/p1-plan.md §3.1（P1）。
@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-CONTRACT_VERSION = "1.3"
+CONTRACT_VERSION = "1.4"
 
 # ---------------------------------------------------------------- 枚举
 
@@ -146,6 +146,7 @@ class TaskPackage:
     prohibitions: list[str] = field(default_factory=list)                 # 段5 禁止事项
     feedback: list[str] = field(default_factory=list)                     # 段6 回灌区（首轮可空）
     closed_tickets: list[str] = field(default_factory=list)               # 已关闭并可据此消歧的票号
+    knowledge_hits: list[str] = field(default_factory=list)               # P3 契约 1.4：检索命中摘要（稳定串）
 
     def missing_sections(self) -> list[str]:
         """返回结构性缺段（空列表 = 六段结构齐全）。
@@ -398,6 +399,66 @@ class ReviewMetrics:
         )
 
 
+# ---------------------------------------------------------------- P3 增量（契约 1.4）
+
+
+class FastlaneStatus(str, Enum):
+    """快车道请求状态（P3 D5-3.1，兑现 R-23 的「P3 落库」）。"""
+
+    PENDING = "pending"        # 已登记待承认
+    APPROVED = "approved"      # 攒批承认通过（唯一可直跑的态）
+    REJECTED = "rejected"      # 人工拒绝
+    ESCALATED = "escalated"    # 触碰设计边界 → 升级回完整设计回合
+
+
+@dataclass
+class FastlaneRequest:
+    """快车道请求（design.md §5.6 的「小变更 → 微型规格 → 攒批承认 → Flash 直跑」）。"""
+
+    request_id: str
+    round_no: int
+    summary: str
+    diff_files: list[str] = field(default_factory=list)    # 三来源优先级沿用 R-23
+    new_interface: bool = False                            # 判据 1
+    new_data_model: bool = False                           # 判据 2
+    touched_modules: list[str] = field(default_factory=list)   # 判据 3（>1 → 不符）
+    status: FastlaneStatus = FastlaneStatus.PENDING
+    batch_id: str = ""
+    decided_by: str = ""
+    decided_at: float = 0.0
+    note: str = ""
+
+    def judged_fastlane(self) -> bool:
+        """三判据全真才算快车道（D5-3.2）。判定只做纯计算，编排不进这里。"""
+        return (
+            not self.new_interface
+            and not self.new_data_model
+            and len(set(self.touched_modules)) <= 1
+        )
+
+    def escalations(self) -> list[str]:
+        """不满足判据的原因清单 —— 不许只给布尔（D5-3.2）。"""
+        reasons: list[str] = []
+        if self.new_interface:
+            reasons.append("new_interface")
+        if self.new_data_model:
+            reasons.append("new_data_model")
+        if len(set(self.touched_modules)) > 1:
+            reasons.append("touched_modules>1")
+        return reasons
+
+
+@dataclass
+class KnowledgeSample:
+    """人工抽检留痕（design.md §5.5「置信度门槛 + 人工抽检」）。"""
+
+    cid: str
+    sampled_at: float = field(default_factory=time.time)
+    sampled_by: str = ""
+    rate: float = 0.0      # 抽中时的动态抽样率（留痕，便于回看口径）
+    passed: bool = True
+
+
 # ---------------------------------------------------------------- 工具
 
 
@@ -445,6 +506,9 @@ __all__ = [
     "ReviewFinding",
     "ReviewReport",
     "ReviewMetrics",
+    "FastlaneStatus",
+    "FastlaneRequest",
+    "KnowledgeSample",
     "to_jsonable",
     "dumps",
 ]
