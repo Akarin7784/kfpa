@@ -25,13 +25,17 @@
 - reasons：{{ gate.reasons | join('；') }}
 - failing_criteria：{{ gate.failing_criteria | join('、') or '（无）' }}
 
-## 输出（严格 JSON，D1-7 评审剧本格式）
+## 输出（严格 JSON，D2 R-5 形状；评审**不参与 P0 门禁判定**，只作输入）
 {% raw %}
 {
-  "verdict": "pass 或 fail",
-  "error_category": "apply_failed|compile|test_fail|missing_section|unmapped_criterion|other",
-  "failed_criteria": ["A1"],
-  "reason": "..."
+  "reviews": [
+    {
+      "severity": "blocker|major|minor",
+      "location": "任务包第几段 / 文件与函数",
+      "issue": "与实现不一致之处",
+      "suggestion": "怎么改"
+    }
+  ]
 }
 {% endraw %}
 

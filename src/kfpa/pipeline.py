@@ -18,15 +18,15 @@
     build_graph(store, llm, executor, workdir, *, max_attempts=3, dry_run=True,
                 injection="none") -> 已编译的 LangGraph 图
     run_round_via_graph(...) -> RoundResult
-    round_exit_code(result) -> int          # D1-5 退出码：0 / 10 / 11 / 3
     render_task_package(package) -> str     # 六段式任务包 Markdown 交付物
     build_review_prompt(package, exec_result, gate) -> str
 
-CLI 退出码（D1-5）：
-    0  PASS（并通过快照）
-    10 NEEDS_FIX（未耗尽重试上限）
-    11 BLOCKED（升级主BOT / attempts_exhausted）
-    3  存在未关闭的高影响質問票，拒绝生成任务包
+退出码：**由 `src/kfpa/cli.py`（磐石）统一映射**（D2 R-1）。本模块只保证
+`RoundResult.state` 语义正确：PASS → `SNAPSHOTTED`；等待人工确认 → `TICKETS_OPEN`；
+已升级主BOT → `BLOCKED`。
+
+`injection` 口径（D2 R-10）：`high_ticket` 由 `build_llm(...)` 在 mock 剧本里消化，
+**不透传执行器**；只有 `apply_fail` / `test_fail` 才转给 `MockExecutor`。
 
 日志：每阶段一行 `[i/6] 阶段名 …` 输出到 **stderr**（保持 stdout 干净，供 `--json` 单行输出）。
 """
@@ -64,15 +64,12 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，运行期不依赖磐�
 #: 提示词模板目录
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-# ---------------------------------------------------------------- 退出码（D1-5）
-
-EXIT_PASS = 0
-EXIT_NEEDS_FIX = 10
-EXIT_BLOCKED = 11
-EXIT_OPEN_HIGH_TICKETS = 3
-
+# ---------------------------------------------------------------- 退出码（D2 R-1：由 cli.py 映射）
 #: 高影响票硬规则的机器可判定标记（CLI 与测试都可据此断言）
 BLOCKED_MARK = "[KFPA-BLOCKED]"
+
+#: 透传执行器的注入档位（D2 R-10：high_ticket 归 mock 剧本，不进执行器）
+EXECUTOR_INJECTIONS = ("apply_fail", "test_fail")
 
 #: 单轮开票上限（D1-1：超过则 LOW 合并成一条汇总票）
 MAX_TICKETS_PER_ROUND = 20
@@ -465,20 +462,6 @@ def build_review_prompt(package: TaskPackage, exec_result: ExecResult, gate: Any
     )
 
 
-# ---------------------------------------------------------------- 退出码
-
-
-def round_exit_code(result: RoundResult) -> int:
-    """把一轮结果映射成 D1-5 的进程退出码。"""
-    if result.state is RoundState.SNAPSHOTTED:
-        return EXIT_PASS
-    if result.state is RoundState.TICKETS_OPEN:
-        return EXIT_OPEN_HIGH_TICKETS
-    if result.state is RoundState.BLOCKED:
-        return EXIT_BLOCKED
-    return EXIT_NEEDS_FIX
-
-
 # ---------------------------------------------------------------- 基础设施
 
 
@@ -636,7 +619,7 @@ def run_round(
     _log(f"[1/6] 设计录入：ref={design_ref} round={round_no} dry_run={dry_run}")
     store.upsert_round(Round(round_no=round_no, design_ref=design_ref, state=RoundState.DESIGN_IN))
 
-    if injection and injection != "none" and hasattr(executor, "injection"):
+    if injection in EXECUTOR_INJECTIONS and hasattr(executor, "injection"):
         executor.injection = injection  # type: ignore[attr-defined]
 
     tickets = _stage_tickets(store, llm, round_no, design_text)
@@ -777,7 +760,7 @@ def build_graph(
         ) from exc
 
     workdir_path = Path(workdir)
-    if injection and injection != "none" and hasattr(executor, "injection"):
+    if injection in EXECUTOR_INJECTIONS and hasattr(executor, "injection"):
         executor.injection = injection  # type: ignore[attr-defined]
 
     class RoundGraphState(TypedDict, total=False):
@@ -1025,6 +1008,7 @@ __all__ = [
     "EXIT_BLOCKED",
     "EXIT_OPEN_HIGH_TICKETS",
     "BLOCKED_MARK",
+    "EXECUTOR_INJECTIONS",
     "MAX_TICKETS_PER_ROUND",
     "IMPACT_FLOOR_HIGH",
     "IMPACT_FLOOR_MEDIUM",
@@ -1037,7 +1021,6 @@ __all__ = [
     "build_task_package",
     "render_task_package",
     "build_review_prompt",
-    "round_exit_code",
     "run_round",
     "build_graph",
     "run_round_via_graph",

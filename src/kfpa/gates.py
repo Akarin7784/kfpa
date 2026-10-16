@@ -18,8 +18,8 @@ r"""质量门禁三态判定（纯函数，P0，契约 §3.5 + 设计补充件 D
     reason_key = sha1(f"{category}|{target}")[:12]
     回避模式固定句式：AVOID[{category}] {target}：上次失败——{error 摘要 ≤80 字}
 
-计数口径：**先取历史计数、再写本次 FailureRecord**，所以 `same_reason_count`
-是「本轮历史出现次数（不含本次）」，`escalated = (count + 1) >= 2`（D1-4）。
+计数口径（D2 R-4）：**先落本次 FailureRecord，再计数（含本次）**，`escalated = count >= 2`，
+`GateReport.same_reason_count = count - 1`（保持 D1-4「历史次数、不含本次」的字段语义）。
 """
 
 from __future__ import annotations
@@ -172,8 +172,8 @@ def evaluate(
         )
 
     reason_key = make_reason_key(category, target)
-    # 先取历史计数（不含本次），再落失败记录 —— 口径见模块 docstring
-    same_reason_count = store.count_same_failure(round_no, reason_key)
+    # D2 R-4 固定顺序：先落本次 FailureRecord，再计数（含本次），escalated = count >= 2；
+    # GateReport.same_reason_count = count - 1（保持 D1-4「历史次数、不含本次」的字段语义）
     avoid = make_avoid_pattern(category, target, exec_result.error or "；".join(reasons))
     store.record_failure(
         FailureRecord(
@@ -184,17 +184,19 @@ def evaluate(
             reason_key=reason_key,
         )
     )
+    same_total = store.count_same_failure(round_no, reason_key)
+    same_reason_count = max(0, same_total - 1)
 
-    escalated = (same_reason_count + 1) >= ESCALATE_THRESHOLD  # G5
+    escalated = same_total >= ESCALATE_THRESHOLD  # G5
     if escalated:
         reasons.append(
-            f"[gate] G5 同类失败第 {same_reason_count + 1} 次（阈值 {ESCALATE_THRESHOLD}）"
+            f"[gate] G5 同类失败第 {same_total} 次（阈值 {ESCALATE_THRESHOLD}）"
             "→ BLOCKED + escalated：停止空转，先做变更影响分析再重规划"
         )
         state = GateState.BLOCKED
     else:
         reasons.append(
-            f"[gate] G5 同类失败第 {same_reason_count + 1} 次（阈值 {ESCALATE_THRESHOLD}）"
+            f"[gate] G5 同类失败第 {same_total} 次（阈值 {ESCALATE_THRESHOLD}）"
             "→ NEEDS_FIX：带上回避模式重试一次"
         )
         state = GateState.NEEDS_FIX
@@ -222,7 +224,6 @@ def exhausted_report(
     category = "other"
     target = reason
     reason_key = make_reason_key(category, target)
-    same_reason_count = store.count_same_failure(round_no, reason_key)
     detail = "；".join(last.reasons) if last else "无更早的门禁记录"
     text = (
         f"[gate] {reason} 不同原因连续失败到重试上限（第 {attempt} 次）→ BLOCKED："
@@ -237,6 +238,7 @@ def exhausted_report(
             reason_key=reason_key,
         )
     )
+    same_total = store.count_same_failure(round_no, reason_key)  # D2 R-4：含本次
     return GateReport(
         round_no=round_no,
         state=GateState.BLOCKED,
@@ -244,7 +246,7 @@ def exhausted_report(
         failing_criteria=list(last.failing_criteria) if last else [],
         attempt=attempt,
         escalated=False,
-        same_reason_count=same_reason_count,
+        same_reason_count=max(0, same_total - 1),
         reason_key=reason_key,
     )
 
