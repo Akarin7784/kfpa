@@ -93,6 +93,48 @@
 - 其余全部成功 → 退出码 **0**。
 - **`1` 不再是合法退出码**（R-1 作废），界面 PR #4 里的「有跳过即退出码 1」必须改掉。
 
+## R-10 A2 与 A3 不互斥：happy-path 剧本不含 HIGH，A3 走注入（`--inject high_ticket`）
+
+- 镜鉴问：§4 硬规则「未关闭 HIGH 票不得出任务包」与 A2「一条命令跑完整轮」看似互斥。
+- **裁决：不采用两段式验收，维持 A2 单命令。** 依据 R-3：mock 默认剧本只产 MEDIUM/LOW，
+  HIGH 票是 A3 的**注入件**，不是 happy-path 的产物。两者从不同剧本出发，不构成互斥。
+- 为了让 A3 **纯 CLI 可复现**（独立验证不该依赖 pytest 之外的私有 API），`--inject` 值域扩为：
+
+  | 值 | 语义 | 接线方 |
+  |---|---|---|
+  | `none`（默认） | 不注入 | — |
+  | `high_ticket` | mock 首张票升为 HIGH | 磐石：`build_llm(roles, provider="mock", high_impact=True)` |
+  | `apply_fail` | 执行器应用失败（`error_category=apply_failed`） | 长流：`run_round(injection=...)` → `MockExecutor` |
+  | `test_fail` | 断言失败（`error_category=test_fail`，`failed_criteria` 非空） | 同上 |
+
+- A3 的 CLI 口径：`... round --inject high_ticket --round N --dry-run` → **退出码 3**，
+  且 `tickets list` 能看到该 HIGH 票；`tickets close` 后重跑同一轮 → 正常出包。
+- `--inject high_ticket` 只影响 mock 剧本，不得影响真实 provider 路径。
+
+## R-11 A5 白名单与验收命令（原命令会误杀适配器）
+
+- 原命令 `grep -riE "deepseek|gpt-|claude|qwen|bge" src --include=*.py` 会把 `llm.py` 适配器自己判违规，
+  与铁律「适配器内部允许出现模型串」自相矛盾。
+- **A5 验收命令改为两条，都必须 0 命中**：
+
+  ```bash
+  # A5.1 业务代码零模型串（排除唯一白名单文件）
+  grep -rnE "deepseek|gpt-|claude|qwen|bge" src --include=*.py | grep -v "^src/kfpa/llm.py:"
+  # A5.2 白名单文件自身也不许有字面量模型串（只能从 config/models.yaml 读）
+  grep -nE "\"(deepseek|gpt-|claude|qwen|bge)[^\"]*\"" src/kfpa/llm.py
+  ```
+
+- 白名单**只有一个文件**：`src/kfpa/llm.py`（适配器内部）。新增白名单必须经 Chief 裁决，不许各自放宽。
+
+## R-12 镜鉴报告里两条「main 状态」结论已过时（先 rebase 再复验）
+
+- 已核实：`main` 现为 **`CONTRACT_VERSION = "1.1"`**（`src/kfpa/schemas.py`），
+  `docs/dev/` 下 `p0-plan.md` / `p0-design-addendum.md` / `p0-rulings.md` **三份都在**。
+- 镜鉴的台架若要基于最新基线，先 `git fetch origin && git rebase origin/main` 再复验；
+  报告中「契约仍是 1.0」「D1 不存在」导致 A4 两条子断言 SKIP 的部分，rebase 后应转为实跑。
+- `batch-close` 的文件格式**不是未定义**：见 `p0-design-addendum.md` **D1-8**
+  （YAML/JSON 的 `票号 -> 结论` 映射；界面额外接受列表形状，属宽松扩展，不冲突）。
+
 ---
 
 ## 变更记录
@@ -101,3 +143,4 @@
 |---|---|---|---|
 | 1.0 | 2026-10-16 | R-1 退出码 · R-2 运行方式 · R-3 Mock 剧本 · R-4 失败计数 · R-5 REVIEWER · R-6 票号 · R-7 异常包装与 A9 | Chief |
 | 1.1 | 2026-10-16 | R-3 补 `ticket_id` 去重口径 · R-8 `--impact` 下推 Store · R-9 batch-close 退出码（禁用 1） | Chief |
+| 1.2 | 2026-10-16 | R-10 A2/A3 不互斥 + `--inject high_ticket` · R-11 A5 白名单与两条验收命令 · R-12 main 基线核对与 rebase 要求 | Chief |
