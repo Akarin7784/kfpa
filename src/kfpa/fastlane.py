@@ -810,7 +810,13 @@ def register(subparsers: Any) -> None:  # pragma: no cover - 由 cli.py 挂载
     group = _fastlane_group(subparsers)
     names = getattr(group, "_name_parser_map", {})
 
-    if "check" not in names:  # R-34：check 由本模块注册；过渡期 impact 已建组时跳过
+    if "check" not in names:
+        # R-34：`check` 也由本模块注册（内部转 `impact.analyze`，A16 行为一致）。
+        #
+        # 磐石在 `impact.register_check(group)` 里提供了同一份 argparse + 处理器，可以省掉下面这段；
+        # 但它内部自建 store（`make_store(args.db)`），而 `tests/test_p3_knowledge.py` 两个已合入
+        # main 的 `check` 用例是用 `fastlane._store_for` 注入库的 —— 现在切过去会把 main 打红两处。
+        # 待镜鉴把那两处改成 patch `kfpa.store.make_store` 后再切（本模块保留等价实现，A16 已过）。
         check = group.add_parser("check", help="对某轮任务包做三判据影响分析（R-23.2 / D3-3.6）")
         check.add_argument("--round", dest="round_no", type=int, required=True)
         check.add_argument("--db", default="kfpa.db")

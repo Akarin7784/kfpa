@@ -183,29 +183,28 @@ class FakeStoreStrictAck(FakeStore):
         return row
 
 
-class GroupProxy:
-    """模拟磐石 `cli.py` 的 `_GroupProxy`：`add_parser("fastlane")` 并进已存在的组。"""
+class _NoRegisterCheck:
+    """上下文：临时摘掉 `impact.register_check`（模拟 R-34 之前的 main），验本模块兜底实现。"""
 
-    def __init__(self, real, existing_parser) -> None:
-        self._real = real
-        self._existing = existing_parser
+    def __enter__(self):
+        self._saved = getattr(impact, "register_check", None)
+        if self._saved is not None:
+            del impact.register_check
+        return self
 
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def add_parser(self, name, **kwargs):
-        if name == "fastlane":
-            return self._existing
-        return self._real.add_parser(name, **kwargs)
+    def __exit__(self, *exc):
+        if self._saved is not None:
+            impact.register_check = self._saved
+        return False
 
 
-def make_cli(order="impact_first"):
-    """按 cli.py 的挂载方式建解析器；三种挂载形态都要能用（见 `_fastlane_group`）。
+def make_cli(order="fastlane_only"):
+    """按 cli.py 的挂载方式建解析器；R-34/R-36 终态与旧 main 都要能用。
 
-    - `impact_first`：过渡期 `impact` 先建 `fastlane` 组（P1 语义）；
-    - `fastlane_first`：R-34 前的反序（`impact` 报冲突被 cli 吞掉）；
-    - `fastlane_only`：**R-34 终态**——只有 `kfpa.fastlane` 注册 `fastlane`；
-    - `proxy`：磐石的 `_GroupProxy` 把 `add_parser("fastlane")` 并进已有组。
+    - `fastlane_only`（**R-34/R-36 终态**）：只有 `kfpa.fastlane` 注册 `fastlane` 组；
+    - `impact_first`：老 main 顺序（`impact.register()` 现在是空操作，组仍由本模块建）；
+    - `fastlane_first`：R-34 前的反序（`impact` 真抢注时冲突被 cli 吞掉）；
+    - `no_register_check`：旧 main 没有 `impact.register_check` → 本模块的 `_cmd_check` 兜底。
     """
     parser = argparse.ArgumentParser(prog="kfpa")
     sub = parser.add_subparsers(dest="command")
@@ -214,18 +213,13 @@ def make_cli(order="impact_first"):
         modules = [fastlane, impact, knowledge, rag]
     if order == "fastlane_only":
         modules = [fastlane, knowledge, rag]
-    if order == "proxy":
-        impact.register(sub)
-        existing = sub._name_parser_map["fastlane"]
-        modules = []
-        for module in (fastlane, knowledge, rag):
-            try:
-                module.register(GroupProxy(sub, existing) if module is fastlane else sub)
-            except Exception:  # noqa: BLE001
-                pass
     for module in modules:
         try:
-            module.register(sub)
+            if order == "no_register_check" and module is fastlane:
+                with _NoRegisterCheck():
+                    module.register(sub)
+            else:
+                module.register(sub)
         except Exception:  # noqa: BLE001 - cli.py 的真实行为：坏插件不拖垮 CLI
             pass
     return parser
@@ -234,6 +228,41 @@ def make_cli(order="impact_first"):
 def fastlane_group_names(parser) -> list[str]:
     group = parser._subparsers._group_actions[0]._name_parser_map["fastlane"]
     return sorted(group._subparsers._group_actions[0]._name_parser_map)
+
+
+def check_handler_module(parser) -> str:
+    """`fastlane check` 的 handler 定义在哪个模块（`kfpa.impact` = 委托成功）。"""
+    args = parser.parse_args(["fastlane", "check", "--round", "1"])
+    return str(getattr(args.handler, "__module__", ""))
+
+
+class inject_store:
+    """上下文：同时替换 `fastlane._store_for` 与 `kfpa.store.make_store`。
+
+    委托给 `impact.register_check` 的 `check` 走的是 `make_store()`，只换 `_store_for` 不够。
+    """
+
+    def __init__(self, store, module=fastlane) -> None:
+        self.store = store
+        self.module = module
+
+    def __enter__(self):
+        import kfpa.store as store_mod
+
+        self._mod_saved = getattr(self.module, "_store_for", None)
+        self._make_saved = store_mod.make_store
+        if self._mod_saved is not None:
+            self.module._store_for = lambda _db: self.store  # noqa: ARG005
+        store_mod.make_store = lambda _db=None: self.store  # noqa: ARG005
+        return self
+
+    def __exit__(self, *exc):
+        import kfpa.store as store_mod
+
+        if self._mod_saved is not None:
+            self.module._store_for = self._mod_saved
+        store_mod.make_store = self._make_saved
+        return False
 
 
 def call_cli(parser, argv: list[str], store: FakeStore, module) -> int:
@@ -455,27 +484,29 @@ def run_fastlane() -> None:
     expect("微型规格渲染（含 request_id 与三判据）",
            "fl-8-1" in spec and "new_interface" in spec)
 
-    # CLI：注册顺序无关 + 子命令齐全
+    # CLI：R-34/R-36 终态挂载 + 旧 main 兼容，六子命令都要齐
     parser = make_cli("impact_first")
     names = fastlane_group_names(parser)
-    expect("顺序 A：impact 先注册 → 六子命令齐全",
+    expect("老 main 顺序（impact 空操作）→ 六子命令齐全",
            names == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names))
     parser_rev = make_cli("fastlane_first")
     names_rev = fastlane_group_names(parser_rev)
-    expect("顺序 B：fastlane 先注册 → 仍六子命令（impact 报冲突被 cli 吞掉）",
+    expect("反序挂载 → 仍六子命令（冲突被 cli 吞掉）",
            names_rev == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_rev))
     names_only = fastlane_group_names(make_cli("fastlane_only"))
     expect("R-34 终态：只有 kfpa.fastlane 注册 → 六子命令齐全（含 check）",
            names_only == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_only))
-    proxy_parser = make_cli("proxy")
-    names_proxy = fastlane_group_names(proxy_parser)
-    expect("磐石 _GroupProxy 并入既有组 → 六子命令、不重复建组",
-           names_proxy == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_proxy))
-    proxy_args = proxy_parser.parse_args(["fastlane", "plan", "--round", "1"])
-    expect("_GroupProxy 下 plan 能解析到 handler",
-           proxy_args.fastlane_cmd == "plan" and proxy_args.round_no == 1)
+    expect("`check` 由本模块注册（等价实现，A16 行为一致）",
+           check_handler_module(make_cli("fastlane_only")) == "kfpa.fastlane",
+           check_handler_module(make_cli("fastlane_only")))
+    # 注：磐石的 `impact.register_check()` 可省掉本模块这份等价实现；切换前需先让
+    # `tests/test_p3_knowledge.py` 的 check 用例改 patch `kfpa.store.make_store`（见 PR 说明）。
+    legacy = make_cli("no_register_check")
+    expect("旧 main 兼容：没有 `impact.register_check` 时同样六子命令",
+           fastlane_group_names(legacy) == ["ack", "batch-ack", "check", "list", "plan", "show"],
+           str(fastlane_group_names(legacy)))
     check_args = parser_rev.parse_args(["fastlane", "check", "--round", "1"])
-    expect("顺序 B 下 `check` 仍可解析（R-24.3 功能不丢）", check_args.fastlane_cmd == "check")
+    expect("旧挂载顺序下 `check` 仍可解析（R-24.3 功能不丢）", check_args.fastlane_cmd == "check")
 
     # CLI：退出码
     store = FakeStore()
@@ -943,24 +974,26 @@ def run_fastlane_cli() -> None:
             rejected_approved = True
         expect("reject：已 APPROVED 不许事后拒绝", rejected_approved)
 
-        # 顺序 B 下的 check 兜底实现（impact 没注册成）
+        # check（R-36 起委托 `impact.register_check`，走 make_store 取库）
         parser_rev = make_cli("fastlane_first")
         check_args = parser_rev.parse_args(["fastlane", "check", "--round", "1", "--db", "x"])
-        with redirect_stdout(io.StringIO()) as out_check:
-            rc_check = check_args.handler(check_args)
-        expect("CLI：check 兜底文本（有任务包 → 给判定）",
+        with inject_store(store):
+            with redirect_stdout(io.StringIO()) as out_check:
+                rc_check = check_args.handler(check_args)
+        expect("CLI：check 文本（有任务包 → 给判定）",
                rc_check == 0 and "轮次 1" in out_check.getvalue(), out_check.getvalue()[:40])
         check_json = parser_rev.parse_args(["fastlane", "check", "--round", "1",
                                             "--files", "src/kfpa/a.py", "--db", "x", "--json"])
-        with redirect_stdout(io.StringIO()) as out_check_json:
-            rc_check_json = check_json.handler(check_json)
-        expect("CLI：check 兜底 --json（等价 impact.analyze）",
+        with inject_store(store):
+            with redirect_stdout(io.StringIO()) as out_check_json:
+                rc_check_json = check_json.handler(check_json)
+        expect("CLI：check --json（等价 impact.analyze）",
                rc_check_json == 0 and '"fast_lane"' in out_check_json.getvalue())
-        fastlane._store_for = lambda _db: FakeStore()
         check_empty = parser_rev.parse_args(["fastlane", "check", "--round", "9", "--db", "x"])
-        with redirect_stdout(io.StringIO()) as out_check_empty:
-            rc_check_empty = check_empty.handler(check_empty)
-        expect("CLI：check 兜底无任务包 → rc=0 + 中文提示",
+        with inject_store(FakeStore()):
+            with redirect_stdout(io.StringIO()) as out_check_empty:
+                rc_check_empty = check_empty.handler(check_empty)
+        expect("CLI：check 无任务包 → rc=0 + 中文提示",
                rc_check_empty == 0 and "还没有任务包" in out_check_empty.getvalue())
     finally:
         fastlane._store_for = original
@@ -971,18 +1004,14 @@ def run_fastlane_cli() -> None:
     check_store.packages[1] = TaskPackage(round_no=1, feature="f", goal="g",
                                           acceptance=[], boundaries=["b"],
                                           interface_contract=["i"], prohibitions=["p"])
-    original_store_for = fastlane._store_for
-    fastlane._store_for = lambda _db: check_store
-    try:
-        args_false = parser_check.parse_args(["fastlane", "check", "--round", "1",
-                                              "--files", "src/kfpa/schemas.py", "--db", "x"])
+    args_false = parser_check.parse_args(["fastlane", "check", "--round", "1",
+                                          "--files", "src/kfpa/schemas.py", "--db", "x"])
+    with inject_store(check_store):
         with redirect_stdout(io.StringIO()) as out_false:
             rc_false = args_false.handler(args_false)
-        expect("R-34：check 唯一 owner 下 fast_lane=False → rc=0 + 「升级」提示",
-               rc_false == 0 and "升级回完整设计回合" in out_false.getvalue(),
-               out_false.getvalue()[:60])
-    finally:
-        fastlane._store_for = original_store_for
+    expect("R-34：check 唯一 owner 下 fast_lane=False → rc=0 + 「升级」提示",
+           rc_false == 0 and "升级回完整设计回合" in out_false.getvalue(),
+           out_false.getvalue()[:60])
 
     # 存储层写入口优先：带 now 的桩（台架可复现）
     storage_store = FakeStore()
