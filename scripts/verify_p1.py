@@ -59,7 +59,11 @@ P1_FILES = {
 }
 
 PG_COMPOSE = "docker-compose.pg.yml"
-PG_PORT = "55432"
+#: R-22.1：宿主端口默认 55440，`KFPA_PG_PORT` 可覆盖；55432-55434 被其它项目占用，禁用
+DEFAULT_PG_PORT = "55440"
+FORBIDDEN_PG_PORTS = ("55432", "55433", "55434")
+#: R-22.2：checkpoint 落盘口径（冻结）
+CHECKPOINT_FILE = "checkpoints.sqlite"
 
 #: P0 七表 + P1 两表（D3 §3.2）
 P1_TABLES = ("rounds", "tickets", "task_packages", "gate_reports", "failures",
@@ -231,17 +235,27 @@ def probe_sqlite(db: Path):
         con.close()
 
 
-def pg_dsn(ctx: Ctx) -> tuple[str, str]:
-    """从 compose 文件读 DSN；缺文件/读不出时给默认值并说明。"""
+def pg_host_port() -> tuple[str, str]:
+    """R-22.1：KFPA 的 PG 宿主端口 —— `KFPA_PG_PORT` 优先，默认 55440。
+
+    55432/55433/55434 已被别的项目容器占用，KFPA 不得占用（返回 port, 违规原因）。
+    """
+    port = os.environ.get("KFPA_PG_PORT") or DEFAULT_PG_PORT
+    port = str(port).strip()
+    if port in FORBIDDEN_PG_PORTS:
+        return port, f"端口 {port} 属 R-22.1 禁用的 55432-55434（其它项目占用）"
+    return port, ""
+
+
+def _compose_pg_env(ctx: Ctx) -> dict:
+    """从 compose 里读 POSTGRES_USER/PASSWORD/DB（读不到给默认）。"""
+    user, pwd, db = "kfpa", "kfpa", "kfpa"
     compose = ctx.root / PG_COMPOSE
-    user, pwd, db = "postgres", "postgres", "kfpa"
-    err = ""
     if compose.exists():
         try:
             import yaml
             spec = yaml.safe_load(compose.read_text(encoding="utf-8")) or {}
-            services = spec.get("services") or {}
-            for svc in services.values():
+            for svc in (spec.get("services") or {}).values():
                 env = svc.get("environment") or {}
                 if isinstance(env, list):
                     env = dict(x.split("=", 1) for x in env if "=" in x)
@@ -249,9 +263,16 @@ def pg_dsn(ctx: Ctx) -> tuple[str, str]:
                 pwd = env.get("POSTGRES_PASSWORD", pwd)
                 db = env.get("POSTGRES_DB", db)
                 break
-        except Exception as exc:  # noqa: BLE001
-            err = f"（compose 解析失败，用默认值：{type(exc).__name__}: {exc}）"
-    return f"postgresql://{user}:{pwd}@127.0.0.1:{PG_PORT}/{db}", err
+        except Exception:  # noqa: BLE001
+            pass
+    return {"user": str(user), "pwd": str(pwd), "db": str(db)}
+
+
+def pg_dsn(ctx: Ctx) -> tuple[str, str]:
+    """按 R-22.1 组装 DSN：`KFPA_PG_PORT` 优先（默认 55440），凭据取自 compose。"""
+    port, perr = pg_host_port()
+    cfg = _compose_pg_env(ctx)
+    return (f"postgresql://{cfg['user']}:{cfg['pwd']}@127.0.0.1:{port}/{cfg['db']}", perr)
 
 
 PG_PROBE = r'''
@@ -411,17 +432,95 @@ def check_a12(ctx: Ctx, c: Check) -> None:
         c.skip("本机无 docker CLI，A12 需要 Docker + postgres:16-alpine，未执行。")
         return
 
+    # R-22.1：compose 默认端口必须是 55440（仍可用 KFPA_PG_PORT 覆盖）
+    try:
+        text = compose.read_text(encoding="utf-8")
+        m = re.search(r"\$\{KFPA_PG_PORT:-(\d+)\}", text)
+        default_port = m.group(1) if m else ""
+        ok = default_port == DEFAULT_PG_PORT
+        c.add(ok=ok, note=f"R-22.1：compose 宿主端口默认 = "
+                          f"{default_port or '未用 KFPA_PG_PORT 参数化'}"
+                          f"（期望 ${{KFPA_PG_PORT:-{DEFAULT_PG_PORT}}}）")
+        if not ok:
+            c.fail(f"R-22.1：compose 端口应写成 `${{KFPA_PG_PORT:-{DEFAULT_PG_PORT}}}:5432`"
+                   f"（实际默认 {default_port or '未参数化'}；55432-55434 已被其它项目占用）—— 磐石。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"读 compose 失败：{type(exc).__name__}: {exc}")
+
+    # R-22.1：端口口径（55440 默认；55432-55434 禁用）
+    port, perr = pg_host_port()
+    c.add(ok=not perr, note=f"A12：PG 宿主端口 = {port}（R-22.1：KFPA_PG_PORT 优先、默认 {DEFAULT_PG_PORT}）"
+                            + (f"；{perr}" if perr else ""))
+    if perr:
+        c.fail(f"A12：{perr} —— 台架不得在 55432/55433/55434 上起 KFPA 的 PG。")
+        return
+    compose_env = {"KFPA_PG_PORT": port}
+
+    # 同机多人协作保护：端口上已经有可用的 PG（别人的实例）时，不启动、不写入，显式 SKIP
+    warm = ctx.run([ctx.python, "-c",
+                    "import psycopg,sys;"
+                    "c=psycopg.connect(sys.argv[1],connect_timeout=3);cur=c.cursor();"
+                    "cur.execute(\"select count(*) from information_schema.tables "
+                    "where table_schema='public'\");print(cur.fetchone()[0]);c.close()",
+                    pg_dsn(ctx)[0]], timeout=60)
+    if warm["rc"] == 0:
+        c.skip(f"端口 {port} 上已有可用的 PG（public 表数 = {warm['stdout'].strip()}）——"
+               f"为避免与同机他人的实例互相写入，本次不启动 compose、不写入数据。"
+               f"请用 `KFPA_PG_PORT=<独占端口>` 重跑 A12。")
+        c.warn("R-22.1 只统一了默认端口；同机多人同时验 A12 时需要各自指定独占端口"
+               "（或让 compose 去掉固定 `container_name`，否则容器名也会撞）。")
+        return
+
     # 先记录「本来是否已起」——已起则不负责关
-    pre = ctx.run(["docker", "compose", "-f", str(compose), "ps", "-q"], timeout=60)
+    pre = ctx.run(["docker", "compose", "-f", str(compose), "ps", "-q"], timeout=60,
+                  env_over=compose_env)
     started_here = not (pre["stdout"] or "").strip()
 
     up = ctx.run(["docker", "compose", "-f", str(compose), "up", "-d", "--wait"],
-                 timeout=420)
-    c.add(cmd=up["cmd"], rc=up["rc"], stdout=up["stdout"], stderr=up["stderr"],
-          ok=up["rc"] == 0, note="A12：起 PG（compose，端口 55432）")
+                 timeout=420, env_over=compose_env)
+    c.add(cmd=up["cmd"] + f"    [KFPA_PG_PORT={port}]", rc=up["rc"], stdout=up["stdout"],
+          stderr=up["stderr"], ok=up["rc"] == 0,
+          note=f"A12：起 PG（compose，宿主端口 {port}，R-22.1）")
+    throwaway = ""
     if up["rc"] != 0:
-        c.fail("A12：`docker compose up -d --wait` 失败 —— 见上方 stderr（镜像/端口/健康检查归磐石）。")
-        return
+        up_msg = (up["stderr"] or "") + (up["stdout"] or "")
+        if "already in use" in up_msg or "Conflict" in up_msg:
+            c.fail("A12/R-22：compose 的 `container_name: kfpa-pg` 是**全局容器名**，与别人的实例"
+                   "（同机另一位的 `kfpa-pg`）撞名 —— 磐石请去掉 `container_name`（让 compose 用"
+                   "项目前缀命名），否则同一台机上只能有一个人起 KFPA 的 PG，与「一人一工作树」冲突。")
+            # 不动别人的容器：用一次性独立容器在同一个端口上继续做双库对拍
+            cfg = _compose_pg_env(ctx)
+            throwaway = f"kfpa-verify-pg-{os.getpid()}"
+            run = ctx.run(["docker", "run", "-d", "--rm", "--name", throwaway,
+                           "-p", f"{port}:5432",
+                           "-e", f"POSTGRES_USER={cfg['user']}",
+                           "-e", f"POSTGRES_PASSWORD={cfg['pwd']}",
+                           "-e", f"POSTGRES_DB={cfg['db']}",
+                           "postgres:16-alpine"], timeout=300)
+            c.add(cmd=run["cmd"], rc=run["rc"], stdout=run["stdout"], stderr=run["stderr"],
+                  ok=run["rc"] == 0,
+                  note=f"A12：降级用一次性容器 {throwaway} 在 {port} 上继续对拍（不碰他人容器）")
+            if run["rc"] != 0:
+                c.fail("A12：一次性 PG 容器也起不来，本轮无法对拍。")
+                return
+            # 等就绪
+            ready = False
+            for _ in range(30):
+                probe = ctx.run([ctx.python, "-c", "import psycopg,sys;"
+                                 "psycopg.connect(sys.argv[1], connect_timeout=2).close()",
+                                 pg_dsn(ctx)[0]], timeout=30)
+                if probe["rc"] == 0:
+                    ready = True
+                    break
+                import time as _t
+                _t.sleep(2)
+            c.add(ok=ready, note=f"A12：一次性 PG 就绪 = {ready}")
+            if not ready:
+                c.fail("A12：一次性 PG 未就绪（30 次重试）。")
+                return
+        else:
+            c.fail("A12：`docker compose up -d --wait` 失败 —— 见上方 stderr（镜像/端口/健康检查归磐石）。")
+            return
 
     dsn, derr = pg_dsn(ctx)
     if derr:
@@ -429,43 +528,63 @@ def check_a12(ctx: Ctx, c: Check) -> None:
     masked = re.sub(r"://[^@]+@", "://***@", dsn)
     c.add(ok=True, note=f"A12：DSN（打码）= {masked}")
 
-    env = {"KFPA_DB_URL": dsn}
-    pg_db = ctx.tmp / "a12-pg"          # 仅为传递 --db 占位；PG 侧由 KFPA_DB_URL 决定
+    # D3 §3.2 的接线形态有两种：`KFPA_DB_URL` 环境变量（推荐的兜底）或把 DSN 直接给 `--db`。
+    # 任一生效即可 —— 验收要的是「同一套断言在 PG 上一致」，不是某一种管道写法。
+    pg = None
+    form_used = ""
+    forms = [
+        ("KFPA_DB_URL 环境变量", {"KFPA_DB_URL": dsn}, []),
+        ("--db 直接传 DSN", {}, ["--db", dsn]),
+    ]
     try:
-        ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(pg_db)],
-                      env_over=env)
-        c.add(cmd=ev0["cmd"] + "    [KFPA_DB_URL=***]", rc=ev0["rc"], stdout=ev0["stdout"],
-              stderr=ev0["stderr"], ok=ev0["rc"] == EXIT_PASS, note="A12：PG 侧建库")
-        if ev0["rc"] != EXIT_PASS:
-            c.fail("A12：PG 侧 `kfpa init` 失败（§3.2 双驱动）。")
-            return
-        work_pg = ctx.tmp / "a12-pg-work"
-        work_pg.mkdir(parents=True, exist_ok=True)
-        ev1 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                       "--round", "1", "--dry-run", "--json", "--db", str(pg_db),
-                       "--workdir", str(work_pg)], env_over=env)
-        c.add(cmd=ev1["cmd"] + "    [KFPA_DB_URL=***]", rc=ev1["rc"], stdout=ev1["stdout"],
-              stderr=ev1["stderr"], ok=ev1["rc"] == EXIT_PASS,
-              note="A12：PG 侧跑 A2 同一命令")
-        if ev1["rc"] != EXIT_PASS:
-            c.fail("A12：PG 侧 round 未通过（与 SQLite 不一致）。")
+        for label, env_over, extra in forms:
+            work_pg = ctx.tmp / f"a12-pg-work-{len(form_used)}"
+            work_pg.mkdir(parents=True, exist_ok=True)
+            # cwd 指到临时目录：万一 CLI 把 DSN 当路径用了，散落的 SQLite 文件也不会脏仓库
+            ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", *extra], env_over=env_over,
+                          cwd=ctx.tmp)
+            c.add(cmd=ev0["cmd"] + ("    [KFPA_DB_URL=***]" if env_over else ""),
+                  rc=ev0["rc"], stdout=ev0["stdout"], stderr=ev0["stderr"],
+                  ok=ev0["rc"] == EXIT_PASS, note=f"A12：PG 侧建库（形态：{label}）")
+            if ev0["rc"] != EXIT_PASS:
+                continue
+            ev1 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                           "--round", "1", "--dry-run", "--json", *extra,
+                           "--workdir", str(work_pg)], env_over=env_over, cwd=ctx.tmp)
+            c.add(cmd=ev1["cmd"] + ("    [KFPA_DB_URL=***]" if env_over else ""),
+                  rc=ev1["rc"], stdout=ev1["stdout"], stderr=ev1["stderr"],
+                  ok=ev1["rc"] == EXIT_PASS, note=f"A12：PG 侧跑 A2 同一命令（形态：{label}）")
+            if ev1["rc"] != EXIT_PASS:
+                continue
 
-        probe = ctx.run([ctx.python, "-c", PG_PROBE, dsn], timeout=120)
-        c.add(cmd="python -c <PG 探针>", rc=probe["rc"], stdout=probe["stdout"],
-              stderr=probe["stderr"], ok=probe["rc"] == 0, note="A12：原始读 PG 表结构")
-        pg = last_json_line(probe["stdout"]) if probe["rc"] == 0 else None
+            probe = ctx.run([ctx.python, "-c", PG_PROBE, dsn], timeout=120)
+            c.add(cmd="python -c <PG 探针>", rc=probe["rc"], stdout=probe["stdout"],
+                  stderr=probe["stderr"], ok=probe["rc"] == 0, note="A12：原始读 PG 表结构")
+            cand = last_json_line(probe["stdout"]) if probe["rc"] == 0 else None
+            if cand and cand.get("tables"):
+                pg, form_used = cand, label
+                break
+
         if pg is None:
-            c.fail(f"A12：PG 探针失败：{excerpt(probe['stderr'], 300)}")
+            c.add(ok=False, note="A12：两种接线形态（KFPA_DB_URL / --db DSN）都没把数据写进 PG")
+            c.fail("A12：PG 里没有任何表 —— `cli.py` 仍在用 `Store(args.db)`（只认 SQLite），"
+                   "没走 D3 §3.2 的 `make_store(dsn)`，所以 `KFPA_DB_URL` 被忽略（磐石：CLI 接线）。")
         else:
+            c.add(ok=True, note=f"A12：生效的接线形态 = {form_used}")
             missing = [t for t in P1_TABLES if t not in set(pg.get("tables") or [])]
             c.add(ok=not missing, note=f"A12：PG 表 = {pg.get('tables')}；缺 {missing or '无'}")
             if missing:
                 c.fail(f"A12：PG 缺表 {missing}（D3 §3.2：P0 七表 + ledger + knowledge）。")
     finally:
         if started_here:
-            down = ctx.run(["docker", "compose", "-f", str(compose), "down", "-v"], timeout=180)
+            down = ctx.run(["docker", "compose", "-f", str(compose), "down", "-v"], timeout=180,
+                           env_over=compose_env)
             c.add(cmd=down["cmd"], rc=down["rc"], ok=down["rc"] == 0,
                   note="A12：收尾（本次由台架起的栈，用完 down -v）")
+        if throwaway:
+            rm = ctx.run(["docker", "rm", "-f", throwaway], timeout=120)
+            c.add(cmd=rm["cmd"], rc=rm["rc"], ok=rm["rc"] == 0,
+                  note=f"A12：收尾（移除一次性容器 {throwaway}）")
 
     # SQLite 侧同命令 + 对拍
     db = ctx.fresh_db("a12-sqlite")
@@ -545,36 +664,49 @@ def check_a13(ctx: Ctx, c: Check) -> None:
         except Exception as exc:  # noqa: BLE001
             c.add(ok=False, note=f"读票失败：{exc}")
 
-    # checkpoint 文件与 thread_id
-    cp_candidates = []
-    for base_dir in (work, ctx.root):
-        for pat in ("*.sqlite", "*.sqlite3", "*.db", "*.checkpoints"):
-            cp_candidates += [p for p in base_dir.glob(pat)
-                              if p.name not in (db.name,) and "kfpa.db" != p.name]
-    found = []
-    for p in cp_candidates:
+    # R-22.2：checkpoint 落盘口径（冻结）—— {workdir}/checkpoints.sqlite、thread_id=kfpa-r{n}
+    frozen_cp = work / CHECKPOINT_FILE
+    c.add(ok=frozen_cp.exists(),
+          note=f"A13/R-22.2：checkpoint 库 = {frozen_cp}"
+               f"（存在 = {frozen_cp.exists()}；口径冻结为 {{workdir}}/{CHECKPOINT_FILE}）")
+    if not frozen_cp.exists():
+        others = []
+        for pat in ("*.sqlite", "*.sqlite3", "*.db"):
+            others += [p.name for p in work.glob(pat) if p.name != CHECKPOINT_FILE]
+            others += [p.name for p in ctx.root.glob(pat) if p.name not in ("kfpa.db",)]
+        c.fail(f"A13：workdir 下没有 `{CHECKPOINT_FILE}`（R-22.2 冻结口径）——"
+               f"实际同期可见的库/文件：{others or '无'}。"
+               "长流：round 默认必须用 SqliteSaver 写 `{workdir}/checkpoints.sqlite`，别用 InMemory。")
+
+    def _checkpoint_threads(path: Path) -> list[str]:
         try:
-            con = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+            con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
             try:
                 tables = {r[0] for r in con.execute(
                     "select name from sqlite_master where type='table'").fetchall()}
-                if "checkpoints" in tables:
-                    threads = sorted({r[0] for r in con.execute(
-                        "select distinct thread_id from checkpoints").fetchall()})
-                    found.append((p.name, threads))
+                if "checkpoints" not in tables:
+                    return []
+                return sorted({r[0] for r in con.execute(
+                    "select distinct thread_id from checkpoints").fetchall()})
             finally:
                 con.close()
         except Exception:  # noqa: BLE001
-            continue
-    c.add(ok=bool(found), note=f"A13：找到 checkpoint 库 = {found or '无'}")
-    if not found:
-        c.fail("A13：没找到 SqliteSaver 落盘的 checkpoint 库（§3.5：P1 默认 SqliteSaver）。")
-    else:
-        threads = {t for _, ts in found for t in ts}
+            return []
+
+    if frozen_cp.exists():
+        threads = _checkpoint_threads(frozen_cp)
+        c.add(ok=bool(threads), note=f"A13：`{CHECKPOINT_FILE}` 里的 thread_id = {threads or '无'}")
         c.add(ok="kfpa-r1" in threads,
-              note=f"A13：checkpoint thread_id = {sorted(threads)}（期望含 `kfpa-r1`）")
+              note=f"A13/R-22.2：thread_id 应为 `kfpa-r1`，实际 {sorted(threads)}")
         if "kfpa-r1" not in threads:
-            c.fail(f"A13：thread_id 应为 `kfpa-r1`，实际 {sorted(threads)}。")
+            c.fail(f"A13：thread_id 口径不符（期望 `kfpa-r1`，实际 {sorted(threads)}）——"
+                   "R-22.2 冻结为 f\"kfpa-r{round_no}\"。")
+    else:
+        fallback = []
+        for pat in ("*.sqlite", "*.sqlite3", "*.db"):
+            fallback += [(p.name, _checkpoint_threads(p)) for p in work.glob(pat)]
+        fallback = [(n, t) for n, t in fallback if t]
+        c.add(ok=False, note=f"A13：退化搜索（仅用于定位）找到的 checkpoint 库 = {fallback or '无'}")
 
     try:
         import importlib.util as ilu
@@ -619,7 +751,7 @@ def check_a14(ctx: Ctx, c: Check) -> None:
             c.add(ok=False, note=f"CoverageReport({label}) 异常：{type(exc).__name__}: {exc}")
             c.fail("A14：CoverageReport 构造/判据不可用。")
 
-    # 门禁：覆盖率不达标 → NEEDS_FIX + error_category=coverage
+    # 门禁：R-22.3 只在「显式提供覆盖率报告」时才启用 G7
     try:
         store_mod, _ = import_mod("kfpa.store")
         st = store_mod.make_store(":memory:") if store_mod and hasattr(store_mod, "make_store") \
@@ -629,6 +761,20 @@ def check_a14(ctx: Ctx, c: Check) -> None:
             acceptance=[sc.AcceptanceCriterion(cid="AC-1", text="t")],
             boundaries=["b"], interface_contract=["i"], prohibitions=["p"], feedback=[])
         ex = sc.ExecResult(ok=True, results={"AC-1": True}, executor="mock")
+
+        # ① 不给报告：G7 必须跳过（默认 happy-path 不得被覆盖率拖红）—— R-22.3
+        try:
+            rep_no = gates_mod.evaluate(90, pkg, ex, st, attempt=1)
+            c.add(ok=rep_no.state.value == "pass",
+                  note=f"R-22.3：不提供覆盖率报告 -> state={rep_no.state.value}（期望 pass，G7 跳过）")
+            if rep_no.state.value != "pass":
+                c.fail(f"R-22.3：未给覆盖率报告却判了 {rep_no.state.value} —— "
+                       f"G7 只能在 `--coverage-json` 显式提供时启用。reasons={rep_no.reasons}")
+        except Exception as exc:  # noqa: BLE001
+            c.add(ok=False, note=f"无报告用例异常：{type(exc).__name__}: {exc}")
+            c.fail("A14：G7 的「无报告」路径不可判定。")
+
+        # ② 给报告且不达标 → NEEDS_FIX + 未达标文件清单
         rep = gates_mod.evaluate(91, pkg, ex, st, attempt=1,
                                  coverage=CR(line_rate=0.5, files={"a.py": 0.5},
                                              critical_paths_ok=True))
@@ -643,12 +789,73 @@ def check_a14(ctx: Ctx, c: Check) -> None:
               note=f"G7 failing_criteria={rep.failing_criteria}（应含未达标文件 a.py）")
         if not any("a.py" in str(x) for x in (rep.failing_criteria or [])):
             c.fail("A14：G7 未把未达标文件写进 `failing_criteria`（§3.3）。")
+
+        # ③ 关键路径红（即使行覆盖率很高）也要拦 —— R-22.3 的 critical_paths_ok
+        rep_cp = gates_mod.evaluate(92, pkg, ex, st, attempt=1,
+                                    coverage=CR(line_rate=0.95, files={"a.py": 0.95},
+                                                critical_paths_ok=False))
+        c.add(ok=rep_cp.state.value == "needs_fix",
+              note=f"G7：0.95 但关键路径红 -> state={rep_cp.state.value}（期望 needs_fix）")
+        if rep_cp.state.value != "needs_fix":
+            c.fail("A14：critical_paths_ok=False 未被 G7 拦下。")
     except TypeError as exc:
         c.add(ok=False, note=f"gates.evaluate 不接受 coverage 参数：{exc}")
         c.fail("A14：`gates.evaluate(..., coverage=CoverageReport)` 接口未实现（D3 §3.3）。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"G7 用例异常：{type(exc).__name__}: {exc}")
         c.fail("A14：G7 覆盖率门槛不可判定。")
+
+    # ④ CLI 侧：`--coverage-json <cov.json>` 才启用 G7（R-22.3，接线归磐石）
+    merged_bad = ctx.tmp / "cov-bad.json"
+    merged_bad.write_text(json.dumps({
+        "totals": {"percent_covered": 50.0},
+        "files": {"src/kfpa/gates.py": {"summary": {"percent_covered": 50.0}}},
+        "critical_paths_ok": False,
+    }, ensure_ascii=False), encoding="utf-8")
+    merged_bad_nokey = ctx.tmp / "cov-bad-nokey.json"
+    merged_bad_nokey.write_text(json.dumps({
+        "totals": {"percent_covered": 50.0},
+        "files": {"src/kfpa/gates.py": {"summary": {"percent_covered": 50.0}}},
+    }, ensure_ascii=False), encoding="utf-8")
+    merged_ok = ctx.tmp / "cov-ok.json"
+    merged_ok.write_text(json.dumps({
+        "totals": {"percent_covered": 95.0},
+        "files": {"src/kfpa/gates.py": {"summary": {"percent_covered": 95.0}}},
+        "critical_paths_ok": True,
+    }, ensure_ascii=False), encoding="utf-8")
+
+    dbc = ctx.fresh_db("a14-cli")
+    ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(dbc)])
+    workc = ctx.tmp / "a14-cli-work"
+    workc.mkdir(parents=True, exist_ok=True)
+    base = [ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()), "--round", "1",
+            "--dry-run", "--db", str(dbc), "--workdir", str(workc)]
+    ev_no = ctx.run(base)
+    c.add(cmd=ev_no["cmd"], rc=ev_no["rc"], stdout=ev_no["stdout"], stderr=ev_no["stderr"],
+          ok=ev_no["rc"] == EXIT_PASS,
+          note="R-22.3：不带 --coverage-json 的 happy-path 必须 rc=0（G7 不启用）")
+    if ev_no["rc"] != EXIT_PASS:
+        c.fail(f"R-22.3：未提供覆盖率报告却 rc={ev_no['rc']} —— G7 被误启用。")
+    ev_bad = ctx.run(base + ["--coverage-json", str(merged_bad)])
+    c.add(cmd=ev_bad["cmd"], rc=ev_bad["rc"], stdout=ev_bad["stdout"], stderr=ev_bad["stderr"],
+          ok=ev_bad["rc"] in (EXIT_NEEDS_FIX, EXIT_BLOCKED),
+          note="R-22.3：提供不达标报告 → G7 必须拦（10/11）")
+    if ev_bad["rc"] not in (EXIT_NEEDS_FIX, EXIT_BLOCKED):
+        c.fail(f"A14：提供不达标覆盖率报告后 rc={ev_bad['rc']}，期望 10/11"
+               "（若报 2，说明 `--coverage-json` 还没接线 —— R-22 派给磐石）。")
+    ev_nokey = ctx.run(base + ["--coverage-json", str(merged_bad_nokey)])
+    c.add(cmd=ev_nokey["cmd"], rc=ev_nokey["rc"], stdout=ev_nokey["stdout"],
+          stderr=ev_nokey["stderr"], ok=ev_nokey["rc"] in (EXIT_NEEDS_FIX, EXIT_BLOCKED),
+          note="R-22.3：报告缺 `critical_paths_ok` 键 → 视为 False（不许编造），G7 仍拦")
+    ev_ok = ctx.run(base + ["--coverage-json", str(merged_ok)])
+    c.add(cmd=ev_ok["cmd"], rc=ev_ok["rc"], stdout=ev_ok["stdout"], stderr=ev_ok["stderr"],
+          ok=ev_ok["rc"] == EXIT_PASS,
+          note="R-22.3：达标报告（0.95 + critical_paths_ok=true）→ G7 放行 rc=0")
+    if ev_ok["rc"] != EXIT_PASS:
+        c.fail(f"A14：达标覆盖率报告下 rc={ev_ok['rc']}，期望 0。")
+    c.warn("R-22.4：门槛只统计核心模块白名单（schemas/config/cli/store/**/gates/pipeline），"
+           "不含 ui/**、executor.py、scripts/** —— 报告的生产方按此口径汇总后再交给 "
+           "`--coverage-json`；台架只验机制，真实达标登记为 P1 尾项债（R-22.5）。")
 
     # 真实覆盖率报告（记录为主；低于 0.80 给建议，不单独判红）
     # COVERAGE_FILE 指到临时目录：不在仓库根留 .coverage 之类的产物
