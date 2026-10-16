@@ -195,7 +195,11 @@ def _db_path(args) -> str:
 
 
 def _open_store(db_path: str):
-    """惰性打开 Store；``kfpa.store`` 未就绪时给中文提示并返回 None。"""
+    """惰性打开 Store；``kfpa.store`` 未就绪时给中文提示并返回 None。
+
+    优先用 P1 的 ``make_store(dsn)`` 工厂（D3 §3.2，PG/SQLite 双驱动），
+    没有该工厂时退回 P0 的 ``Store(db_path)`` —— 磐石重构 store 时不至于让台账断在 import 上。
+    """
     try:
         from ..store import Store  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -204,7 +208,11 @@ def _open_store(db_path: str):
             file=sys.stderr,
         )
         return None
-    return Store(db_path)
+    try:
+        from ..store import make_store  # type: ignore[attr-defined]
+    except ImportError:
+        return Store(db_path)
+    return make_store(db_path)
 
 
 def _io_error(action: str, exc: Exception, db_path: str) -> int:
