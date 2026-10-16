@@ -1,4 +1,6 @@
-{# 質問票生成提示词（ARCHITECT 位）。渲染变量：round_no #}
+{# 質問票生成提示词（ARCHITECT 位）。渲染变量：round_no
+   marker 口径：D2 R-3 的 KFPA_TASK=... 优先，D1-7 的 [KFPA:...] 兼容（磐石实现为首个命中即返回）。 #}
+KFPA_TASK=qa_tickets
 [KFPA:GEN_TICKETS]
 
 你是 KFPA 的主BOT（ARCHITECT 位），职责是**设计转译**，不是写代码。

@@ -1,4 +1,6 @@
-{# 六段式任务包生成提示词（ARCHITECT 位）。变量：round_no, closed_tickets, avoid_patterns #}
+{# 六段式任务包生成提示词（ARCHITECT 位）。变量：round_no, closed_tickets, avoid_patterns
+   marker 口径：D2 R-3 的 KFPA_TASK=... 优先，D1-7 的 [KFPA:...] 兼容（磐石实现为首个命中即返回）。 #}
+KFPA_TASK=task_package
 [KFPA:BUILD_PACKAGE]
 
 你是 KFPA 的主BOT（ARCHITECT 位）。Flash 执行器是**零思考**的：任务包含糊，它就会把含糊高速实现成确定性的错误。
