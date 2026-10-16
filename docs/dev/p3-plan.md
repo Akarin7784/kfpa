@@ -238,7 +238,7 @@ A26 直接断 SQLite/PG 两侧 `package_hash` 一致。
 |---|---|
 | 模型 API key | **暂无** → 真实 LLM 调用不在 P3 验收范围（快车道直跑走 mock 执行器） |
 | Dify 自托管 | 未部署 → 本地回退检索是验收路径；Dify 适配器接线完成即交付 |
-| PostgreSQL（A12/A26 双库对拍） | 就绪（Docker 29.8.2，端口 55440 独占） |
+| PostgreSQL（A12/A26 双库对拍） | 就绪（Docker 29.8.2，端口 55440 **独占**——见 R-37） |
 | 覆盖率工具 | 已装（`coverage` / `pytest-cov`） |
 | `streamlit` | 已装（界面页可 headless 冒烟，不列入验收） |
 
@@ -248,3 +248,6 @@ A26 直接断 SQLite/PG 两侧 `package_hash` 一致。
 2. 每合一步，在 `main` 上跑 `verify_p0 + verify_p1 + verify_p2` 全量，**P0/P1/P2 不许回归**；
 3. `verify_p3` 的 A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆盖率不下降（≥80%）；
 4. 全部合完后由 Chief 跑干净环境终验、更新进度地图与 README，并写 `docs/acceptance/p3-acceptance.md`。
+5. **终验必须独占 PG（R-37）**：A12/A26 用的是同一个共享库（端口 55440），
+   别人的台架/桩同时在跑会让双库对拍读到混入的行 → 台架报红，但那是**环境干扰不是产品缺口**。
+   跑终验前先确认没有他人台架在跑；报红时先用 `verify_p3 --only A0`（或对应单条）**复跑一次**再定论。
