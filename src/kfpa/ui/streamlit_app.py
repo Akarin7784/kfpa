@@ -92,7 +92,11 @@ def _db_from_argv(argv: Optional[list[str]] = None) -> str:
 
 
 def _open_store(db_path: str):
-    """惰性打开 Store（磐石）；缺模块 → UIDependencyError，库错 → UIOperationError。"""
+    """惰性打开 Store（磐石）；缺模块 → UIDependencyError，库错 → UIOperationError。
+
+    优先用 P1 的 ``make_store(dsn)`` 工厂（D3 §3.2，PG/SQLite 双驱动），
+    没有该工厂时退回 P0 的 ``Store(db_path)``。
+    """
     try:
         from kfpa.store import Store  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -100,7 +104,11 @@ def _open_store(db_path: str):
             f"[kfpa-ui] 缺少 kfpa.store（{exc}）→ 该模块归磐石，合入后再用本页面。"
         ) from exc
     try:
-        return Store(db_path)
+        from kfpa.store import make_store  # type: ignore[attr-defined]
+    except ImportError:
+        make_store = None  # type: ignore[assignment]
+    try:
+        return make_store(db_path) if make_store is not None else Store(db_path)
     except Exception as exc:
         raise UIOperationError(
             f"[kfpa-ui] 打开数据库失败：{exc} → 检查 --db {db_path}，必要时先跑 `kfpa init --db {db_path}`"
