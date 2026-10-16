@@ -10,8 +10,11 @@
    `rollback --apply` 失败路径的 stderr、插件挂载的**幂等性**（重复挂载不许追加同名子命令）；
 4. `rollback --apply` 一律 mock 掉 `subprocess.run` —— 这条测试**不许**碰真 git 状态。
 
-注：R-31 的「provider 合法但缺凭据 → rc=4」不在本文件断（`_exception_exit_code` 现在把通用
-RuntimeError 归 5，归磐石的 `p2/cov-store` 修）；台架 A18 已对那条判红。
+注（R-31 收口后的口径，Chief 2026-10-17 修）：`_exception_exit_code` 按**异常类型**三分——
+`RuntimeError`（本仓库用它承载依赖/凭据类错误）与 `ImportError` → `EXIT_DEP_MISSING`(4)，
+`OSError`/`sqlite3.Error` 以及其它非 RuntimeError 异常 → `EXIT_IO`(5)，未知 `--provider` 值由
+argparse 原生拒绝 → `EXIT_USAGE`(2)。本文件原先断「通用 RuntimeError → 5」是 #48 之前的口径，
+#48 落地后已过期（PR #49 的基点早于 #48，合并后 pytest 1 failed）；这里改为按 R-31 断。
 """
 
 from __future__ import annotations
@@ -188,6 +191,7 @@ def test_exception_exit_code_mapping():
     assert cli._exception_exit_code(RuntimeError("未安装 streamlit")) == cli.EXIT_DEP_MISSING
     assert cli._exception_exit_code(RuntimeError("其它")) == cli.EXIT_DEP_MISSING   # RuntimeError 一律环境类
     assert cli._exception_exit_code(OSError("disk")) == cli.EXIT_IO
+    # R-31：RuntimeError 是本仓库的依赖/凭据类错误载体 → 4；真正「其它异常」走 5。
     assert cli._exception_exit_code(ValueError("参数怪")) == cli.EXIT_IO
 
 
