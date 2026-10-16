@@ -37,7 +37,7 @@ from ..schemas import (
     package_hash,
 )
 from . import mask_dsn, migrations_dir
-from .sqlite import SCHEMA_VERSION, _enum_value
+from .sqlite import SCHEMA_VERSION, _enum_value, _severity_of
 
 
 class PostgresStore:
@@ -549,7 +549,7 @@ def _review_from_row(row: dict[str, Any]) -> ReviewReport:
         raw = []
     findings = [
         ReviewFinding(
-            severity=Severity(item.get("severity", Severity.INFO.value)),
+            severity=_severity_of(item.get("severity", Severity.INFO.value)),
             location=str(item.get("location", "")),
             issue=str(item.get("issue", "")),
             suggestion=str(item.get("suggestion", "")),
@@ -645,3 +645,4 @@ def _package_from_payload(round_no: int, payload: str) -> TaskPackage:
 
 
 __all__ = ["PostgresStore"]
+
