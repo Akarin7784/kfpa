@@ -24,6 +24,7 @@ from ..schemas import (
     KnowledgeCandidate,
     LedgerEntry,
     QATicket,
+    ReviewReport,
     Round,
     RoundState,
     Snapshot,
@@ -36,7 +37,10 @@ from .sqlite import (
     BUSINESS_TABLES,
     META_TABLE,
     P0_SCHEMA_VERSION,
+    P1_SCHEMA_VERSION,
+    P2_SCHEMA_VERSION,
     P1_TABLE_NAMES,
+    P2_TABLE_NAMES,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     TABLE_NAMES,
@@ -105,6 +109,10 @@ class StoreProtocol(Protocol):
     def list_candidates(self, status: Optional[str] = None) -> list[KnowledgeCandidate]: ...
     def promote_candidate(self, cid: str, reused_by_round: int) -> KnowledgeCandidate: ...
     def drop_candidate(self, cid: str, reason: str) -> None: ...
+
+    # ---- P2：评审留痕（D4-3.3 / A19）
+    def add_review_report(self, report: ReviewReport) -> None: ...
+    def list_review_reports(self, round_no: Optional[int] = None) -> list[ReviewReport]: ...
 
 
 def mask_dsn(dsn: str) -> str:
@@ -179,9 +187,14 @@ __all__ = [
     "SCHEMA_SQL",
     "SCHEMA_VERSION",
     "P0_SCHEMA_VERSION",
+    "P1_SCHEMA_VERSION",
+    "P2_SCHEMA_VERSION",
+    "P1_SCHEMA_VERSION",
     "TABLE_NAMES",
     "ALL_TABLE_NAMES",
     "BUSINESS_TABLES",
     "P1_TABLE_NAMES",
+    "P2_TABLE_NAMES",
     "META_TABLE",
 ]
+

@@ -67,22 +67,17 @@ def default_workdir(round_no: int) -> str:
 
 
 def _open_store(db_arg: str) -> Any:
-    """打开状态库（口径见 `kfpa.store.make_store`，R-22.1）：
+    """打开状态库（口径见 `kfpa.store.make_store`，**R-25.1**）：
 
-    显式 DSN（`postgresql://…` / `sqlite://…`）> `KFPA_DB_URL` > 显式普通路径 > 默认 `kfpa.db`。
-    当环境变量压过显式普通路径时打一行中文提示——这种覆盖必须看得见，不许静默换库。
+    优先级 = 显式 `--db`（DSN 或普通路径）> `KFPA_DB_URL` > 默认 `kfpa.db`；
+    `KFPA_DB_URL` 只在「没给 `--db`」或「`--db` 就是默认 `kfpa.db`」时生效。
+
+    （早期版本反过来让环境变量压过显式路径，制造过「环境变量残留 → 台架临时库全被顶成同一个 PG」
+    的假红，R-25.1 已改回常规约定；判断逻辑统一在 `make_store()`，本函数只负责把默认值让给环境变量。）
     """
-    from .store import DB_URL_ENV, make_store, mask_dsn
+    from .store import make_store
 
     explicit = str(db_arg or "").strip()
-    env_url = os.environ.get(DB_URL_ENV, "").strip()
-    is_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
-    if explicit and not is_dsn and env_url and explicit != "kfpa.db":
-        print(
-            f"[core] 提示：KFPA_DB_URL 优先于 --db {explicit} → 本次使用 {mask_dsn(env_url)}"
-            "（要强制本地 SQLite 请传 --db sqlite://<path>）",
-            file=sys.stderr,
-        )
     return make_store(explicit or None)
 
 
@@ -177,12 +172,18 @@ def cmd_round(args: argparse.Namespace) -> int:
             roles = load_roles(args.config)
             # D2 R-10：high_ticket 只改 mock 剧本（build_llm(..., high_impact=True)），
             # apply_fail / test_fail 由 run_round(injection=...) 交给执行器。
+            # D4-3.2：--provider 不传（None）= 按角色解析（REVIEWER → mock_hetero）；传了则全局覆盖。
             llm = build_llm(
                 roles,
                 provider=args.provider,
                 injection=args.inject,
                 high_impact=(args.inject == "high_ticket"),
             )
+            if args.provider is None and hasattr(llm, "provider_for"):
+                routed = ", ".join(
+                    f"{name}={llm.provider_for(name)}" for name in ("ARCHITECT", "REVIEWER", "FLASH")
+                )
+                print(f"[core] provider 路由：{routed}", file=sys.stderr)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             # D2 R-1：4 = 依赖/环境错误，明确包含「配置错误」。
             print(f"[core] 角色配置错误：{exc} → 检查 --config / models.yaml 并在仓库根目录运行", file=sys.stderr)
@@ -232,6 +233,17 @@ def cmd_round(args: argparse.Namespace) -> int:
             # 账本要拿角色表才能记 model_ref（不编造模型名）
             if "roles" in params:
                 call_kwargs["roles"] = roles
+
+            # P2 D4-3.3：把 REVIEWER 实际用的 provider / model_ref 传给 pipeline 作**记录**字段
+            # （真调用仍由注入的 llm 决定；不编造，model_ref 一律从 config 的 REVIEWER.model 取）。
+            if "review_provider" in params:
+                call_kwargs["review_provider"] = (
+                    llm.provider_for("REVIEWER")
+                    if hasattr(llm, "provider_for")
+                    else (args.provider or "mock_hetero")
+                )
+            if "review_model_ref" in params:
+                call_kwargs["review_model_ref"] = str((roles.get("REVIEWER") or {}).get("model") or "")
 
             # R-22.3：只有显式给报告才启用 G7；没给就跳过、不得判红。
             coverage = None
@@ -447,6 +459,7 @@ def _register_plugin_commands(subparsers: Any) -> None:
         ("kfpa.ledger", ".ledger"),
         ("kfpa.knowledge", ".knowledge"),
         ("kfpa.impact", ".impact"),
+        ("kfpa.eval", ".eval"),          # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
     ]
     import importlib
 
@@ -497,7 +510,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_round.add_argument("--db", default="kfpa.db", help="SQLite 路径（默认 kfpa.db）")
     p_round.add_argument("--workdir", default="", help="执行器工作目录（默认 runs/round-{n}，D1-10）")
     p_round.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"角色配置（默认 {DEFAULT_CONFIG_PATH}）")
-    p_round.add_argument("--provider", choices=["mock", "litellm"], default="mock", help="LLM 提供方（默认 mock）")
+    p_round.add_argument(
+        "--provider",
+        choices=["mock", "mock_hetero", "litellm"],
+        default=None,
+        help="LLM 提供方（不传 = 按角色配置解析：REVIEWER 默认 mock_hetero；传了则全局覆盖）",
+    )
     p_round.add_argument(
         "--inject",
         choices=["none", "high_ticket", "apply_fail", "test_fail"],

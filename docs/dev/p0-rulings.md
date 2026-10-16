@@ -471,6 +471,37 @@ NG A12：票号一致 SQLite=['R1-001', …] PG=[['R1-001'], ['R1-002'], …]
 
 归属：长流（`pipeline.py`）。本次由 Chief 代推（长流连续两轮未动，且这是 A12 剩余两处阻塞之一）。
 
+## R-29 升版守卫的同步范围 = 全部台架；新增台架必须自带版本断言
+
+- 镜鉴 A0 抓到：契约升 1.3 时只同步了 `verify_p0.py` 与 `tests/test_contract.py`，
+  **`verify_p1.py` 还锁在 1.2**（`SUPPORTED_CONTRACT_VERSIONS = ("1.2",)`）→ 升版后 P1 台架必红。
+  这是 R-20 的**范围写窄了**：当时只点了「三处」，没写「所有台架」。
+- **裁决**：
+  1. 契约升版（`CONTRACT_VERSION`）时，必须同批同步**仓库里每一个** `scripts/verify_*.py`
+     的 `CONTRACT_VERSION_LATEST` 与 `SUPPORTED_CONTRACT_VERSIONS`，以及 `tests/**` 的同类清单。
+     漏一个都算升版未完成（R-20/R-21 的一般化）。查漏：
+     `grep -rn "SUPPORTED_CONTRACT_VERSIONS" scripts tests` —— 每处都必须含新版本号。
+  2. **新增台架必须自带**当前契约版本的断言（新写 `verify_p2.py` 等要包含 `SUPPORTED_CONTRACT_VERSIONS`），
+     否则它逃过升版守卫。
+  3. 允许存在**额外诊断字段**（如 `samples` 里的 `parse_ok`/`context_id`），但**消费方必须容忍未知键**；
+     冻结的只是「最小必需键集」（P2 报告：顶层六键 + `samples` 的 `missed`/`false_alarm` 布尔）。
+     生产方可以加诊断字段，不得删必需键。
+
+## R-30 P2 测试归属：实现方的桩落在自己范围内，由镜鉴搬进 `tests/**`
+
+- 背景：D4 §3.5 的覆盖率债要求 `review.py`/`eval.py` 白名单行覆盖 ≥80%，而 A20 是在 main 上跑
+  `pytest --cov=kfpa`。长流的桩（54 项）只在他的临时脚本里 → main 上这两个模块接近 0 覆盖，A20 必红。
+- **裁决**（沿用 P0 先例：磐石自检脚本由镜鉴搬进 `scripts/`）：
+  1. **`tests/**` 仍归镜鉴单写**，实现方**不越界**加 `tests/test_p2_*.py`。
+  2. **交接路径**：长流把桩落成**他自己写者范围内的文件** —— `benchmarks/review/stub_p2_review.py`
+     （避免在群里贴几千行）；镜鉴把它搬进 `tests/test_p2_review.py`，并按独立验证口径改写/复核断言
+     （保留边界用例：空集 / 全漏 / 全错 / 缺 `baseline_*` / 非法 JSONL / `--out` 与 rc=4 分支）。
+  3. **覆盖率口径**：临时脚本的数字**不能替代** A20；必须由仓库内 `tests/**` 撑起白名单覆盖，
+     由台架生成合并 `coverage.json` 交给 G7 判定。
+  4. 交接未完成前 A20 判 **FAIL**（可注明「待交接：`benchmarks/review/stub_p2_review.py` → `tests/`」），
+     **不许静默 SKIP**。
+  5. 同一路径适用于后续所有「实现方自测 → 仓库测试」的搬运。
+
 ---
 
 ## 变更记录
