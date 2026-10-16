@@ -64,8 +64,8 @@ DEFAULT_PG_PORT = "55440"
 FORBIDDEN_PG_PORTS = ("55432", "55433", "55434")
 #: R-22.2：checkpoint 落盘口径（冻结）
 CHECKPOINT_FILE = "checkpoints.sqlite"
-#: A12 对拍专用轮次：不碰别人已有的第 1..n 轮数据，只比这一轮
-PROBE_ROUND = 91
+#: A12 对拍专用轮次：**每次运行取一个唯一轮号**，避免复用共享 PG 时被自己上次的行累加
+PROBE_ROUND = 1000 + (os.getpid() % 8000)
 
 #: P0 七表 + P1 两表（D3 §3.2）
 P1_TABLES = ("rounds", "tickets", "task_packages", "gate_reports", "failures",
@@ -131,6 +131,8 @@ class Ctx:
         # R-25.3：台架所有子进程一律剥掉 KFPA_DB_URL —— 谁机器上残留了这个变量，
         # 都不许把各断言自己准备的临时库顶掉（R-25 实测：残留会让 A6/A7/A10/A11/A13 全红）。
         self.env.pop("KFPA_DB_URL", None)
+        # 台架**自身进程**也要剥：A11/A15 等断言会用 in-process 的 make_store 直接连库
+        os.environ.pop("KFPA_DB_URL", None)
         sys.path.insert(0, str(self.root / "src"))
 
     def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 300,
