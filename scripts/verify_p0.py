@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -407,6 +408,7 @@ def check_a2(ctx: Ctx, c: Check) -> None:
 
 
 def check_a3(ctx: Ctx, c: Check) -> None:
+    """R-10：A3 纯 CLI 可复现 —— 用 `--inject high_ticket` 造 HIGH 票，不依赖私有 API。"""
     store_mod, serr = import_mod("kfpa.store")
     if store_mod is None:
         c.add(ok=False, note=f"import kfpa.store 失败：{serr}")
@@ -416,46 +418,53 @@ def check_a3(ctx: Ctx, c: Check) -> None:
     db = ctx.fresh_db("a3")
     ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
     c.add(cmd=ev0["cmd"], rc=ev0["rc"], ok=ev0["rc"] == EXIT_PASS, note="A3 前置：建库")
-    # R-6：票号固定 R{n}-{seq:03d}；用 R2-999 避开 pipeline 会分配的号段
-    try:
-        seed_ticket(store_mod, db, ticket_id="R2-999", round_no=2, impact="HIGH")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"造高影响票失败：{type(exc).__name__}: {exc}")
-        c.fail("无法用 Store.add_ticket 构造用例（§3.2）。")
-        return
 
     base = [ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
             "--round", "2", "--dry-run", "--db", str(db), "--workdir", str(ctx.tmp / "a3-work")]
-    ev = ctx.run(base)
+    ev = ctx.run(base[:4] + ["--inject", "high_ticket"] + base[4:])
     blob = ev["stdout"] + ev["stderr"]
     c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
           ok=ev["rc"] == EXIT_CONFIRM,
-          note="A3/D1-5：存在未关闭 HIGH 票 → 退出码 3（等待人工确认）")
+          note="A3/R-10/D1-5：`--inject high_ticket` → 未关闭 HIGH 票 → 退出码 3")
     if ev["rc"] != EXIT_CONFIRM:
-        c.fail(f"硬规则未按 D1-5 报码：期望退出码 3，实际 {ev['rc']}。")
+        c.fail(f"硬规则未按 D1-5 报码：期望退出码 3，实际 {ev['rc']}。"
+               "（若报 2，先查 `--inject` 值域是否含 `high_ticket`——R-10 要求。）")
     c.add(ok=cjk(blob), note="拒绝理由必须是中文（D1-10：模块+原因+下一步）",
           stdout=excerpt(blob, 300))
     if not cjk(blob):
         c.fail("D1-10：拒绝输出没有中文提示。")
 
-    # 关闭后可继续（R-6：同票号重跑保留 status/answer）
-    evc = ctx.run([ctx.python, "-m", "kfpa", "tickets", "close", "R2-999",
+    # R-10：`tickets list` 要能看到那张 HIGH 票
+    el = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--impact", "HIGH",
+                  "--db", str(db)])
+    lout = el["stdout"] + el["stderr"]
+    c.add(cmd=el["cmd"], rc=el["rc"], stdout=el["stdout"], stderr=el["stderr"],
+          ok=el["rc"] == EXIT_PASS, note="R-10：台账可见注入的高影响票")
+    ids = re.findall(r"R\d+-\d{3}", lout)
+    c.add(ok=bool(ids), note=f"从 `tickets list --impact HIGH` 抽到票号 {sorted(set(ids))}")
+    if not ids:
+        c.add(ok=False, note=f"台账输出：{excerpt(lout, 300)}")
+        c.fail("R-10/A3：`--inject high_ticket` 后 `tickets list --impact HIGH` 看不到 HIGH 票。")
+        return
+    tid = ids[0]
+
+    evc = ctx.run([ctx.python, "-m", "kfpa", "tickets", "close", tid,
                    "--answer", "选 A：按仓隔离", "--db", str(db)])
     c.add(cmd=evc["cmd"], rc=evc["rc"], stdout=evc["stdout"], stderr=evc["stderr"],
-          ok=evc["rc"] == EXIT_PASS, note="A3：`tickets close` 关闭高影响票（期望 0）")
+          ok=evc["rc"] == EXIT_PASS, note=f"A3：`tickets close {tid}`（期望 0）")
     if evc["rc"] != EXIT_PASS:
         c.fail("A3：「关闭后可继续」的前提不成立 —— `tickets close` 不可用。")
         return
     ev2 = ctx.run(base)
     c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
           ok=ev2["rc"] in (EXIT_PASS, EXIT_NEEDS_FIX, EXIT_BLOCKED),
-          note="A3：关票后重跑必须放行（不再被硬规则拦停）")
+          note="A3：关票后重跑同一轮必须放行（不再被硬规则拦停）")
     if ev2["rc"] == EXIT_CONFIRM:
         c.fail("A3：关票后仍被硬规则拦停（退出码 3）—— 关闭状态没生效。")
     try:
-        t = store_mod.Store(str(db)).get_ticket("R2-999")
+        t = store_mod.Store(str(db)).get_ticket(tid)
         c.add(ok=t is not None and str(t.status).endswith("closed") and bool((t.answer or "").strip()),
-              note=f"R-6：重跑后票 R2-999 status={getattr(t, 'status', None)} "
+              note=f"R-6：重跑后票 {tid} status={getattr(t, 'status', None)} "
                    f"answer={getattr(t, 'answer', None)!r}")
         if t is None or not str(t.status).endswith("closed"):
             c.fail("R-6：同票号重跑把 status 冲掉了（必须保留 status/answer）。")
@@ -628,7 +637,8 @@ def check_a4(ctx: Ctx, c: Check) -> None:
 # ------------------------------------------------------------------ A5
 
 
-def check_a5_scan(ctx: Ctx, c: Check) -> None:
+def check_a5_business_scan(ctx: Ctx, c: Check) -> None:
+    """R-11.1：业务代码零模型串（排除唯一白名单文件 src/kfpa/llm.py）。"""
     src = ctx.root / "src"
     if not src.exists():
         c.fail("src/ 不存在。")
@@ -640,7 +650,7 @@ def check_a5_scan(ctx: Ctx, c: Check) -> None:
             if MODEL_STR_PAT.search(line):
                 hits.append((rel, i, line.strip()))
     bad = [h for h in hits if h[0] not in MODEL_STR_ALLOWED]
-    c.add(ok=not bad, note=f"src/ 命中 {len(hits)} 处模型字符串，越界 {len(bad)} 处；"
+    c.add(ok=not bad, note=f"R-11.1：src/ 命中 {len(hits)} 处模型字符串，越界 {len(bad)} 处；"
                            f"白名单 = {list(MODEL_STR_ALLOWED)}")
     for rel, i, line in hits[:20]:
         c.findings.append(f"[{'越界' if rel not in MODEL_STR_ALLOWED else '白名单'}] "
@@ -648,14 +658,26 @@ def check_a5_scan(ctx: Ctx, c: Check) -> None:
     if not hits:
         c.findings.append("src/ 全库无模型字符串命中（铁律成立）。")
     if bad:
-        c.fail("A5 铁律被击穿：src/ 业务代码里出现模型字符串 —— "
+        c.fail("R-11.1/A5.1 铁律被击穿：src/ 业务代码里出现模型字符串 —— "
                + "; ".join(f"{r}:{i}" for r, i, _ in bad)
-               + "。只允许在 src/kfpa/llm.py 适配器与 config/models.yaml。"
-               "（p0-plan §4/A5 给的裸 grep 会把 llm.py 也判违规，台架按铁律原文加白名单。）")
-    else:
-        c.warn("p0-plan §4/A5 的示例命令 `grep -riE ... src --include=*.py` 会把适配器 "
-               "src/kfpa/llm.py 自身判违规，与铁律「仅 llm.py 适配器与 config 白名单」冲突；"
-               "建议把白名单写进验收表（本台架已按铁律原文实现）。")
+               + "。白名单只有一个文件：src/kfpa/llm.py（新增白名单须经 Chief 裁决）。")
+
+
+def check_a5_literal(ctx: Ctx, c: Check) -> None:
+    """R-11.2：白名单文件自身也不许有字面量模型串（只能从 config/models.yaml 读）。"""
+    llm = ctx.root / "src/kfpa/llm.py"
+    if not llm.exists():
+        c.fail("缺 src/kfpa/llm.py，R-11.2 无法验收。")
+        return
+    pat = re.compile(r"[\"'](?:deepseek|gpt|claude|qwen|bge)[^\"']*[\"']", re.I)
+    hits = [(i, line.strip()) for i, line in
+            enumerate(llm.read_text(encoding="utf-8", errors="replace").splitlines(), 1)
+            if pat.search(line)]
+    c.add(ok=not hits, note=f"R-11.2：src/kfpa/llm.py 字面量模型串命中 {len(hits)} 处（期望 0）")
+    for i, line in hits[:10]:
+        c.findings.append(f"[越界] src/kfpa/llm.py:{i}: {line[:140]}")
+    if hits:
+        c.fail("R-11.2：适配器里出现字面量模型串 —— 模型名必须只来自 config/models.yaml。")
 
 
 def check_a5_adapter(ctx: Ctx, c: Check) -> None:
@@ -677,15 +699,31 @@ except Exception as e:
     out["roles_error"] = "%s: %s" % (type(e).__name__, e); roles = {}
 try:
     llm = m.build_llm(roles, provider="mock")
-    a = llm.complete("FLASH", "sys", "usr")
-    b = llm.complete("FLASH", "sys", "usr")
-    out["mock_call_ok"] = True
-    out["mock_deterministic"] = (a == b)
-    out["mock_returns_str"] = isinstance(a, str)
+    prompts = {
+        "d1_marker": "[KFPA:GEN_TICKETS]\nQA: design.md \u00a75.1 | A: \u7532 | B: \u4e59 | P: \u7532 | I: MEDIUM",
+        "r3_marker": "KFPA_TASK=qa_tickets\nQA: design.md \u00a75.1 | A: \u7532 | B: \u4e59 | P: \u7532 | I: MEDIUM",
+        "keyword": "\u4ee5\u4e0b\u8bbe\u8ba1\u5b58\u5728\u6b67\u4e49\uff0c\u8bf7\u4ea7\u51fa\u8cea\u554f\u7968\uff1a\nQA: design.md \u00a75.1 | A: \u7532 | B: \u4e59 | P: \u7532 | I: MEDIUM",
+    }
+    errs = {}
+    for kind, prompt in prompts.items():
+        try:
+            a = llm.complete("ARCHITECT", "sys", prompt)
+            b = llm.complete("ARCHITECT", "sys", prompt)
+            out["mock_prompt_kind"] = kind
+            out["mock_call_ok"] = True
+            out["mock_deterministic"] = (a == b)
+            out["mock_returns_str"] = isinstance(a, str)
+            out["mock_sample"] = str(a)[:200]
+            break
+        except Exception as e:
+            errs[kind] = "%s: %s" % (type(e).__name__, e)
+    else:
+        out["mock_error"] = json.dumps(errs, ensure_ascii=False)
 except Exception as e:
     out["mock_error"] = "%s: %s" % (type(e).__name__, e)
 try:
-    m.MockLLM().complete("BOGUS", "sys", "usr")
+    m.MockLLM().complete("BOGUS", "sys",
+                         "[KFPA:GEN_TICKETS]\nQA: x | A: a | B: b | P: a | I: LOW")
     out["bogus_role_rejected"] = False
 except Exception as e:
     out["bogus_role_rejected"] = True
@@ -726,10 +764,14 @@ print(json.dumps(out, ensure_ascii=False))
     if got != want:
         c.fail(f"§3.3 角色集合不符：多 = {sorted(got - want)}，缺 = {sorted(want - got)}。")
     c.add(ok=bool(data.get("roles_have_model")), note="每个角色都有 model 字段（唯一绑定点在 config）")
-    c.add(ok=bool(data.get("mock_call_ok")), note=f"MockLLM.complete 可用 = {data.get('mock_call_ok')}")
+    c.add(ok=bool(data.get("mock_call_ok")),
+          note=f"MockLLM.complete 可用 = {data.get('mock_call_ok')}"
+               f"（命中的 prompt 口径 = {data.get('mock_prompt_kind')}）")
     if data.get("mock_error"):
-        c.add(ok=False, note=f"MockLLM 调用异常：{data['mock_error']}")
-        c.fail("§3.3 MockLLM 不可用（离线验收路径断）。")
+        c.add(ok=False, note=f"MockLLM 调用异常（三种 prompt 口径全失败）：{data['mock_error']}")
+        c.fail("§3.3/D1-7：MockLLM 三种 marker/关键词口径都无法取得剧本输出"
+               "（marker 字面量 D1-7 `[KFPA:GEN_TICKETS]` 与 R-3 `KFPA_TASK=qa_tickets` 不一致时，"
+               "以两条都支持为准）。")
     c.add(ok=bool(data.get("mock_deterministic")),
           note=f"D1-7：MockLLM 同输入同输出 = {data.get('mock_deterministic')}")
     if data.get("mock_call_ok") and data.get("mock_deterministic") is False:
@@ -957,6 +999,100 @@ def check_a7(ctx: Ctx, c: Check) -> None:
         c.add(ok=False, note=f"直读失败：{exc}")
 
 
+# ------------------------------------------------------------------ A7.2
+
+
+def check_a7_rules(ctx: Ctx, c: Check) -> None:
+    """R-8（impact 下推 Store）+ R-9（batch-close 事务与幂等）。"""
+    store_mod, serr = import_mod("kfpa.store")
+    if store_mod is None:
+        c.add(ok=False, note=f"import kfpa.store 失败：{serr}")
+        c.fail("R-8 无法验收：kfpa.store 不可导入。")
+        return
+    sc = importlib.import_module("kfpa.schemas")
+
+    # --- R-8：list_tickets 必须收 impact，且下推到 SQL（不是界面本地过滤）
+    try:
+        params = list(inspect.signature(store_mod.Store.list_tickets).parameters)
+        c.add(ok="impact" in params, note=f"R-8：Store.list_tickets 参数 = {params}")
+        if "impact" not in params:
+            c.fail("R-8：`Store.list_tickets()` 没有 `impact` 参数 —— 界面按 R-8 传参会抛 "
+                   "TypeError，`kfpa tickets list`（含不带 --impact 的普通调用）会整体失败。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"取签名失败：{type(exc).__name__}: {exc}")
+
+    db = ctx.fresh_db("a72")
+    ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
+    c.add(cmd=ev0["cmd"], rc=ev0["rc"], ok=ev0["rc"] == EXIT_PASS, note="A7.2 前置：建库")
+    try:
+        seed_ticket(store_mod, db, ticket_id="R1-911", round_no=1, impact="MEDIUM")
+        seed_ticket(store_mod, db, ticket_id="R1-912", round_no=1, impact="HIGH")
+        st = store_mod.Store(str(db))
+        got = st.list_tickets(impact=sc.TicketImpact.HIGH)
+        ok = [t.ticket_id for t in got] == ["R1-912"]
+        c.add(ok=ok, note=f"R-8：list_tickets(impact=HIGH) 返回 {[t.ticket_id for t in got]}"
+                          f"（期望 ['R1-912']）")
+        if not ok:
+            c.fail("R-8：Store 侧 impact 过滤不正确（应只返回 HIGH 票）。")
+    except TypeError as exc:
+        c.add(ok=False, note=f"R-8：调用 list_tickets(impact=...) 抛 TypeError: {exc}")
+        c.fail("R-8：Store.list_tickets 未实现 impact 过滤。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"R-8 用例异常：{type(exc).__name__}: {exc}")
+
+    # --- R-9：重复提交（已关闭票）幂等跳过 → 0；空答案 → 2 且整体不写
+    db2 = ctx.fresh_db("a72b")
+    ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db2)])
+    try:
+        seed_ticket(store_mod, db2, ticket_id="R1-921", round_no=1, impact="MEDIUM")
+        seed_ticket(store_mod, db2, ticket_id="R1-922", round_no=1, impact="LOW")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"造票失败：{type(exc).__name__}: {exc}")
+        return
+    f1 = ctx.tmp / "r9-ok.yaml"
+    f1.write_text('R1-921: "采用 A"\nR1-922: "采用 B"\n', encoding="utf-8")
+    e1 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(f1),
+                  "--db", str(db2)])
+    c.add(cmd=e1["cmd"], rc=e1["rc"], ok=e1["rc"] == EXIT_PASS,
+          note="R-9：正常攒批期望 0", stdout=excerpt(e1["stdout"] + e1["stderr"], 300))
+    e2 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(f1),
+                  "--db", str(db2)])
+    blob2 = e2["stdout"] + e2["stderr"]
+    c.add(cmd=e2["cmd"], rc=e2["rc"], ok=e2["rc"] == EXIT_PASS,
+          note="R-9：已关闭票重复提交 → 幂等跳过，期望 0（禁止用 1）",
+          stdout=excerpt(blob2, 400))
+    if e2["rc"] != EXIT_PASS:
+        c.fail(f"R-9：已关闭票重复提交退出码 {e2['rc']}，期望 0（R-1 已作废 1）。")
+    c.add(ok=("跳过" in blob2 or "skip" in blob2.lower()),
+          note="R-9：重复提交要打印「跳过 + 原因」")
+
+    db3 = ctx.fresh_db("a72c")
+    ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db3)])
+    try:
+        seed_ticket(store_mod, db3, ticket_id="R1-931", round_no=1, impact="MEDIUM")
+        seed_ticket(store_mod, db3, ticket_id="R1-932", round_no=1, impact="LOW")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"造票失败：{type(exc).__name__}: {exc}")
+        return
+    f2 = ctx.tmp / "r9-empty.yaml"
+    f2.write_text('R1-931: "采用 A"\nR1-932: ""\n', encoding="utf-8")
+    e3 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(f2),
+                  "--db", str(db3)])
+    c.add(cmd=e3["cmd"], rc=e3["rc"], stdout=e3["stdout"], stderr=e3["stderr"],
+          ok=e3["rc"] == EXIT_USAGE, note="R-9：答案为空 → 退出码 2（输入错误）")
+    if e3["rc"] != EXIT_USAGE:
+        c.fail(f"R-9：含空答案应退出码 2，实际 {e3['rc']}。")
+    try:
+        con = sqlite3.connect(str(db3))
+        n_closed = con.execute("select count(*) from tickets where status='closed'").fetchone()[0]
+        con.close()
+        c.add(ok=n_closed == 0, note=f"R-9：空答案时整体不写 —— closed = {n_closed}（期望 0）")
+        if n_closed != 0:
+            c.fail(f"R-9 事务被击穿：含空答案时仍写了 {n_closed} 张已关闭票。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"直读失败：{exc}")
+
+
 # ------------------------------------------------------------------ A8
 
 
@@ -1118,14 +1254,18 @@ CHECKS = [
      "p0-plan §4/A3、D1-5、R-6", check_a3),
     ("A4", "三态闭环：G1–G6 判据 + 同类第 2 次失败 BLOCKED + AVOID 回灌", "长流",
      "p0-plan §4/A4、D1-3/D1-4/D1-11、R-4", check_a4),
-    ("A5", "模型绑定铁律：src/ 无越界模型字符串（llm.py 白名单外）", "全员",
-     "p0-plan §4/A5", check_a5_scan),
-    ("A5.2", "适配器：4 角色、MockLLM 确定性、非法 role 拒绝、high_impact 开关", "磐石",
-     "p0-plan §3.3、R-3", check_a5_adapter),
+    ("A5.1", "模型绑定铁律：src/ 业务代码无越界模型字符串（llm.py 白名单外）", "全员",
+     "p0-plan §4/A5、R-11.1", check_a5_business_scan),
+    ("A5.2", "白名单文件自身无字面量模型串（只能从 config/models.yaml 读）", "磐石",
+     "p0-rulings R-11.2", check_a5_literal),
+    ("A5.3", "适配器：4 角色、MockLLM 确定性、非法 role 拒绝、high_impact 开关", "磐石",
+     "p0-plan §3.3、R-3/R-10", check_a5_adapter),
     ("A6", "快照可查：PASS 轮落 snapshots + tag kfpa-r{n} + history 列出", "磐石",
      "p0-plan §4/A6、D1-6", check_a6),
     ("A7", "台账：列全/过滤/close 落库/batch-close 映射与未知票号事务拒绝", "界面",
      "p0-plan §4/A7、D1-8", check_a7),
+    ("A7.2", "R-8 impact 下推 Store + R-9 batch-close 幂等与空答案事务", "磐石+界面",
+     "p0-rulings R-8/R-9", check_a7_rules),
     ("A8", "LangGraph 图冒烟（build_graph 可编译可跑），纯函数核心仍有保险丝", "长流",
      "p0-plan §4/A8、D1-12", check_a8),
     ("A9", "LiteLLM 适配器异常统一包装为中文 RuntimeError 且提示 --provider mock", "磐石",

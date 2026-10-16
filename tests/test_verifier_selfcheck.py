@@ -67,7 +67,7 @@ def test_unknown_check_id_is_a_usage_error():
 def test_runner_lists_a1_to_a9():
     cp = _run(ROOT, "--list")
     assert cp.returncode == 0
-    for cid in ("A1", "A2", "A3", "A4", "A5", "A5.2", "A6", "A7", "A8", "A9"):
+    for cid in ("A1", "A2", "A3", "A4", "A5.1", "A5.2", "A5.3", "A6", "A7", "A7.2", "A8", "A9"):
         assert cid in cp.stdout, f"--list 未列出 {cid}"
 
 
@@ -86,9 +86,9 @@ def test_planted_model_string_is_caught(tmp_path):
         "src/kfpa/__init__.py": "",
         "src/kfpa/oops.py": 'DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"\n',
     })
-    rep = _report(tmp_path, stub, "--only", "A5")
-    a5 = _by_id(rep, "A5")
-    assert a5["status"] == "FAIL", "投毒的模型字符串没被 A5 抓到"
+    rep = _report(tmp_path, stub, "--only", "A5.1")
+    a5 = _by_id(rep, "A5.1")
+    assert a5["status"] == "FAIL", "投毒的模型字符串没被 A5.1 抓到"
     assert "oops.py" in _findings(a5)
 
 
@@ -97,8 +97,8 @@ def test_adapter_whitelist_is_not_a_false_positive(tmp_path):
         "src/kfpa/__init__.py": "",
         "src/kfpa/llm.py": 'MODEL = "deepseek/deepseek-v4.1-flash"  # 适配器内部\n',
     })
-    rep = _report(tmp_path, stub, "--only", "A5")
-    assert _by_id(rep, "A5")["status"] == "PASS", "llm.py 白名单被误杀"
+    rep = _report(tmp_path, stub, "--only", "A5.1")
+    assert _by_id(rep, "A5.1")["status"] == "PASS", "llm.py 白名单被误杀"
 
 
 def test_contract_version_drift_is_flagged(tmp_path):
@@ -112,6 +112,6 @@ def test_contract_version_drift_is_flagged(tmp_path):
 
 
 def test_real_repo_passes_model_string_iron_rule(tmp_path):
-    """真仓库（main + 各人分支合并后）必须满足 A5；失败说明有人把模型串写进了业务代码。"""
-    rep = _report(tmp_path, ROOT, "--only", "A5")
-    assert _by_id(rep, "A5")["status"] == "PASS", _findings(_by_id(rep, "A5"))
+    """真仓库必须满足 A5.1；失败说明有人把模型串写进了业务代码。"""
+    rep = _report(tmp_path, ROOT, "--only", "A5.1")
+    assert _by_id(rep, "A5.1")["status"] == "PASS", _findings(_by_id(rep, "A5.1"))
