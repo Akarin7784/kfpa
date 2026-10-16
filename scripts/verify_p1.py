@@ -128,6 +128,9 @@ class Ctx:
         self.env["PYTHONPATH"] = str(self.root / "src") + os.pathsep + self.env.get("PYTHONPATH", "")
         self.env["PYTHONIOENCODING"] = "utf-8"
         self.env["PYTHONUTF8"] = "1"
+        # R-25.3：台架所有子进程一律剥掉 KFPA_DB_URL —— 谁机器上残留了这个变量，
+        # 都不许把各断言自己准备的临时库顶掉（R-25 实测：残留会让 A6/A7/A10/A11/A13 全红）。
+        self.env.pop("KFPA_DB_URL", None)
         sys.path.insert(0, str(self.root / "src"))
 
     def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 300,
@@ -552,13 +555,11 @@ def check_a12(ctx: Ctx, c: Check) -> None:
     masked = re.sub(r"://[^@]+@", "://***@", dsn)
     c.add(ok=True, note=f"A12：DSN（打码）= {masked}")
 
-    # D3 §3.2 的接线形态有两种：`KFPA_DB_URL` 环境变量（推荐的兜底）或把 DSN 直接给 `--db`。
-    # 任一生效即可 —— 验收要的是「同一套断言在 PG 上一致」，不是某一种管道写法。
+    # R-25.2：对拍就是「显式指定两库」，PG 侧一律显式 `--db <DSN>`，不靠环境变量隐式切换。
     pg = None
     form_used = ""
     forms = [
-        ("KFPA_DB_URL 环境变量", {"KFPA_DB_URL": dsn}, []),
-        ("--db 直接传 DSN", {}, ["--db", dsn]),
+        ("--db 显式传 DSN（R-25.2）", {}, ["--db", dsn]),
     ]
     try:
         for label, env_over, extra in forms:
