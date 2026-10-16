@@ -188,6 +188,28 @@ def make_store_for(store_mod, db) -> object:
     return store_mod.Store(str(db))
 
 
+def normalize_rows(rows, *, scalar_when_single: bool = True) -> list:
+    """R-27：把 PG 元组行与 SQLite 标量行统一成同一形状再比较。
+
+    - 单列行 → 扁平标量（长度 1 的 tuple/list 取首元素）
+    - 多列行 → list
+    - None → 跳过
+    禁止为了迁就探针去改产品代码（R-27.1）。
+    """
+    out = []
+    for r in rows or []:
+        if r is None:
+            continue
+        if isinstance(r, (list, tuple)):
+            if scalar_when_single and len(r) == 1:
+                out.append(r[0])
+            else:
+                out.append(list(r))
+        else:
+            out.append(r)
+    return out
+
+
 def cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
 
@@ -642,7 +664,8 @@ def check_a12(ctx: Ctx, c: Check) -> None:
         conn.close()
     c.add(ok=bool(sq_tickets), note=f"A12：SQLite 第 {PROBE_ROUND} 轮票号 = {sq_tickets}")
     if pg is not None:
-        pg_tickets = sorted(pg.get("tickets") or [])
+        # R-27：先归一（PG 元组行 / SQLite 标量行）再比较
+        pg_tickets = sorted(normalize_rows(pg.get("tickets")))
         c.add(ok=sq_tickets == pg_tickets,
               note=f"A12：第 {PROBE_ROUND} 轮票号一致 = {sq_tickets == pg_tickets}"
                    f"（SQLite={sq_tickets} PG={pg_tickets}）")
@@ -662,7 +685,7 @@ def check_a12(ctx: Ctx, c: Check) -> None:
               note=f"A12：第 {PROBE_ROUND} 轮账本 SQLite={sq_ledger} 条、PG 按角色={pg_ledger}")
         if sq_ledger <= 0 or not pg_ledger:
             c.fail("A12：两库的 `ledger` 在同一轮上不一致（应都有记录）。")
-        pg_gates = pg.get("gates") or []
+        pg_gates = normalize_rows(pg.get("gates"))
         c.add(ok=sq_gates == pg_gates,
               note=f"A12：第 {PROBE_ROUND} 轮门禁态一致 = {sq_gates == pg_gates}"
                    f"（SQLite={sq_gates} PG={pg_gates}）")
