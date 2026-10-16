@@ -553,6 +553,15 @@ def check_a20(ctx: Ctx, c: Check) -> None:
     if not cov_json.exists():
         c.fail(f"A20：未产出覆盖率 JSON（rc={ev['rc']}）。")
         return
+    # 红着的 pytest 也会产出覆盖率 JSON，但那份数字不能证明白名单达标：
+    # A20 的前置条件是 `pytest` **全绿**（PR #49 合并后暴露的真缺口：pytest 1 failed
+    # 仍被 A20 判 PASS）。先卡死这一步，再看门槛。
+    c.add(cmd="[A20 前置] pytest 必须全绿（rc=0）", rc=ev["rc"],
+          stdout=ev["stdout"], stderr=ev["stderr"], ok=ev["rc"] == 0,
+          note="A20：覆盖率只在全绿测试上采集")
+    if ev["rc"] != 0:
+        c.fail(f"A20：`pytest` 未全绿（rc={ev['rc']}），覆盖率数字不作数——先修红。")
+        return
     try:
         cov = json.loads(cov_json.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
