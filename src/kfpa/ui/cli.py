@@ -1,25 +1,27 @@
 """質問票台账子命令（``kfpa tickets ...``）。
 
-主入口（磐石 ``src/kfpa/cli.py``）只要在 ``add_subparsers()`` 之后调用本模块的
-``register(subparsers)`` 即可；各子命令用 ``set_defaults(func=...)`` 挂处理函数，
-约定签名为 ``func(args) -> int``（返回进程退出码）。若不带子命令调用
-``kfpa tickets``，本模块给用法提示并返回 2。
+挂载方式：主入口（磐石 ``src/kfpa/cli.py``）在 ``add_subparsers()`` 之后调用
+``register(subparsers)`` 即可。为了让两种分发约定都能跑，每个子命令同时设
+``handler`` 与 ``func`` 两个默认值（磐石主入口读 ``args.handler``），处理函数签名
+``func(args) -> int``，返回进程退出码。不带子命令调用 ``kfpa tickets`` 时给用法提示并返回 2。
 
 命令（docs/dev/p0-plan.md §3.7）：
 
-- ``kfpa tickets list [--round N] [--impact HIGH] [--status OPEN]``
-- ``kfpa tickets close <ticket_id> --answer "<人工确认>"``
-- ``kfpa tickets batch-close --file <answers.yaml|json>``
+- ``kfpa tickets list [--round N] [--impact HIGH] [--status OPEN]``：台账列见 D1-8
+- ``kfpa tickets close <ticket_id> --answer "<人工确认>"``：关闭并入库，回显票面与结论
+- ``kfpa tickets batch-close --file <answers.yaml|json>``：攒批确认，格式与失败规则见 D1-8
 
-实现约束：
+退出码（D1-5）：``0`` 成功 / ``2`` 用法与参数错误 / ``4`` 依赖缺失 / ``5`` I/O 或数据库错误。
 
-- 只用标准库；``yaml`` 是惰性可选依赖（缺包时给中文提示并建议改用 JSON）；
-- ``kfpa.store`` 惰性导入：``store.py`` 由 p0/core（磐石）提供，尚未合入时
-  必须给中文提示，而不是 ImportError 崩溃；
-- ``--db`` 的 default 用 ``argparse.SUPPRESS``：主入口若已定义全局 ``--db``，
-  子命令不写它时不覆盖，写它时（如 ``tickets list --db t.db``）以子命令为准；
-- 影响面过滤在本地做：冻结接口 ``Store.list_tickets(round_no, status)`` 没有
-  ``impact`` 参数（``schemas`` 与 §3.2 只读），界面不擅自扩契约。
+D1-8 落地口径：
+
+- 台账列固定 ``ticket_id | round | impact | status | location | architect_preference | answer``；
+- ``batch-close`` 是**事务**：出现未知票号 → 退出码 2 且整体不写；
+- 答案为空 → 拒绝该条（其余照写，最终退出码 2）；
+- 已关闭票重复提交 → 幂等忽略并提示（不改库、不计错）；单张 ``close`` 同口径。
+
+其它约束：只用标准库；``yaml`` 惰性可选；``kfpa.store`` 惰性导入，未就绪时给中文提示；
+影响面过滤在本地做（冻结签名 ``Store.list_tickets(round_no, status)`` 没有 impact 参数）。
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import argparse
 import json
 import sys
 import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -40,26 +43,42 @@ __all__ = [
     "cmd_batch_close",
     "render_tickets",
     "parse_answers",
+    "plan_batch",
+    "apply_batch",
     "apply_answers",
+    "enum_value",
     "impact_label",
     "status_label",
+    "EXIT_OK",
+    "EXIT_USAGE",
+    "EXIT_DEPS",
+    "EXIT_IO",
 ]
 
-#: 默认库路径，与主入口 §3.8 一致
+#: 默认库路径（D1-10）
 DEFAULT_DB = "kfpa.db"
+
+#: 退出码（D1-5）
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_DEPS = 4
+EXIT_IO = 5
 
 _IMPACT_LABEL = {"high": "高", "medium": "中", "low": "低"}
 _STATUS_LABEL = {"open": "未关闭", "closed": "已关闭", "dropped": "已丢弃"}
 
-#: list 表格的列（表头, 最大显示宽度）：票号/轮次/位置/影响面/状态/主BOT倾向
+#: 台账列固定为 D1-8；值为机读原文（high/open…），中文释义走表尾图例
 _COLUMNS: tuple[tuple[str, int], ...] = (
-    ("票号", 18),
-    ("轮次", 6),
-    ("位置", 30),
-    ("影响面", 8),
-    ("状态", 8),
-    ("倾向", 26),
+    ("ticket_id", 12),
+    ("round", 6),
+    ("impact", 8),
+    ("status", 8),
+    ("location", 28),
+    ("architect_preference", 22),
+    ("answer", 26),
 )
+
+_LEGEND = "影响面：high=高 / medium=中 / low=低；状态：open=未关闭 / closed=已关闭 / dropped=已丢弃"
 
 _JSON_SUFFIXES = {".json"}
 _YAML_SUFFIXES = {".yaml", ".yml"}
@@ -80,10 +99,15 @@ def _add_db_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _defaults(parser: argparse.ArgumentParser, handler) -> None:
+    """同时设 handler / func：两种主入口分发约定都能命中。"""
+    parser.set_defaults(handler=handler, func=handler)
+
+
 def register(subparsers) -> None:
     """把 ``tickets`` 子命令组注册到主入口的 subparsers 上。"""
     parser = subparsers.add_parser("tickets", help="質問票台账：列出 / 关闭 / 攒批关闭")
-    _add_db_option(parser)  # 让 `kfpa tickets --db x` 也能走到用法提示，而不是 argparse 报错
+    _add_db_option(parser)  # 让 `kfpa tickets --db x` 走到用法提示，而不是 argparse 报错
     group = parser.add_subparsers(
         dest="tickets_command",
         title="tickets 子命令",
@@ -109,10 +133,10 @@ def register(subparsers) -> None:
         help="按状态过滤：OPEN / CLOSED / DROPPED",
     )
     _add_db_option(p_list)
-    p_list.set_defaults(func=cmd_list)
+    _defaults(p_list, cmd_list)
 
     p_close = group.add_parser("close", help="关闭单张票并写入人工确认结论")
-    p_close.add_argument("ticket_id", metavar="TICKET_ID", help="票号，如 T-001")
+    p_close.add_argument("ticket_id", metavar="TICKET_ID", help="票号，如 R1-001")
     p_close.add_argument(
         "--answer",
         required=True,
@@ -120,20 +144,19 @@ def register(subparsers) -> None:
         help="人工确认结论（采用了哪个解释 / 补充约束）",
     )
     _add_db_option(p_close)
-    p_close.set_defaults(func=cmd_close)
+    _defaults(p_close, cmd_close)
 
     p_batch = group.add_parser("batch-close", help="按答案文件攒批关闭（保护确认带宽）")
     p_batch.add_argument(
         "--file",
         required=True,
         metavar="PATH",
-        help="答案文件：.json 或 .yaml/.yml；形如 {票号: 结论} 或 [{ticket_id, answer}, ...]",
+        help="答案文件：.json 或 .yaml/.yml；D1-8 格式 票号→结论，或 [{ticket_id, answer}, ...]",
     )
     _add_db_option(p_batch)
-    p_batch.set_defaults(func=cmd_batch_close)
+    _defaults(p_batch, cmd_batch_close)
 
-    # 不带子命令时（kfpa tickets）给用法提示，而不是 KeyError/AttributeError
-    parser.set_defaults(func=_cmd_tickets_help)
+    _defaults(parser, _cmd_tickets_help)
 
 
 def _upper(value: str) -> str:
@@ -145,7 +168,7 @@ def _cmd_tickets_help(_args) -> int:
         "用法：kfpa tickets <list|close|batch-close> ...（详见 kfpa tickets --help）",
         file=sys.stderr,
     )
-    return 2
+    return EXIT_USAGE
 
 
 # ------------------------------------------------------------------ 取值助手
@@ -177,12 +200,20 @@ def _open_store(db_path: str):
         from ..store import Store  # type: ignore[import-not-found]
     except ImportError as exc:
         print(
-            f"[kfpa-ui] 无法加载 kfpa.store（{exc}）：该模块由 p0/core（磐石）提供，"
-            "请先合入后再使用 tickets 子命令。",
+            f"[kfpa-ui] 缺少 kfpa.store（{exc}）→ 该模块由 p0/core 提供，请先合入或安装后再用 tickets 子命令",
             file=sys.stderr,
         )
         return None
     return Store(db_path)
+
+
+def _io_error(action: str, exc: Exception, db_path: str) -> int:
+    """I/O 或数据库错误统一提示（D1-10：模块 + 原因 + 下一步）。"""
+    print(
+        f"[kfpa-ui] {action}失败：{exc} → 检查 --db 路径与文件权限，必要时先跑 `kfpa init --db {db_path}`",
+        file=sys.stderr,
+    )
+    return EXIT_IO
 
 
 # ------------------------------------------------------------------ list
@@ -211,7 +242,7 @@ def _pad(text: str, width: int) -> str:
 
 
 def render_tickets(tickets: Iterable[QATicket]) -> str:
-    """把票渲染成等宽表格（中文按双宽对齐）；空列表给中文占位。"""
+    """按 D1-8 的列渲染台账（中文按双宽对齐）；空列表给中文占位。"""
     rows = sorted(tickets, key=lambda t: (getattr(t, "round_no", 0), str(t.ticket_id)))
     if not rows:
         return "（无匹配質問票）"
@@ -222,10 +253,11 @@ def render_tickets(tickets: Iterable[QATicket]) -> str:
             [
                 _clip(getattr(t, "ticket_id", ""), _COLUMNS[0][1]),
                 _clip(getattr(t, "round_no", ""), _COLUMNS[1][1]),
-                _clip(getattr(t, "location", ""), _COLUMNS[2][1]),
-                _clip(impact_label(getattr(t, "impact", "")), _COLUMNS[3][1]),
-                _clip(status_label(getattr(t, "status", "")), _COLUMNS[4][1]),
+                _clip(enum_value(getattr(t, "impact", "")), _COLUMNS[2][1]),
+                _clip(enum_value(getattr(t, "status", "")), _COLUMNS[3][1]),
+                _clip(getattr(t, "location", ""), _COLUMNS[4][1]),
                 _clip(getattr(t, "architect_preference", ""), _COLUMNS[5][1]),
+                _clip(getattr(t, "answer", None), _COLUMNS[6][1]),
             ]
         )
 
@@ -241,9 +273,10 @@ def render_tickets(tickets: Iterable[QATicket]) -> str:
 
     open_high = [t for t in rows if _is_open_high(t)]
     lines.append("")
+    lines.append(_LEGEND)
     summary = f"共 {len(rows)} 张；未关闭高影响票 {len(open_high)} 张"
     if open_high:
-        summary += "（存在时 pipeline 拒绝生成任务包）：" + "、".join(
+        summary += "（存在时 pipeline 拒绝生成任务包，退出码 3）：" + "、".join(
             str(t.ticket_id) for t in open_high
         )
     lines.append(summary)
@@ -262,16 +295,23 @@ def _is_open_high(ticket: Any) -> bool:
 
 
 def cmd_list(args) -> int:
-    store = _open_store(_db_path(args))
+    db_path = _db_path(args)
+    try:
+        store = _open_store(db_path)
+    except Exception as exc:  # sqlite3.Error：库/目录不可用
+        return _io_error("打开数据库", exc, db_path)
     if store is None:
-        return 2
-    status = TicketStatus(args.status.lower()) if args.status else None
-    tickets = list(store.list_tickets(round_no=args.round, status=status))
-    if args.impact:
-        want = args.impact.lower()
-        tickets = [t for t in tickets if enum_value(getattr(t, "impact", "")) == want]
+        return EXIT_DEPS
+    try:
+        status = TicketStatus(args.status.lower()) if args.status else None
+        tickets = list(store.list_tickets(round_no=args.round, status=status))
+        if args.impact:
+            want = args.impact.lower()
+            tickets = [t for t in tickets if enum_value(getattr(t, "impact", "")) == want]
+    except Exception as exc:  # sqlite3.Error 等
+        return _io_error("读取台账", exc, db_path)
     print(render_tickets(tickets))
-    return 0
+    return EXIT_OK
 
 
 # ------------------------------------------------------------------ close
@@ -281,29 +321,54 @@ def cmd_close(args) -> int:
     ticket_id = str(args.ticket_id or "").strip()
     answer = str(args.answer or "").strip()
     if not ticket_id:
-        print("[kfpa-ui] 票号不能为空。", file=sys.stderr)
-        return 2
+        print('[kfpa-ui] 票号不能为空 → 形如 `kfpa tickets close R1-001 --answer "..."`', file=sys.stderr)
+        return EXIT_USAGE
     if not answer:
-        print("[kfpa-ui] --answer 不能为空：人工确认的结论必须写下来。", file=sys.stderr)
-        return 2
+        print("[kfpa-ui] --answer 不能为空 → 人工确认的结论必须写下来", file=sys.stderr)
+        return EXIT_USAGE
 
-    store = _open_store(_db_path(args))
+    db_path = _db_path(args)
+    try:
+        store = _open_store(db_path)
+    except Exception as exc:
+        return _io_error("打开数据库", exc, db_path)
     if store is None:
-        return 2
+        return EXIT_DEPS
 
-    ticket = store.get_ticket(ticket_id)
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except Exception as exc:
+        return _io_error("查询票面", exc, db_path)
+
     if ticket is None:
-        print(f"[kfpa-ui] 库里没有票号 {ticket_id}（可先跑 kfpa tickets list）。", file=sys.stderr)
-        return 1
-    if enum_value(getattr(ticket, "status", "")) != TicketStatus.OPEN.value:
         print(
-            f"[kfpa-ui] {ticket_id} 当前状态「{status_label(ticket.status)}」，"
-            "只有未关闭（OPEN）的票才能确认。",
+            f"[kfpa-ui] 票号 {ticket_id} 不存在 → 先跑 `kfpa tickets list --db {db_path}` 核对票号",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_USAGE
 
-    closed = store.close_ticket(ticket_id, answer) or store.get_ticket(ticket_id) or ticket
+    status = enum_value(getattr(ticket, "status", ""))
+    if status == TicketStatus.CLOSED.value:
+        print(
+            f"[kfpa-ui] {ticket_id} 已是 closed（幂等忽略，未改动库）→ 如需改结论请另行处理",
+            file=sys.stderr,
+        )
+        return EXIT_OK
+    if status != TicketStatus.OPEN.value:
+        print(
+            f"[kfpa-ui] {ticket_id} 状态为 {status}，只有 open 的票可确认 → 换一张票",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        closed = store.close_ticket(ticket_id, answer) or store.get_ticket(ticket_id) or ticket
+    except KeyError as exc:
+        print(f"[kfpa-ui] {ticket_id} 在写入前消失（{exc}）→ 重跑 `kfpa tickets list` 核对", file=sys.stderr)
+        return EXIT_USAGE
+    except Exception as exc:
+        return _io_error("关闭票", exc, db_path)
+
     print(
         "已关闭：{tid}（第 {rnd} 轮 · {impact}影响 · {status}）".format(
             tid=getattr(closed, "ticket_id", ticket_id),
@@ -317,7 +382,7 @@ def cmd_close(args) -> int:
     print(f"  B  ：{getattr(closed, 'option_b', '')}")
     print(f"  主BOT 倾向：{getattr(closed, 'architect_preference', '')}")
     print(f"  人工确认：{getattr(closed, 'answer', None) or answer}")
-    return 0
+    return EXIT_OK
 
 
 # ------------------------------------------------------------------ batch-close
@@ -326,13 +391,10 @@ def cmd_close(args) -> int:
 def parse_answers(payload: str, suffix: str = "") -> tuple[dict[str, str], list[str]]:
     """解析攒批答案，返回 ``(票号→结论, 问题清单)``。
 
-    支持两种形状：
-
-    - 映射：``{"T-001": "采用 A"}``
-    - 列表：``[{"ticket_id": "T-001", "answer": "采用 A"}]``
-
-    结论值也可以是 ``{"answer": "...", "reason": "..."}`` 这样的对象。
-    后缀未识别时先按 JSON 解析，失败再按 YAML 试一次。
+    D1-8 的主形状是映射 ``{"R1-001": "采用 B"}``；为便于手写也接受列表
+    ``[{"ticket_id": "R1-001", "answer": "采用 B"}]``，结论值可以是
+    ``{"answer": "...", "reason": "..."}`` 这样的对象。后缀未识别时先按 JSON 解析，失败再按 YAML 试一次。
+    空结论会原样保留，由 :func:`plan_batch` 记成「拒绝该条」并让退出码为 2。
     """
     problems: list[str] = []
     text = (payload or "").strip()
@@ -368,7 +430,7 @@ def _decode_yaml(payload: str) -> tuple[Any, Optional[str]]:
     try:
         import yaml  # 惰性可选依赖（由 Chief 统一安装 pyyaml）
     except ImportError:
-        return None, "未安装 pyyaml，无法解析 YAML；请改用 .json 答案文件（或请 Chief 安装 pyyaml）"
+        return None, "未安装 pyyaml → 请改用 .json 答案文件，或请 Chief 安装 pyyaml"
     try:
         return yaml.safe_load(payload), None
     except Exception as exc:  # yaml.YAMLError 及其它解析异常
@@ -393,14 +455,11 @@ def _normalize_answers(data: Any, problems: list[str]) -> dict[str, str]:
     if isinstance(data, dict):
         for key, value in data.items():
             ticket_id = "" if key is None else str(key).strip()
-            answer = _answer_text(value)
             if not ticket_id:
                 problems.append("有一条答案的票号为空，已跳过")
                 continue
-            if not answer:
-                problems.append(f"{ticket_id}：结论为空，已跳过")
-                continue
-            answers[ticket_id] = answer
+            # 空结论不在这里丢：交给 plan_batch 记成「拒绝该条」，退出码才可判定
+            answers[ticket_id] = _answer_text(value)
     elif isinstance(data, list):
         for index, item in enumerate(data, 1):
             if not isinstance(item, dict):
@@ -408,36 +467,68 @@ def _normalize_answers(data: Any, problems: list[str]) -> dict[str, str]:
                 continue
             ticket_id = _first_value(item, _TICKET_KEYS)
             ticket_id = "" if ticket_id is None else str(ticket_id).strip()
-            answer = _answer_text(_first_value(item, _ANSWER_KEYS))
             if not ticket_id:
                 problems.append(f"第 {index} 条缺少票号（ticket_id），已跳过")
                 continue
-            if not answer:
-                problems.append(f"{ticket_id}：结论为空，已跳过")
-                continue
-            answers[ticket_id] = answer
+            answers[ticket_id] = _answer_text(_first_value(item, _ANSWER_KEYS))
     else:
         problems.append("答案文件顶层必须是对象（票号→结论）或数组")
     return answers
 
 
-def apply_answers(store, answers: dict[str, str]) -> tuple[list[str], list[str]]:
-    """逐票关闭，返回 ``(已关闭票号, 失败说明)``；不抛异常，逐条给出原因。"""
-    closed: list[str] = []
-    failures: list[str] = []
+@dataclass
+class BatchPlan:
+    """攒批预检结果：先全部校验，再决定写不写（D1-8 事务规则）。"""
+
+    to_close: dict[str, str] = field(default_factory=dict)
+    ignored: list[str] = field(default_factory=list)   # 已关闭 → 幂等忽略
+    unknown: list[str] = field(default_factory=list)   # 未知票号 → 整体不写
+    rejected: list[str] = field(default_factory=list)  # 空结论 / 非 open 状态 → 拒绝该条
+
+    @property
+    def writable(self) -> bool:
+        return not self.unknown
+
+
+def plan_batch(store, answers: dict[str, str]) -> BatchPlan:
+    """逐条预检，**不写库**；未知票号返回在 ``unknown`` 里，由调用方整体拒绝。"""
+    plan = BatchPlan()
     for ticket_id, answer in answers.items():
+        text = str(answer or "").strip()
+        if not text:
+            plan.rejected.append(f"{ticket_id}：结论为空")
+            continue
         ticket = store.get_ticket(ticket_id)
         if ticket is None:
-            failures.append(f"{ticket_id}：库中不存在该票号，已跳过")
+            plan.unknown.append(ticket_id)
             continue
-        if enum_value(getattr(ticket, "status", "")) != TicketStatus.OPEN.value:
-            failures.append(
-                f"{ticket_id}：当前状态「{status_label(ticket.status)}」，只有未关闭的票可确认，已跳过"
-            )
-            continue
+        status = enum_value(getattr(ticket, "status", ""))
+        if status == TicketStatus.OPEN.value:
+            plan.to_close[ticket_id] = text
+        elif status == TicketStatus.CLOSED.value:
+            plan.ignored.append(ticket_id)
+        else:
+            plan.rejected.append(f"{ticket_id}：状态 {status}，不可确认")
+    return plan
+
+
+def apply_batch(store, plan: BatchPlan) -> list[str]:
+    """只写 ``plan.to_close``（预检通过的部分），返回已关闭票号。"""
+    closed: list[str] = []
+    for ticket_id, answer in plan.to_close.items():
         store.close_ticket(ticket_id, answer)
         closed.append(ticket_id)
-    return closed, failures
+    return closed
+
+
+def apply_answers(store, answers: dict[str, str]) -> tuple[list[str], list[str]]:
+    """页面用的一次性封装：未知票号则整体不写；返回 ``(已关闭, 提示)``。"""
+    plan = plan_batch(store, answers)
+    if plan.unknown:
+        return [], [f"{t}：未知票号，按事务规则本次不写任何票" for t in plan.unknown]
+    closed = apply_batch(store, plan)
+    notes = [f"{t}：已关闭，幂等忽略" for t in plan.ignored] + list(plan.rejected)
+    return closed, notes
 
 
 def cmd_batch_close(args) -> int:
@@ -445,24 +536,53 @@ def cmd_batch_close(args) -> int:
     try:
         payload = path.read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"[kfpa-ui] 读不到答案文件 {path}：{exc}", file=sys.stderr)
-        return 2
+        print(f"[kfpa-ui] 读不到答案文件 {path}：{exc} → 检查路径与 UTF-8 编码", file=sys.stderr)
+        return EXIT_IO
 
     answers, problems = parse_answers(payload, path.suffix)
     for problem in problems:
         print(f"[提示] {problem}", file=sys.stderr)
     if not answers:
-        print("[kfpa-ui] 答案文件里没有可用的「票号→结论」，未做任何关闭。", file=sys.stderr)
-        return 2
+        print(
+            "[kfpa-ui] 答案文件里没有可用的「票号→结论」→ 按 D1-8 格式填写后重跑",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
 
-    store = _open_store(_db_path(args))
+    db_path = _db_path(args)
+    try:
+        store = _open_store(db_path)
+    except Exception as exc:
+        return _io_error("打开数据库", exc, db_path)
     if store is None:
-        return 2
+        return EXIT_DEPS
 
-    closed, failures = apply_answers(store, answers)
+    try:
+        plan = plan_batch(store, answers)
+    except Exception as exc:
+        return _io_error("预检攒批答案", exc, db_path)
+
+    if plan.unknown:
+        print(
+            "[kfpa-ui] 未知票号："
+            + "、".join(plan.unknown)
+            + f" → 按 D1-8 事务规则整体不写；先跑 `kfpa tickets list --db {db_path}` 核对票号",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        closed = apply_batch(store, plan)
+    except Exception as exc:
+        return _io_error("写入攒批结论", exc, db_path)
+
     for ticket_id in closed:
-        print(f"已关闭 {ticket_id} → {answers[ticket_id]}")
-    for failure in failures:
-        print(f"[跳过] {failure}", file=sys.stderr)
-    print(f"攒批完成：关闭 {len(closed)} 张，跳过 {len(failures)} 张。")
-    return 0 if not failures else 1
+        print(f"已关闭 {ticket_id} → {plan.to_close[ticket_id]}")
+    for ticket_id in plan.ignored:
+        print(f"已关闭过 {ticket_id} → 幂等忽略，未改动库")
+    for reason in plan.rejected:
+        print(f"[拒绝] {reason}", file=sys.stderr)
+    print(
+        f"攒批完成：关闭 {len(closed)} 张，幂等忽略 {len(plan.ignored)} 张，拒绝 {len(plan.rejected)} 张。"
+    )
+    return EXIT_USAGE if plan.rejected else EXIT_OK

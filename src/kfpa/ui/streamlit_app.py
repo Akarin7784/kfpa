@@ -6,9 +6,9 @@
 
 约束（docs/dev/p0-plan.md §0/§3.7）：
 
-- ``streamlit`` 惰性导入：缺包时给中文提示并返回非零，不抛 ImportError；
+- ``streamlit`` 惰性导入：缺包时给中文提示并返回 4（D1-5 依赖缺失），不抛 ImportError；
 - 页面只读 ``kfpa.store.Store``（磐石）并调用其关闭接口，不自己写 SQL；
-- 攒批关闭复用 ``kfpa.ui.cli`` 的解析/落库逻辑，保证 CLI 与页面同一套语义；
+- 攒批关闭复用 ``kfpa.ui.cli`` 的解析/落库逻辑，保证 CLI 与页面同一套语义（含 D1-8 事务规则）；
 - 验收仍走 ``kfpa tickets list/close/batch-close``（A7），本页面不参与断言。
 """
 
@@ -18,6 +18,9 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Any
+
+#: D1-5：依赖缺失（streamlit 等可选包未安装）
+_EXIT_DEPS = 4
 
 _STREAMLIT_HINT = (
     "[kfpa-ui] 未安装 streamlit，質問票台账页面不可用（P0 不列入验收）。\n"
@@ -180,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_src_on_path()
     deps = _load_deps()
     if deps is None:
-        return 1
+        return _EXIT_DEPS
     st, Store, TicketImpact, TicketStatus, parse_answers, apply_answers = deps
     return _render(st, Store, TicketImpact, TicketStatus, parse_answers, apply_answers)
 
