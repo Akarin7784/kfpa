@@ -64,10 +64,11 @@ def test_unknown_check_id_is_a_usage_error():
     assert cp.returncode == 2, cp.stdout + cp.stderr
 
 
-def test_runner_lists_a1_to_a9():
+def test_runner_lists_a1_to_a10():
     cp = _run(ROOT, "--list")
     assert cp.returncode == 0
-    for cid in ("A1", "A2", "A3", "A4", "A5.1", "A5.2", "A5.3", "A6", "A7", "A7.2", "A8", "A9"):
+    for cid in ("A1", "A2", "A3", "A4", "A5.1", "A5.2", "A5.3", "A6", "A7", "A7.2",
+                "A8", "A9", "A10"):
         assert cid in cp.stdout, f"--list 未列出 {cid}"
 
 

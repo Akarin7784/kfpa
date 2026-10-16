@@ -54,8 +54,9 @@ EXIT_PASS, EXIT_USAGE, EXIT_CONFIRM, EXIT_DEP, EXIT_IO, EXIT_NEEDS_FIX, EXIT_BLO
 MODEL_STR_PAT = re.compile(r"deepseek|gpt-|claude|qwen|bge", re.I)
 MODEL_STR_ALLOWED = ("src/kfpa/llm.py",)
 
-#: D1-9：六表（+ meta）
-EXPECTED_TABLES = ("rounds", "tickets", "task_packages", "gate_reports", "failures", "snapshots")
+#: D1-9：六表 + meta（实际建库 7 张）
+EXPECTED_TABLES = ("meta", "rounds", "tickets", "task_packages", "gate_reports",
+                   "failures", "snapshots")
 #: D1-9 明确要求存在的列（抽查最容易被偷工减料的几处）
 EXPECTED_COLUMNS = {
     "tickets": {"ticket_id", "round_no", "location", "option_a", "option_b",
@@ -145,16 +146,24 @@ class Ctx:
         self.env["PYTHONUTF8"] = "1"
         sys.path.insert(0, str(self.root / "src"))
 
-    def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 240) -> dict:
+    def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 240,
+            clean_env: bool = False) -> dict:
+        """clean_env=True：不设 PYTHONIOENCODING / PYTHONUTF8（R-18：A10 与 A1/A7 复跑必须有一遍如此）。"""
+        env = self.env
+        if clean_env:
+            env = {k: v for k, v in self.env.items()
+                   if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
         try:
-            p = subprocess.run(cmd, cwd=str(cwd or self.root), env=self.env,
+            p = subprocess.run(cmd, cwd=str(cwd or self.root), env=env,
                                capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"cmd": " ".join(cmd), "rc": -9, "stdout": "",
-                    "stderr": f"命令超时（>{timeout}s）——离线验收不应长阻塞"}
+                    "stderr": f"命令超时（>{timeout}s）——离线验收不应长阻塞",
+                    "clean_env": clean_env}
         return {"cmd": " ".join(cmd), "rc": p.returncode,
                 "stdout": p.stdout.decode("utf-8", "replace"),
-                "stderr": p.stderr.decode("utf-8", "replace")}
+                "stderr": p.stderr.decode("utf-8", "replace"),
+                "clean_env": clean_env}
 
     def fresh_db(self, name: str) -> Path:
         p = self.tmp / f"{name}.db"
@@ -301,6 +310,18 @@ def check_a1(ctx: Ctx, c: Check) -> None:
         c.warn(f"契约版本 {ver} < main 的 {CONTRACT_VERSION_LATEST}：该分支可能未 rebase 到 main"
                "（PR 纪律第 6 条），v1.1 字段相关断言会 SKIP。")
 
+    # R-18/R-18.4：这一遍**不设** PYTHONIOENCODING / PYTHONUTF8（否则 A10 这类缺陷永远测不出）
+    ev_clean = ctx.run([ctx.python, "-m", "kfpa", "--help"], clean_env=True)
+    blob_clean = ev_clean["stdout"] + ev_clean["stderr"]
+    c.add(cmd=ev_clean["cmd"] + "    [clean-env: 未设 PYTHONIOENCODING/PYTHONUTF8]",
+          rc=ev_clean["rc"], stdout=ev_clean["stdout"], stderr=ev_clean["stderr"],
+          ok=ev_clean["rc"] == EXIT_PASS and "UnicodeEncodeError" not in blob_clean,
+          note="R-18：重定向且不设 PYTHONIOENCODING 时 --help 也不得编码崩")
+    if ev_clean["rc"] != EXIT_PASS or "UnicodeEncodeError" in blob_clean:
+        c.fail(f"R-18：不设 PYTHONIOENCODING 时 `--help` rc={ev_clean['rc']}"
+               f"{'（UnicodeEncodeError）' if 'UnicodeEncodeError' in blob_clean else ''}"
+               "—— 中文输出必须由 cli.main() 兜底 reconfigure 成 UTF-8。")
+
 
 # ------------------------------------------------------------------ A2
 
@@ -345,7 +366,7 @@ def check_a2(ctx: Ctx, c: Check) -> None:
             c.add(ok=ok, note=f"D1-9 表 `{t}` 存在" + ("" if ok else f" —— 缺失；实际 = {sorted(tables)}"))
             if not ok:
                 c.fail(f"SQLite 缺表 `{t}`（D1-9）。")
-        for t, minimum in (("rounds", 1), ("tickets", 1), ("task_packages", 1),
+        for t, minimum in (("meta", 1), ("rounds", 1), ("tickets", 1), ("task_packages", 1),
                            ("gate_reports", 1), ("snapshots", 1)):
             n = counts.get(t, -1)
             c.add(ok=n >= minimum, note=f"表 `{t}` 行数 = {n}（要求 >= {minimum}）")
@@ -970,6 +991,18 @@ def check_a7(ctx: Ctx, c: Check) -> None:
     c.add(ok=tid in blob, note=f"列表含票号 {tid}")
     if tid not in blob:
         c.fail(f"D1-8/A7：台账列表未列出票号 {tid}。")
+    # R-18：这一遍不设 PYTHONIOENCODING / PYTHONUTF8
+    evq = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--db", str(db)],
+                  clean_env=True)
+    blobq = evq["stdout"] + evq["stderr"]
+    c.add(cmd=evq["cmd"] + "    [clean-env: 未设 PYTHONIOENCODING/PYTHONUTF8]",
+          rc=evq["rc"], stdout=evq["stdout"], stderr=evq["stderr"],
+          ok=evq["rc"] == EXIT_PASS and "UnicodeEncodeError" not in blobq and tid in blobq,
+          note="R-18/R-18.4：台账在重定向且不设 PYTHONIOENCODING 时也要能正常输出中文")
+    if evq["rc"] != EXIT_PASS or "UnicodeEncodeError" in blobq or tid not in blobq:
+        c.fail(f"R-18：不设 PYTHONIOENCODING 时 `tickets list` rc={evq['rc']}、"
+               f"含票号={tid in blobq}"
+               f"{'（UnicodeEncodeError）' if 'UnicodeEncodeError' in blobq else ''}。")
     low = blob.lower()
     for label, keys in (("影响面", ("high", "medium", "low", "高", "中", "低")),
                         ("状态", ("open", "closed", "dropped", "未关闭", "已关闭")),
@@ -1307,6 +1340,75 @@ print(json.dumps(out, ensure_ascii=False))
         c.fail("R-7②：包装后的异常消息未提示 `--provider mock`。")
 
 
+# ------------------------------------------------------------------ A10
+
+
+def check_a10(ctx: Ctx, c: Check) -> None:
+    """R-18：stdout 被重定向（非 UTF-8 locale）且**不设** PYTHONIOENCODING / PYTHONUTF8 时，
+    `--help` / `init` / `tickets list` / `round --json` 都不得编码崩溃，rc 符合 D1-5。"""
+    print(f"   [A10] 台架自身 env：PYTHONIOENCODING={os.environ.get('PYTHONIOENCODING')!r}、"
+          f"PYTHONUTF8={os.environ.get('PYTHONUTF8')!r}（子进程这一遍两个都不传）")
+
+    db = ctx.fresh_db("a10")
+    # ① --help
+    ev = ctx.run([ctx.python, "-m", "kfpa", "--help"], clean_env=True)
+    blob = ev["stdout"] + ev["stderr"]
+    c.add(cmd=ev["cmd"] + "    [clean-env]", rc=ev["rc"], stdout=ev["stdout"],
+          stderr=ev["stderr"],
+          ok=ev["rc"] == EXIT_PASS and "UnicodeEncodeError" not in blob,
+          note="R-18：--help 期望 rc=0（D1-5）且无 UnicodeEncodeError")
+    if ev["rc"] != EXIT_PASS or "UnicodeEncodeError" in blob:
+        c.fail(f"R-18：`--help` rc={ev['rc']}，输出含 UnicodeEncodeError="
+               f"{'UnicodeEncodeError' in blob}。")
+    c.add(ok=cjk(ev["stdout"]),
+          note="R-18：stdout 能按 UTF-8 解出中文（说明兜底 reconfigure 生效，而不是 errors=replace 掩盖）")
+    if not cjk(ev["stdout"]):
+        c.fail("R-18：`--help` 的 stdout 解不出中文 —— 兜底没写，或被 errors=replace 掩盖成乱码。")
+
+    # ② init
+    ev2 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)], clean_env=True)
+    blob2 = ev2["stdout"] + ev2["stderr"]
+    c.add(cmd=ev2["cmd"] + "    [clean-env]", rc=ev2["rc"], stdout=ev2["stdout"],
+          stderr=ev2["stderr"],
+          ok=ev2["rc"] == EXIT_PASS and "UnicodeEncodeError" not in blob2,
+          note="R-18：init 期望 rc=0（D1-5）")
+
+    # ③ tickets list（先造票，保证有中文输出）
+    store_mod, serr = import_mod("kfpa.store")
+    if store_mod is None:
+        c.add(ok=False, note=f"import kfpa.store 失败：{serr}")
+        c.fail("A10：无法准备票数据。")
+        return
+    try:
+        seed_ticket(store_mod, db, ticket_id="R1-941", round_no=1, impact="MEDIUM")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"造票失败：{type(exc).__name__}: {exc}")
+        c.fail("A10：无法准备票数据。")
+        return
+    ev3 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--db", str(db)], clean_env=True)
+    blob3 = ev3["stdout"] + ev3["stderr"]
+    c.add(cmd=ev3["cmd"] + "    [clean-env]", rc=ev3["rc"], stdout=ev3["stdout"],
+          stderr=ev3["stderr"],
+          ok=ev3["rc"] == EXIT_PASS and "UnicodeEncodeError" not in blob3,
+          note="R-18：tickets list 期望 rc=0（D1-5）")
+
+    # ④ round --json（dumps(ensure_ascii=False) 直出中文 + 中文阶段日志）
+    ev4 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                   "--round", "1", "--dry-run", "--json", "--db", str(db),
+                   "--workdir", str(ctx.tmp / "a10-work")], clean_env=True)
+    blob4 = ev4["stdout"] + ev4["stderr"]
+    c.add(cmd=ev4["cmd"] + "    [clean-env]", rc=ev4["rc"], stdout=ev4["stdout"],
+          stderr=ev4["stderr"],
+          ok=ev4["rc"] in (EXIT_PASS, EXIT_NEEDS_FIX, EXIT_BLOCKED, EXIT_CONFIRM)
+             and "UnicodeEncodeError" not in blob4,
+          note="R-18：round --json 的 rc 必须符合 D1-5（0/10/11/3 均可，不得是编码崩溃的 1）")
+    if ev4["rc"] == 1 or "UnicodeEncodeError" in blob4:
+        c.fail(f"R-18：`round --json` rc={ev4['rc']}，疑似编码崩溃"
+               f"（含 UnicodeEncodeError={'UnicodeEncodeError' in blob4}）。")
+    c.add(ok=last_json_line(ev4["stdout"]) is not None,
+          note="R-18：clean-env 下 `--json` 末行仍是可解析的 RoundResult（中文 JSON 没崩）")
+
+
 # ------------------------------------------------------------------ 报告
 
 
@@ -1354,6 +1456,8 @@ CHECKS = [
      "p0-plan §4/A8、D1-12", check_a8),
     ("A9", "LiteLLM 适配器异常统一包装为中文 RuntimeError 且提示 --provider mock", "磐石",
      "p0-rulings R-7", check_a9),
+    ("A10", "中文输出健壮性：重定向且不设 PYTHONIOENCODING 时 --help/init/tickets list/round --json 不崩", "磐石+界面",
+     "p0-rulings R-18", check_a10),
 ]
 
 
