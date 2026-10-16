@@ -525,8 +525,91 @@ def _fastlane_rows(db: Path) -> list[dict]:
 # ------------------------------------------------------------------ A23
 
 
+def _r34_fastlane_owner(ctx: Ctx, c: Check) -> None:
+    """R-34 判据（三）：`kfpa/fastlane.py` 是 `fastlane` 组唯一 owner，`check` 未失效。
+
+    单独拿出来、放在 `_cli_ready` 之前跑：组整个不在时也要看得见（而不是被早退吞掉）。
+    """
+    help_ev = ctx.cli("fastlane", "--help")
+    text = (help_ev["stdout"] or "") + (help_ev["stderr"] or "")
+    need = ("check", "plan", "list", "ack", "batch-ack", "show")
+    missing = [x for x in need if x not in text]
+    c.add(cmd=help_ev["cmd"], rc=help_ev["rc"], stdout=help_ev["stdout"][:600],
+          stderr=help_ev["stderr"][:400], ok=help_ev["rc"] == EXIT_PASS and not missing,
+          note=f"R-34：`kfpa fastlane --help` 子命令齐（缺 {missing or '无'}）；owner 归 `kfpa/fastlane.py`")
+    if help_ev["rc"] != EXIT_PASS:
+        c.fail("R-34：`kfpa fastlane` 组不可用 → 磐石 `cli.py` 清单（`kfpa.fastlane`）+ 长流 `register()`。")
+        return
+    if missing:
+        c.fail(f"R-34：`fastlane` 组缺子命令 {missing}（唯一 owner 收口后 `check` 必须一并由它注册）。")
+
+    chk = ctx.cli("fastlane", "check", "--help")
+    c.add(cmd=chk["cmd"], rc=chk["rc"], stdout=chk["stdout"][:400], stderr=chk["stderr"][:400],
+          ok=chk["rc"] == EXIT_PASS,
+          note="R-34：`fastlane check` 换 owner 后仍可用（行为一致性由 A0 内嵌的 verify_p1 断）")
+    if chk["rc"] != EXIT_PASS:
+        c.fail("R-34：`kfpa fastlane check` 挂了 —— 换 owner 不许把 P1 的 `check` 弄丢（R-24.1）。")
+
+    imp = ctx.cli("impact", "--help")
+    c.add(cmd=imp["cmd"], rc=imp["rc"], ok=imp["rc"] != EXIT_PASS,
+          note=f"R-34：`kfpa impact` 组不存在（rc={imp['rc']}）—— 注：这条在收口前就成立，"
+               "因为 `impact.py` 注册的组名本来就是 `fastlane`，真正的判据见下一条")
+    if imp["rc"] == EXIT_PASS:
+        c.fail("R-34：`kfpa impact` 组存在 —— 与 R-34 的唯一 owner 收口不符。")
+
+    # 非空断：直接问 `kfpa.impact.register()` 还会不会抢注 `fastlane` 组（真能证伪的那条）
+    probe = (
+        "import argparse\n"
+        "from kfpa import impact\n"
+        "p = argparse.ArgumentParser(prog='kfpa')\n"
+        "sub = p.add_subparsers(dest='cmd')\n"
+        "impact.register(sub)\n"
+        "print('REGISTERED:' + ','.join(sorted(sub.choices)))\n"
+    )
+    ev = ctx.run([ctx.python, "-c", probe], timeout=60)
+    registered = ""
+    for line in (ev["stdout"] or "").splitlines():
+        if line.startswith("REGISTERED:"):
+            registered = line.split(":", 1)[1].strip()
+    hijack = "fastlane" in [x for x in registered.split(",") if x]
+    c.add(cmd="python -c <impact.register 抢注探针>", rc=ev["rc"], stdout=ev["stdout"],
+          stderr=ev["stderr"], ok=ev["rc"] == 0 and not hijack,
+          note=f"R-34：`kfpa.impact.register()` 抢注子命令 = {registered or '（无）'}"
+               f"；抢注 `fastlane` = {hijack}（期望 False，`analyze()` 保留为库函数）")
+    if ev["rc"] != 0:
+        c.fail(f"R-34：抢注探针跑不起来（rc={ev['rc']}）—— `kfpa.impact` 应仍可导入。")
+    elif hijack:
+        c.fail("R-34：`kfpa.impact.register()` 仍在 `add_parser('fastlane')` —— "
+               "唯一 owner 必须归 `kfpa/fastlane.py`，否则两组撞名会整组消失。")
+
+
+def _r34_acks_schema(ctx: Ctx, c: Check, db: Path) -> None:
+    """R-34 判据（二）：`acks.yaml` 冻结 `acks: [{request_id, note?}]`；坏形状 → rc=2 + 中文。"""
+    cases = {
+        "缺 `acks` 键": "note: 只有备注，没有 acks\n",
+        "元素缺 `request_id`": "acks:\n  - note: 只有备注没有 id\n",
+        "`acks` 不是列表": "acks: fl-1-1\n",
+    }
+    for i, (label, text) in enumerate(cases.items()):
+        bad = ctx.tmp / f"acks_bad_{i}.yaml"
+        bad.write_text(text, encoding="utf-8")
+        ev = ctx.cli("fastlane", "batch-ack", "--file", str(bad), "--by", "verify", db=db)
+        blob = (ev["stdout"] or "") + (ev["stderr"] or "")
+        c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"][:400], stderr=ev["stderr"][:400],
+              ok=ev["rc"] == EXIT_USAGE and cjk(blob),
+              note=f"R-34：acks.yaml「{label}」→ rc={ev['rc']}（期望 {EXIT_USAGE}=用法错误）+ 中文")
+        if ev["rc"] != EXIT_USAGE:
+            c.fail(f"R-34：acks.yaml「{label}」应 rc={EXIT_USAGE}（用法错误），实际 {ev['rc']}"
+                   " —— 不许静默跳过或补行。")
+        elif not cjk(blob):
+            c.fail(f"R-34：acks.yaml「{label}」报错没有中文提示（R-18 口径）。")
+        if "Traceback" in blob:
+            c.fail(f"R-34：acks.yaml「{label}」抛裸栈（应中文 + rc=2）。")
+
+
 def check_a23(ctx: Ctx, c: Check) -> None:
     """A23：快车道登记 → 承认落库；幂等；batch_id 同批共享；ESCALATED/REJECTED 不可翻白。"""
+    _r34_fastlane_owner(ctx, c)
     if not _cli_ready(ctx, c, "fastlane"):
         return
     if not _sub_ready(ctx, c, "fastlane", "plan", "list", "ack", "batch-ack", "show"):
@@ -553,6 +636,9 @@ def check_a23(ctx: Ctx, c: Check) -> None:
         c.fail("A23：plan 之后表里没有行 → 登记没落库。")
         return
     first = rows[0]
+
+    # R-34：acks.yaml 冻结形状先断（坏输入不许被静默吞掉），再走正常承认流程
+    _r34_acks_schema(ctx, c, db)
 
     ack = ctx.cli("fastlane", "ack", first["request_id"], "--by", "reviewer", db=db)
     c.add(cmd=ack["cmd"], rc=ack["rc"], stdout=ack["stdout"], stderr=ack["stderr"],
