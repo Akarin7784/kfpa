@@ -1,13 +1,15 @@
-"""SQLite 状态库（docs/dev/p0-plan.md §3.2；DDL 严格照 docs/dev/p0-design-addendum.md D1-9）。
+"""SQLite 状态库（P0 §3.2 + D1-9；P1 增量见 docs/dev/p1-plan.md §3.2）。
 
-表：`meta` + 六张业务表 —— rounds / tickets / task_packages / gate_reports / failures / snapshots。
+表：`meta` + P0 六张业务表（rounds / tickets / task_packages / gate_reports / failures / snapshots）
+    + P1 两张（ledger / knowledge）。
 
 设计要点：
 - 只用标准库 `sqlite3`；`db_path=":memory:"` 必须可用（镜鉴的用例靠它隔离）。
 - JSON 字段一律走 `schemas.dumps`（sort_keys，稳定可复算）；时间戳一律 Unix epoch 秒（UTC）。
-- `meta.schema_version = "1"`（D1-9）。
-- **不做业务判定**：门禁三态、硬规则（未关闭高影响票）都不在这里判，本模块只忠实读写。
-- 所有写操作立即 commit；`Store` 可作上下文管理器，也能手动 `close()`。
+- `meta.schema_version = "2"`（P1；P0 时为 "1"，见 P0_SCHEMA_VERSION）。
+- **不做业务判定**：门禁三态、硬规则（未关闭高影响票）、沉淀闸门判据都不在这里判，本模块只忠实读写。
+- 所有写操作立即 commit；实例可作上下文管理器，也能手动 `close()`。
+- 类名 `SqliteStore`；`kfpa.store.Store` 仍是它的别名（P0 契约 `Store(path)` 不破）。
 """
 
 from __future__ import annotations
@@ -18,12 +20,15 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import schemas
-from .schemas import (
+from .. import schemas
+from ..schemas import (
     AcceptanceCriterion,
+    CandidateStatus,
     FailureRecord,
     GateReport,
     GateState,
+    KnowledgeCandidate,
+    LedgerEntry,
     QATicket,
     Round,
     RoundState,
@@ -35,13 +40,21 @@ from .schemas import (
     package_hash,
 )
 
-#: D1-9 的 schema 版本（写入 meta.schema_version）
-SCHEMA_VERSION = "1"
+
+def _enum_value(value: Any) -> str:
+    """str/Enum 统一成入库用的裸字符串（CandidateStatus 是 str Enum）。"""
+    return str(value.value) if hasattr(value, "value") else str(value)
+
+#: 当前 schema 版本（P1 = "2"，写入 meta.schema_version）
+SCHEMA_VERSION = "2"
+
+#: P0 时代的 schema 版本（历史记录/兼容判定用）
+P0_SCHEMA_VERSION = "1"
 
 #: D1-9 的 meta 表名
 META_TABLE = "meta"
 
-#: D1-9 的六张业务表
+#: D1-9 的六张 P0 业务表（数量断言沿用 P0 台架，不要往里塞 P1 表）
 BUSINESS_TABLES = (
     "rounds",
     "tickets",
@@ -51,8 +64,14 @@ BUSINESS_TABLES = (
     "snapshots",
 )
 
-#: 建库后的完整表集合（含 meta），镜鉴可直接断言
+#: P1 新增的两张业务表（docs/dev/p1-plan.md §3.2）
+P1_TABLE_NAMES = ("ledger", "knowledge")
+
+#: P0 建库后的表集合（含 meta）——P0 台架 selfcheck_core 依赖此常量
 TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES)
+
+#: P1 建库后的完整表集合（含 meta）
+ALL_TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES, *P1_TABLE_NAMES)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -122,6 +141,32 @@ CREATE TABLE IF NOT EXISTS snapshots (
     tag          TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL
 );
+
+-- ------------------------------------------------------------ P1（D3 §3.2）
+CREATE TABLE IF NOT EXISTS ledger (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_no   INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    model_ref  TEXT NOT NULL DEFAULT '',
+    tokens_in  INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    cost       REAL NOT NULL DEFAULT 0.0,
+    source     TEXT NOT NULL DEFAULT 'mock',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ledger_round ON ledger(round_no, role);
+
+CREATE TABLE IF NOT EXISTS knowledge (
+    cid        TEXT PRIMARY KEY,
+    round_no   INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    status     TEXT NOT NULL,
+    reused_by  TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_knowledge_status ON knowledge(status, round_no);
 """
 
 
@@ -160,8 +205,8 @@ def _package_from_payload(round_no: int, payload: str) -> TaskPackage:
     )
 
 
-class Store:
-    """SQLite 持久化门面（签名见契约 §3.2，一个不多一个不少；表名照 D1-9）。"""
+class SqliteStore:
+    """SQLite 持久化门面（P0 §3.2 的 18 个签名 + P1 的 7 个；DDL 见 D1-9 / D3 §3.2）。"""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
@@ -174,10 +219,15 @@ class Store:
     # ------------------------------------------------------------ 生命周期
 
     def init_schema(self) -> None:
-        """建库建表（幂等）+ 写 `meta.schema_version`（D1-9）。"""
+        """建库建表（幂等）+ 把 `meta.schema_version` 升到当前版本。
+
+        DDL 全是 `IF NOT EXISTS`，所以 P0 的旧库（schema_version="1"）直接原地升到 "2"：
+        建出 ledger / knowledge 两张新表，版本号一并更新，不需要单独迁移脚本。
+        """
         self._conn.executescript(SCHEMA_SQL)
         self._conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (SCHEMA_VERSION,),
         )
         self._conn.commit()
@@ -189,7 +239,7 @@ class Store:
         except sqlite3.ProgrammingError:  # pragma: no cover - 重复 close
             pass
 
-    def __enter__(self) -> "Store":
+    def __enter__(self) -> "SqliteStore":
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -415,7 +465,7 @@ class Store:
                 getattr(report, "reason_key", "") or "",
                 dumps(list(report.reasons)),
                 dumps(list(report.failing_criteria)),
-                1 if report.escalated else 0,
+                bool(report.escalated),
                 report.same_reason_count,
                 report.created_at or time.time(),
             ),
@@ -543,13 +593,155 @@ class Store:
             for r in rows
         ]
 
+    # ------------------------------------------------------------ P1 token 账本（D3 §3.2 / §3.4）
+
+    def add_ledger_entry(self, entry: LedgerEntry) -> None:
+        """追加一条 token 账目（只落库，不做任何统计/判定）。"""
+        self._conn.execute(
+            """
+            INSERT INTO ledger(round_no, role, model_ref, tokens_in, tokens_out,
+                               cost, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.round_no,
+                entry.role,
+                entry.model_ref,
+                int(entry.tokens_in),
+                int(entry.tokens_out),
+                float(entry.cost),
+                entry.source,
+                entry.created_at or time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def list_ledger(self, round_no: Optional[int] = None) -> list[LedgerEntry]:
+        """按轮次列账目（None = 全部），按 round_no、id 排序。"""
+        if round_no is None:
+            rows = self._conn.execute("SELECT * FROM ledger ORDER BY round_no, id").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM ledger WHERE round_no = ? ORDER BY id", (round_no,)
+            ).fetchall()
+        return [
+            LedgerEntry(
+                round_no=r["round_no"],
+                role=r["role"],
+                model_ref=r["model_ref"],
+                tokens_in=r["tokens_in"],
+                tokens_out=r["tokens_out"],
+                cost=r["cost"],
+                source=r["source"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------ P1 知识沉淀（D3 §3.2 / §3.5）
+
+    def add_candidate(self, c: KnowledgeCandidate) -> None:
+        """新增沉淀候选；同 cid 覆盖（幂等重跑）。"""
+        self._conn.execute(
+            """
+            INSERT INTO knowledge(cid, round_no, kind, content, confidence, status, reused_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cid) DO UPDATE SET
+                round_no   = excluded.round_no,
+                kind       = excluded.kind,
+                content    = excluded.content,
+                confidence = excluded.confidence,
+                status     = excluded.status,
+                reused_by  = excluded.reused_by,
+                created_at = excluded.created_at
+            """,
+            (
+                c.cid,
+                c.round_no,
+                c.kind,
+                c.content,
+                float(c.confidence),
+                _enum_value(c.status),
+                dumps(list(c.reused_by)),
+                c.created_at or time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_candidate(self, cid: str) -> Optional[KnowledgeCandidate]:
+        row = self._conn.execute("SELECT * FROM knowledge WHERE cid = ?", (cid,)).fetchone()
+        return None if row is None else _candidate_from_row(row)
+
+    def list_candidates(self, status: Optional[str] = None) -> list[KnowledgeCandidate]:
+        """按状态列候选（None = 全部），按 created_at、cid 排序。
+
+        `status` 接受裸字符串或 `CandidateStatus`（str Enum），两者等价。
+        """
+        if status is None:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge ORDER BY created_at, cid"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge WHERE status = ? ORDER BY created_at, cid",
+                (_enum_value(status),),
+            ).fetchall()
+        return [_candidate_from_row(r) for r in rows]
+
+    def promote_candidate(self, cid: str, reused_by_round: int) -> KnowledgeCandidate:
+        """转正：追加一次成功轮复用并置 `status=promoted`。cid 不存在 → KeyError（中文）。"""
+        candidate = self.get_candidate(cid)
+        if candidate is None:
+            raise KeyError(f"沉淀候选不存在：{cid}")
+        reused = list(candidate.reused_by)
+        if reused_by_round not in reused:
+            reused.append(reused_by_round)
+        self._conn.execute(
+            "UPDATE knowledge SET status = ?, reused_by = ? WHERE cid = ?",
+            ("promoted", dumps(reused), cid),
+        )
+        self._conn.commit()
+        return self.get_candidate(cid)  # type: ignore[return-value]
+
+    def drop_candidate(self, cid: str, reason: str) -> None:
+        """丢弃候选（`status=dropped`）；cid 不存在 → KeyError（中文）。
+
+        `reason` 只进调用方日志，P0/P1 的 knowledge 表不存该列（DDL 见 D3 未定义），
+        避免为了日志字段擅自扩表——需要落库时请先让 Chief 裁。
+        """
+        if self.get_candidate(cid) is None:
+            raise KeyError(f"沉淀候选不存在：{cid}")
+        self._conn.execute("UPDATE knowledge SET status = ? WHERE cid = ?", ("dropped", cid))
+        self._conn.commit()
+
+
+def _candidate_from_row(row: sqlite3.Row) -> KnowledgeCandidate:
+    raw = row["reused_by"]
+    try:
+        reused = [int(x) for x in json.loads(raw)] if raw else []
+    except (TypeError, ValueError):
+        reused = []
+    return KnowledgeCandidate(
+        cid=row["cid"],
+        round_no=row["round_no"],
+        kind=row["kind"],
+        content=row["content"],
+        confidence=row["confidence"],
+        status=CandidateStatus(row["status"]),
+        reused_by=reused,
+        created_at=row["created_at"],
+    )
+
 
 __all__ = [
-    "Store",
+    "SqliteStore",
     "SCHEMA_SQL",
     "SCHEMA_VERSION",
+    "P0_SCHEMA_VERSION",
     "TABLE_NAMES",
+    "ALL_TABLE_NAMES",
     "BUSINESS_TABLES",
+    "P1_TABLE_NAMES",
     "META_TABLE",
     "schemas",
 ]

@@ -18,7 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 惰性导入的可选适配器（D1-0 / D1-5 退出码 4）：缺包必须中文报错，不崩。
+# 惰性导入的可选适配器 / P1 驱动（缺包必须中文报错，不崩；D3 §5）
+pg = ["psycopg[binary]>=3.2"]                # P1 A12 双库对拍
+cov = ["coverage>=7.0", "pytest-cov>=5.0"]   # P1 A14 G7 覆盖率门槛
 exec = ["aider-chat"]
 ui = ["streamlit"]
 dev = ["pytest"]

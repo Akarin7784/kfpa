@@ -1,0 +1,33 @@
+# KFPA P1：PostgreSQL 16（D3 §1.5 / §5）
+# 端口固定 55432:5432 —— 不占用本机 5432（D3 明确要求）。
+# 用法：
+#   docker compose -f docker-compose.pg.yml up -d
+#   KFPA_DB_URL=postgresql://kfpa:kfpa@127.0.0.1:55432/kfpa python -m kfpa init
+#   docker compose -f docker-compose.pg.yml down          # 停容器、保留数据卷
+#   docker compose -f docker-compose.pg.yml down -v       # 连数据卷一起删（成员勿自行执行，D3 §1.4）
+services:
+  pg:
+    image: postgres:16-alpine
+    container_name: kfpa-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kfpa
+      POSTGRES_PASSWORD: kfpa
+      POSTGRES_DB: kfpa
+      # 保证按 UTF-8 / C 排序初始化，避免不同宿主机排序规则差异影响对拍
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 默认 55432（D3 §1.5）。本机若已被别的项目占用，用环境变量覆盖即可，
+      # 例如：$env:KFPA_PG_PORT="55435"; docker compose -f docker-compose.pg.yml up -d
+      - "${KFPA_PG_PORT:-55432}:5432"
+    healthcheck:
+      # pg_isready 通过后 up -d 才能视为「可用」，A12 对拍前先等健康
+      test: ["CMD-SHELL", "pg_isready -U kfpa -d kfpa -h 127.0.0.1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - kfpa-pg-data:/var/lib/postgresql/data
+
+volumes:
+  kfpa-pg-data:
