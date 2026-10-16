@@ -1,0 +1,48 @@
+{
+  "metrics": {
+    "corpus": "benchmarks/review/seed.jsonl (demo 合成样本)",
+    "total": 4,
+    "missed": 1,
+    "false_alarms": 1,
+    "agreement": 0.75,
+    "baseline_missed": 2,
+    "baseline_false_alarms": 1,
+    "baseline_agreement": 0.5
+  },
+  "samples": [
+    {
+      "id": "S001",
+      "feature": "order-atp",
+      "human_verdict": "fail",
+      "verdict": "pass",
+      "baseline_verdict": "pass",
+      "injected_defects": [
+        {"criterion": "AC2", "location": "段4 接口契约", "kind": "missing_error_code"}
+      ]
+    },
+    {
+      "id": "S002",
+      "feature": "stock-lock",
+      "human_verdict": "pass",
+      "verdict": "fail",
+      "baseline_verdict": "pass",
+      "injected_defects": []
+    },
+    {
+      "id": "S003",
+      "feature": "picking",
+      "human_verdict": "fail",
+      "verdict": "fail",
+      "baseline_verdict": "fail",
+      "injected_defects": [{"criterion": "AC1", "kind": "wrong_unit"}]
+    },
+    {
+      "id": "S004",
+      "feature": "delivery",
+      "human_verdict": "pass",
+      "verdict": "pass",
+      "baseline_verdict": "pass",
+      "injected_defects": []
+    }
+  ]
+}
