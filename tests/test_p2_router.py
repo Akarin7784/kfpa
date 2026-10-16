@@ -164,9 +164,12 @@ def test_build_llm_forced_provider_and_unknown_rejected(roles):
 
 def test_store_schema_version_is_p2_and_reviews_table_exists():
     store = st.Store(":memory:")
-    assert st.SCHEMA_VERSION == st.P2_SCHEMA_VERSION == "3"
+    # P3（D5-3.1）把 schema 升到 4：P2 常量作为历史仍是 "3"，当前版本跟 P3 走（R-20/R-21 同批同步）。
+    assert st.SCHEMA_VERSION == st.P3_SCHEMA_VERSION == "4"
+    assert st.P2_SCHEMA_VERSION == "3"
     assert set(st.ALL_TABLE_NAMES) <= set(store.list_tables())
     assert st.P2_TABLE_NAMES == ("reviews",)
+    assert st.P3_TABLE_NAMES == ("fastlane_requests", "knowledge_samples")
     assert "reviews" in store.list_tables()
 
 

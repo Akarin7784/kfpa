@@ -152,18 +152,20 @@ def test_coverage_json_is_loaded_and_participates_in_g7(tmp_path, capsys):
     assert rc == cli.EXIT_PASS, f"rc={rc} stderr={err[-300:]}"
 
 
-def test_unusable_coverage_json_returns_4_and_documents_dead_branch(tmp_path, capsys):
-    """256-261 是**死分支**：`GatesError` 继承 `RuntimeError`，`except (OSError, ValueError)` 抓不到，
-    所以那段「覆盖率报告不可用 → 退出码 4」的中文永远不会打印，异常落到 274-289。
+def test_unusable_coverage_json_returns_4_with_dedicated_hint(tmp_path, capsys):
+    """256-261 的专用提示：D5 §5 清偿 #51 报的死分支（`GatesError` 必须被 except 捕获）。
 
-    #48 之后 `RuntimeError` 一律归 4，于是**退出码正好与提示一致（4）**，只有那段中文没了。
-    这里钉住 4（与 R-31/#48 的语义一致，不依赖死分支是否被修）。
+    修前：`GatesError` 继承 `RuntimeError`，`except (OSError, ValueError)` 抓不到，
+    那段「覆盖率报告不可用 → 退出码 4」的中文永远不打印，异常落到通用路径。
+    修后：`GatesError` 加进 except —— 本用例证明**该中文真的打印**且 rc 仍是 4。
     """
     db = _init_db(tmp_path)
     rc, _out, err = _run(capsys, _round_argv(db, tmp_path / "w8",
                                              "--coverage-json", str(tmp_path / "nope.json")))
     assert rc == cli.EXIT_DEP_MISSING
-    assert "轮次执行失败" in err          # 走的是通用异常路径，不是 256-261 的专用提示
+    assert "覆盖率报告不可用" in err        # 专用提示（死分支已清偿）
+    assert "退出码 4" in err
+    assert "轮次执行失败" not in err        # 不再落到通用异常路径
 
 
 def test_round_exception_runtime_error_maps_to_4(tmp_path, capsys, monkeypatch):

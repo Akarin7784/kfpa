@@ -184,11 +184,17 @@ def files_from_workdir(round_no: int, workdir: str | None = None) -> list[str]:
     return [str(f) for f in files if str(f).strip()]
 
 
-def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
-    """注册 `kfpa fastlane check --round N [--files a,b] [--workdir DIR] [--json]`（D3-3.6 / R-23.2）。"""
-    parser = subparsers.add_parser("fastlane", help="快车道影响分析（D3-3.6）")
-    sub = parser.add_subparsers(dest="fastlane_cmd", required=True)
-    check = sub.add_parser("check", help="对某轮任务包做三判据影响分析")
+def register_check(sub) -> None:
+    """把 `check` 子命令注册进**调用方给的** `fastlane` 组（R-34：组的唯一 owner 是 `kfpa.fastlane`）。
+
+    形参是 `fastlane` 组的 sub-action（`group.add_subparsers(...)` 的返回值），**不是根 subparsers**：
+    本模块从此不碰「组」本身，只提供 `check` 的 argparse 与处理器，由 `kfpa.fastlane.register()`
+    在同一笔里把它挂进自己建的组 —— 于是「组换手」不会出现一帧 `check` 消失的红窗。
+
+    `kfpa.impact.analyze()` / `files_from_workdir()` 仍是库函数，行为与 P1 一致（A16 口径不变：
+    退出码固定 0 = 成功输出判定，`fast_lane=False` 只打「升级回完整设计回合」）。
+    """
+    check = sub.add_parser("check", help="对某轮任务包做三判据影响分析（R-23.2 / D3-3.6）")
     check.add_argument("--round", dest="round_no", type=int, required=True)
     check.add_argument("--db", default="kfpa.db")
     check.add_argument("--files", default=None, help="逗号分隔的改动文件清单（R-23.2 来源②；无执行结果时的预判）")
@@ -235,6 +241,16 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
     check.set_defaults(handler=_run, func=_run)
 
 
+def register(subparsers) -> None:  # pragma: no cover - 兼容旧调用
+    """**R-34 之后为空操作**：`fastlane` 组的唯一 owner 是 `kfpa.fastlane`（`check` 也由它注册）。
+
+    保留本函数只为兼容「进程内 `kfpa.impact.register(sub)`」这类旧调用与验收探针不炸；
+    它**不注册任何组、任何子命令** —— 一个组被两个模块抢注，正是 R-34 要消灭的形态。
+    需要 `check` 的调用方请用 :func:`register_check`（挂进自己建的组）。
+    """
+    return None
+
+
 __all__ = [
     "CONTRACT_DELTA_MARKS",
     "DATA_MODEL_FILES",
@@ -246,4 +262,5 @@ __all__ = [
     "analyze",
     "files_from_workdir",
     "register",
+    "register_check",
 ]

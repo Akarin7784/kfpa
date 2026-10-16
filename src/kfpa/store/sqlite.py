@@ -1,12 +1,12 @@
 """SQLite 状态库（P0 §3.2 + D1-9；P1 增量见 docs/dev/p1-plan.md §3.2）。
 
 表：`meta` + P0 六张业务表（rounds / tickets / task_packages / gate_reports / failures / snapshots）
-    + P1 两张（ledger / knowledge）。
+    + P1 两张（ledger / knowledge）+ P2 一张（reviews）+ P3 两张（fastlane_requests / knowledge_samples）。
 
 设计要点：
 - 只用标准库 `sqlite3`；`db_path=":memory:"` 必须可用（镜鉴的用例靠它隔离）。
 - JSON 字段一律走 `schemas.dumps`（sort_keys，稳定可复算）；时间戳一律 Unix epoch 秒（UTC）。
-- `meta.schema_version = "2"`（P1；P0 时为 "1"，见 P0_SCHEMA_VERSION）。
+- `meta.schema_version = "4"`（P3；P0 为 "1"、P1 为 "2"、P2 为 "3"，见各 P*_SCHEMA_VERSION 常量）。
 - **不做业务判定**：门禁三态、硬规则（未关闭高影响票）、沉淀闸门判据都不在这里判，本模块只忠实读写。
 - 所有写操作立即 commit；实例可作上下文管理器，也能手动 `close()`。
 - 类名 `SqliteStore`；`kfpa.store.Store` 仍是它的别名（P0 契约 `Store(path)` 不破）。
@@ -25,9 +25,12 @@ from ..schemas import (
     AcceptanceCriterion,
     CandidateStatus,
     FailureRecord,
+    FastlaneRequest,
+    FastlaneStatus,
     GateReport,
     GateState,
     KnowledgeCandidate,
+    KnowledgeSample,
     LedgerEntry,
     QATicket,
     ReviewFinding,
@@ -48,8 +51,8 @@ def _enum_value(value: Any) -> str:
     """str/Enum 统一成入库用的裸字符串（CandidateStatus 是 str Enum）。"""
     return str(value.value) if hasattr(value, "value") else str(value)
 
-#: 当前 schema 版本（P2 = "3"，写入 meta.schema_version）
-SCHEMA_VERSION = "3"
+#: 当前 schema 版本（P3 = "4"，写入 meta.schema_version）
+SCHEMA_VERSION = "4"
 
 #: P0 时代的 schema 版本（历史记录/兼容判定用）
 P0_SCHEMA_VERSION = "1"
@@ -57,9 +60,12 @@ P0_SCHEMA_VERSION = "1"
 #: P1 的 schema 版本
 P1_SCHEMA_VERSION = "2"
 
-#: P2 的 schema 版本（`SCHEMA_VERSION` 始终等于当前阶段的常量）
+#: P2 的 schema 版本（历史常量：`reviews` 表那一代）
 P2_SCHEMA_VERSION = "3"
-assert SCHEMA_VERSION == P2_SCHEMA_VERSION, "SCHEMA_VERSION 必须等于当前阶段的常量"
+
+#: P3 的 schema 版本（`SCHEMA_VERSION` 始终等于当前阶段的常量）
+P3_SCHEMA_VERSION = "4"
+assert SCHEMA_VERSION == P3_SCHEMA_VERSION, "SCHEMA_VERSION 必须等于当前阶段的常量"
 
 #: D1-9 的 meta 表名
 META_TABLE = "meta"
@@ -80,11 +86,20 @@ P1_TABLE_NAMES = ("ledger", "knowledge")
 #: P2 新增的表（docs/dev/p2-plan.md §3.3：评审留痕）
 P2_TABLE_NAMES = ("reviews",)
 
+#: P3 新增的表（docs/dev/p3-plan.md D5-3.2 / §3.3：快车道台账 + 抽检留痕）
+P3_TABLE_NAMES = ("fastlane_requests", "knowledge_samples")
+
 #: P0 建库后的表集合（含 meta）——P0 台架 selfcheck_core 依赖此常量
 TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES)
 
-#: 当前建库后的完整表集合（含 meta）——A12 对拍与 P1/P2 台架用这个
-ALL_TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES, *P1_TABLE_NAMES, *P2_TABLE_NAMES)
+#: 当前建库后的完整表集合（含 meta）——A12 对拍与 P1/P2/P3 台架用这个
+ALL_TABLE_NAMES = (
+    META_TABLE,
+    *BUSINESS_TABLES,
+    *P1_TABLE_NAMES,
+    *P2_TABLE_NAMES,
+    *P3_TABLE_NAMES,
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -195,6 +210,34 @@ CREATE TABLE IF NOT EXISTS reviews (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_reviews_round ON reviews(round_no, attempt);
+
+-- ------------------------------------------------------------ P3（D5-3.2 快车道台账 / D5-3.3 抽检留痕）
+-- 与 migrations/0003_fastlane.sql 同构（布尔 0/1、列表 JSON TEXT、时间戳 epoch 秒）。
+CREATE TABLE IF NOT EXISTS fastlane_requests (
+    request_id      TEXT PRIMARY KEY,
+    round_no        INTEGER NOT NULL,
+    summary         TEXT NOT NULL DEFAULT '',
+    diff_files      TEXT NOT NULL DEFAULT '[]',
+    new_interface   INTEGER NOT NULL DEFAULT 0,
+    new_data_model  INTEGER NOT NULL DEFAULT 0,
+    touched_modules TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    batch_id        TEXT NOT NULL DEFAULT '',
+    decided_by      TEXT NOT NULL DEFAULT '',
+    decided_at      REAL NOT NULL DEFAULT 0.0,
+    note            TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_fastlane_status ON fastlane_requests(status, round_no);
+
+CREATE TABLE IF NOT EXISTS knowledge_samples (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    cid        TEXT NOT NULL,
+    sampled_at REAL NOT NULL,
+    sampled_by TEXT NOT NULL DEFAULT '',
+    rate       REAL NOT NULL DEFAULT 0.0,
+    passed     INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS ix_ksamples_cid ON knowledge_samples(cid, sampled_at);
 """
 
 
@@ -778,6 +821,252 @@ class SqliteStore:
             ).fetchall()
         return [_review_from_row(r) for r in rows]
 
+    # ------------------------------------------------------------ P3 快车道落库（D5-3.2 / A23）
+
+    def add_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """登记/更新一条快车道请求（幂等：同 `request_id` 覆盖）。
+
+        **只在既有行仍是 `pending` 时覆盖**（`ON CONFLICT ... DO UPDATE ... WHERE`）：
+        已决行（approved/rejected/escalated）的 `status/batch_id/decided_by/decided_at` 是审计留痕，
+        重跑 `plan` 不许把它们改回 pending，也不许抹掉承认人。真要翻案必须新开请求（D5-3.2）。
+        """
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = excluded.round_no,
+                summary         = excluded.summary,
+                diff_files      = excluded.diff_files,
+                new_interface   = excluded.new_interface,
+                new_data_model  = excluded.new_data_model,
+                touched_modules = excluded.touched_modules,
+                status          = excluded.status,
+                batch_id        = excluded.batch_id,
+                decided_by      = excluded.decided_by,
+                decided_at      = excluded.decided_at,
+                note            = excluded.note
+            WHERE fastlane_requests.status = 'pending'
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
+    def get_fastlane_request(self, request_id: str) -> Optional[FastlaneRequest]:
+        row = self._conn.execute(
+            "SELECT * FROM fastlane_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        return None if row is None else _fastlane_from_row(row)
+
+    def update_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """整对象写回（长流 `fastlane._decide()` 的落库口）：**审计优先，拒绝翻案**。
+
+        - 行不存在 → 整条落库（`plan` 已登记过，这里当「保存」用，不新增异常路径）；
+        - 行已决（approved/rejected/escalated）：
+          - 传入状态与库里一致 → 返回库里那条（幂等，**不覆盖首次 `decided_by/decided_at`**）；
+          - 传入状态不同 → **返回库里那条，一个字段都不改**（`ESCALATED`/`REJECTED` 不许被翻成
+            `APPROVED`；要翻必须新开请求 —— D5-3.2 / A23，模块层 `fastlane.ack` 会抛 conflict）；
+        - 行仍 `pending` → 整条写回（正常状态迁移）。
+
+        与 :meth:`ack_fastlane_request` 的分工：那个是存储层的「单字段承认」便利口，
+        这个是模块层状态机把整条请求算完之后的写回口，两者的审计不变量一致。
+        """
+        current = self.get_fastlane_request(request.request_id)
+        if current is not None and _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = excluded.round_no,
+                summary         = excluded.summary,
+                diff_files      = excluded.diff_files,
+                new_interface   = excluded.new_interface,
+                new_data_model  = excluded.new_data_model,
+                touched_modules = excluded.touched_modules,
+                status          = excluded.status,
+                batch_id        = excluded.batch_id,
+                decided_by      = excluded.decided_by,
+                decided_at      = excluded.decided_at,
+                note            = excluded.note
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
+    def list_fastlane_requests(
+        self,
+        status: Optional[FastlaneStatus | str] = None,
+        round_no: Optional[int] = None,
+    ) -> list[FastlaneRequest]:
+        """列快车道请求（两个过滤条件可选），按 `round_no, request_id` 稳定排序。
+
+        `status` 接受 `FastlaneStatus` 或裸字符串（str Enum，两者等价）。
+        """
+        sql = "SELECT * FROM fastlane_requests"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(_enum_value(status))
+        if round_no is not None:
+            clauses.append("round_no = ?")
+            params.append(round_no)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY round_no, request_id"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_fastlane_from_row(r) for r in rows]
+
+    def ack_fastlane_request(
+        self,
+        request_id: str,
+        by: str = "",
+        status: FastlaneStatus | str = FastlaneStatus.APPROVED,
+        batch_id: str = "",
+        note: str = "",
+    ) -> FastlaneRequest:
+        """承认/拒绝一条快车道请求，返回落库后的记录（D5-3.2）。
+
+        幂等与不可翻案（A23 的三条硬断言都落在这一处，两驱动同签名同语义）：
+        - `request_id` 不存在 → `KeyError`（中文），不静默造行；
+        - **已决行**（approved/rejected/escalated）二次承认**不写行、不覆盖**
+          `decided_by/decided_at/status`，原样返回首次记录 —— 因此
+          `ESCALATED`/`REJECTED` **不可能**被 `ack` 翻成 `APPROVED`；
+        - 只有 `pending` 行会被写入：`status`、`decided_by`、`decided_at`（现在）、
+          `batch_id`（攒批承认同批共享）、`note`（空则保留原值）。
+        """
+        current = self.get_fastlane_request(request_id)
+        if current is None:
+            raise KeyError(f"快车道请求不存在：{request_id}")
+        if _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current  # 已决 → 幂等返回，审计字段一个都不动
+        self._conn.execute(
+            "UPDATE fastlane_requests SET status = ?, batch_id = ?, decided_by = ?, "
+            "decided_at = ?, note = ? WHERE request_id = ? AND status = ?",
+            (
+                _enum_value(status),
+                batch_id,
+                by,
+                time.time(),
+                note or current.note,
+                request_id,
+                FastlaneStatus.PENDING.value,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fastlane_request(request_id)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------ P3 抽检留痕（D5-3.3 / A25）
+
+    def add_knowledge_sample(self, sample: KnowledgeSample) -> KnowledgeSample:
+        """落一条人工抽检留痕（**append-only**：一行一次抽检结论，同 cid 可多行）。
+
+        `sampled_at` 为 0 时取当前时间；`passed` 转 0/1 入库（两驱动同构）。
+        """
+        sampled_at = float(sample.sampled_at or time.time())
+        cur = self._conn.execute(
+            "INSERT INTO knowledge_samples(cid, sampled_at, sampled_by, rate, passed) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                sample.cid,
+                sampled_at,
+                sample.sampled_by,
+                float(sample.rate),
+                1 if sample.passed else 0,
+            ),
+        )
+        self._conn.commit()
+        return _sample_from_row(
+            self._conn.execute(
+                "SELECT * FROM knowledge_samples WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        )
+
+    def list_knowledge_samples(self, cid: Optional[str] = None) -> list[KnowledgeSample]:
+        """按 cid 列抽检留痕（None = 全部），按 `sampled_at, id` 稳定排序（审计可回放）。"""
+        if cid is None:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge_samples ORDER BY sampled_at, id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge_samples WHERE cid = ? ORDER BY sampled_at, id", (cid,)
+            ).fetchall()
+        return [_sample_from_row(r) for r in rows]
+
+
+def _fastlane_from_row(row: sqlite3.Row) -> FastlaneRequest:
+    """把 fastlane_requests 行还原成 `FastlaneRequest`（列表走 JSON，布尔还原）."""
+    return FastlaneRequest(
+        request_id=row["request_id"],
+        round_no=row["round_no"],
+        summary=row["summary"],
+        diff_files=_json_list(row["diff_files"]),
+        new_interface=bool(row["new_interface"]),
+        new_data_model=bool(row["new_data_model"]),
+        touched_modules=_json_list(row["touched_modules"]),
+        status=FastlaneStatus(row["status"]),
+        batch_id=row["batch_id"],
+        decided_by=row["decided_by"],
+        decided_at=row["decided_at"],
+        note=row["note"],
+    )
+
+
+def _json_list(raw: object) -> list[str]:
+    """TEXT 列里的 JSON 列表 → `list[str]`（坏数据不炸读路径，退化成空列表）。"""
+    try:
+        parsed = json.loads(str(raw)) if raw else []
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed]
+
+
+def _sample_from_row(row: sqlite3.Row) -> KnowledgeSample:
+    return KnowledgeSample(
+        cid=row["cid"],
+        sampled_at=row["sampled_at"],
+        sampled_by=row["sampled_by"],
+        rate=row["rate"],
+        passed=bool(row["passed"]),
+    )
+
 
 def _severity_of(raw: object) -> Severity:
     """评审 severity 宽容解析：未知/缺失一律归 INFO（D4-3.4「宽容解析」，不因格式差异炸门禁）。"""
@@ -842,11 +1131,13 @@ __all__ = [
     "P0_SCHEMA_VERSION",
     "P1_SCHEMA_VERSION",
     "P2_SCHEMA_VERSION",
+    "P3_SCHEMA_VERSION",
     "TABLE_NAMES",
     "ALL_TABLE_NAMES",
     "BUSINESS_TABLES",
     "P1_TABLE_NAMES",
     "P2_TABLE_NAMES",
+    "P3_TABLE_NAMES",
     "META_TABLE",
     "schemas",
 ]

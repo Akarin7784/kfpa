@@ -257,11 +257,13 @@ def cmd_round(args: argparse.Namespace) -> int:
             # R-22.3：只有显式给报告才启用 G7；没给就跳过、不得判红。
             coverage = None
             if args.coverage_json:
-                from .gates import load_coverage_report
+                from .gates import GatesError, load_coverage_report
 
                 try:
                     coverage = load_coverage_report(args.coverage_json)
-                except (OSError, ValueError) as exc:
+                except (OSError, ValueError, GatesError) as exc:
+                    # D5 §5（#51 报的死分支）：load_coverage_report 抛的是 GatesError（RuntimeError 子类），
+                    # 只捕 (OSError, ValueError) 时这里永远不执行。三个都捕，中文提示与 rc=4 才真的生效。
                     print(
                         f"[core] 覆盖率报告不可用：{args.coverage_json}：{exc} → "
                         "用 `pytest --cov=kfpa --cov-report=json` 生成后再传（退出码 4）",
@@ -456,19 +458,55 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- 解析
 
 
+class PluginGroupConflict(RuntimeError):
+    """插件试图注册一个**已存在**的子命令组（R-34：响亮报错，不许静默并入）。"""
+
+
+class _SubparsersGuard:
+    """传给插件 `register()` 的 subparsers 视图：**重名组直接报错**，其余原样转发。
+
+    R-34 的教训：`fastlane` 组曾被 `kfpa.impact` 与 `kfpa.fastlane` 两个模块抢注，
+    而当时 argparse 的 `conflicting subparser` 被降级成一句 stderr 警告后继续跑，
+    结果是「命令悄悄少一半」——与 P2 漏挂 `kfpa.eval` 是同一类雷。现在同名注册一律硬失败。
+    """
+
+    def __init__(self, subparsers: Any) -> None:
+        self._subparsers = subparsers
+
+    def add_parser(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        choices = getattr(self._subparsers, "choices", None)
+        if isinstance(choices, dict) and name in choices:
+            raise PluginGroupConflict(
+                f"子命令组 `{name}` 已被注册 → 一个组只能有一个 owner（R-34：`fastlane` 归 "
+                "`kfpa.fastlane`）；请把你那条子命令挂进 owner 的组，不要新建同名组"
+            )
+        return self._subparsers.add_parser(name, *args, **kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._subparsers, item)
+
+
 def _register_plugin_commands(subparsers: Any) -> None:
-    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3）：
-    `tickets`（界面）、`ledger` / `knowledge`（长流）、`fastlane`（长流 impact）。
+    """挂载各模块自己的子命令组（P0 §3.7 + P1 D3 + P2 D4 + P3 D5）：
+    `tickets`（界面）、`ledger` / `knowledge`（长流）、`eval`（P2）、
+    `fastlane`（长流 P3，R-34 起**唯一 owner**，含 P1 的 `check`）、`rag`（长流 P3 检索）。
 
     每个模块导出 `register(subparsers)`；模块缺失时静默跳过（P0 core-only 环境仍可用），
     模块存在但挂载失败时打警告——**不许让一个坏插件拖垮整个 CLI**。
+
+    **例外是重名组**（R-34）：插件再注册一个已存在的组名 → 中文报错 + 退出码 2，硬失败。
+    静默并入/静默跳过都会让「命令少一半」藏在一次警告里，那正是 P2 踩过的坑。
+
+    P3 教训（D5 §1）：`fastlane` / `rag` 的 `register()` 写好了不等于 `kfpa fastlane` 存在——
+    P2 的 `kfpa.eval` 就漏挂过，A21 的 CLI 路径直接跑不通。实现方交付前必须自己跑 `--help` 自证。
     """
     builtins_list = [
         ("kfpa.ui.cli", ".ui"),
         ("kfpa.ledger", ".ledger"),
         ("kfpa.knowledge", ".knowledge"),
-        ("kfpa.impact", ".impact"),
         ("kfpa.eval", ".eval"),          # P2 D4-3.4：`kfpa eval review`（同源盲区度量）
+        ("kfpa.fastlane", ".fastlane"),  # P3 D5-3.2 / R-34：`fastlane` 组的唯一 owner（含 `check`）
+        ("kfpa.rag", ".rag"),            # P3 D5-3.5：`kfpa rag search`
     ]
     import importlib
 
@@ -484,7 +522,11 @@ def _register_plugin_commands(subparsers: Any) -> None:
         if not callable(register):
             continue
         try:
-            register(subparsers)
+            register(_SubparsersGuard(subparsers))
+        except PluginGroupConflict as exc:
+            # 响亮失败：不许把「命令少一半」降级成一句警告（R-34）。
+            print(f"[kfpa] 错误：{short} 注册了重复的子命令组：{exc}", file=sys.stderr)
+            raise SystemExit(EXIT_USAGE) from exc
         except Exception as exc:
             print(f"[kfpa] 警告：{short} 子命令注册失败：{exc}", file=sys.stderr)
 

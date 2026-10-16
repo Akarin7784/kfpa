@@ -19,9 +19,12 @@ from ..schemas import (
     AcceptanceCriterion,
     CandidateStatus,
     FailureRecord,
+    FastlaneRequest,
+    FastlaneStatus,
     GateReport,
     GateState,
     KnowledgeCandidate,
+    KnowledgeSample,
     LedgerEntry,
     QATicket,
     ReviewFinding,
@@ -537,8 +540,212 @@ class PostgresStore:
             ).fetchall()
         return [_review_from_row(r) for r in rows]
 
+    # ------------------------------------------------------------ P3 快车道落库（D5-3.2 / A23）
+
+    def add_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """登记/更新一条快车道请求（同 SQLite 侧语义：只在既有行仍 pending 时覆盖）。"""
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = EXCLUDED.round_no,
+                summary         = EXCLUDED.summary,
+                diff_files      = EXCLUDED.diff_files,
+                new_interface   = EXCLUDED.new_interface,
+                new_data_model  = EXCLUDED.new_data_model,
+                touched_modules = EXCLUDED.touched_modules,
+                status          = EXCLUDED.status,
+                batch_id        = EXCLUDED.batch_id,
+                decided_by      = EXCLUDED.decided_by,
+                decided_at      = EXCLUDED.decided_at,
+                note            = EXCLUDED.note
+            WHERE fastlane_requests.status = 'pending'
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
+    def get_fastlane_request(self, request_id: str) -> Optional[FastlaneRequest]:
+        row = self._conn.execute(
+            "SELECT * FROM fastlane_requests WHERE request_id = %s", (request_id,)
+        ).fetchone()
+        return None if row is None else _fastlane_from_row(row)
+
+    def update_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """整对象写回（同 SQLite 侧语义：审计优先，已决行不覆盖、不翻案）。"""
+        current = self.get_fastlane_request(request.request_id)
+        if current is not None and _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = EXCLUDED.round_no,
+                summary         = EXCLUDED.summary,
+                diff_files      = EXCLUDED.diff_files,
+                new_interface   = EXCLUDED.new_interface,
+                new_data_model  = EXCLUDED.new_data_model,
+                touched_modules = EXCLUDED.touched_modules,
+                status          = EXCLUDED.status,
+                batch_id        = EXCLUDED.batch_id,
+                decided_by      = EXCLUDED.decided_by,
+                decided_at      = EXCLUDED.decided_at,
+                note            = EXCLUDED.note
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
+    def list_fastlane_requests(
+        self,
+        status: Optional[FastlaneStatus | str] = None,
+        round_no: Optional[int] = None,
+    ) -> list[FastlaneRequest]:
+        sql = "SELECT * FROM fastlane_requests"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(_enum_value(status))
+        if round_no is not None:
+            clauses.append("round_no = %s")
+            params.append(round_no)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY round_no, request_id"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_fastlane_from_row(r) for r in rows]
+
+    def ack_fastlane_request(
+        self,
+        request_id: str,
+        by: str = "",
+        status: FastlaneStatus | str = FastlaneStatus.APPROVED,
+        batch_id: str = "",
+        note: str = "",
+    ) -> FastlaneRequest:
+        """承认/拒绝一条快车道请求（幂等；已决行原样返回，不覆盖审计字段）。"""
+        current = self.get_fastlane_request(request_id)
+        if current is None:
+            raise KeyError(f"快车道请求不存在：{request_id}")
+        if _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current
+        self._conn.execute(
+            "UPDATE fastlane_requests SET status = %s, batch_id = %s, decided_by = %s, "
+            "decided_at = %s, note = %s WHERE request_id = %s AND status = %s",
+            (
+                _enum_value(status),
+                batch_id,
+                by,
+                time.time(),
+                note or current.note,
+                request_id,
+                FastlaneStatus.PENDING.value,
+            ),
+        )
+        return self.get_fastlane_request(request_id)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------ P3 抽检留痕（D5-3.3 / A25）
+
+    def add_knowledge_sample(self, sample: KnowledgeSample) -> KnowledgeSample:
+        """落一条人工抽检留痕（append-only，同 SQLite 侧）。"""
+        sampled_at = float(sample.sampled_at or time.time())
+        row = self._conn.execute(
+            "INSERT INTO knowledge_samples(cid, sampled_at, sampled_by, rate, passed) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING *",
+            (
+                sample.cid,
+                sampled_at,
+                sample.sampled_by,
+                float(sample.rate),
+                1 if sample.passed else 0,
+            ),
+        ).fetchone()
+        return _sample_from_row(row)
+
+    def list_knowledge_samples(self, cid: Optional[str] = None) -> list[KnowledgeSample]:
+        if cid is None:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge_samples ORDER BY sampled_at, id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM knowledge_samples WHERE cid = %s ORDER BY sampled_at, id", (cid,)
+            ).fetchall()
+        return [_sample_from_row(r) for r in rows]
+
 
 # ---------------------------------------------------------------- 内部工具
+
+
+def _fastlane_from_row(row: dict[str, Any]) -> FastlaneRequest:
+    """把 fastlane_requests 行还原成 `FastlaneRequest`（与 SQLite 侧同一口径）。"""
+    return FastlaneRequest(
+        request_id=row["request_id"],
+        round_no=row["round_no"],
+        summary=row["summary"],
+        diff_files=_json_list(row["diff_files"]),
+        new_interface=bool(row["new_interface"]),
+        new_data_model=bool(row["new_data_model"]),
+        touched_modules=_json_list(row["touched_modules"]),
+        status=FastlaneStatus(row["status"]),
+        batch_id=row["batch_id"],
+        decided_by=row["decided_by"],
+        decided_at=row["decided_at"],
+        note=row["note"],
+    )
+
+
+def _json_list(raw: object) -> list[str]:
+    try:
+        parsed = json.loads(str(raw)) if raw else []
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed]
+
+
+def _sample_from_row(row: dict[str, Any]) -> KnowledgeSample:
+    return KnowledgeSample(
+        cid=row["cid"],
+        sampled_at=row["sampled_at"],
+        sampled_by=row["sampled_by"],
+        rate=row["rate"],
+        passed=bool(row["passed"]),
+    )
 
 
 def _review_from_row(row: dict[str, Any]) -> ReviewReport:

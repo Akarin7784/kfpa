@@ -115,10 +115,13 @@ def test_build_llm_routes_by_role(roles):
 
 def test_store_reviews_and_p2_constants():
     store = st.Store(":memory:")
-    assert store.get_meta("schema_version") == st.SCHEMA_VERSION == st.P2_SCHEMA_VERSION == "3"
+    # P3（D5-3.1）升到 "4"；P2 常量 "3" 保留为历史口径。
+    assert store.get_meta("schema_version") == st.SCHEMA_VERSION == st.P3_SCHEMA_VERSION == "4"
+    assert st.P2_SCHEMA_VERSION == "3"
     assert set(st.ALL_TABLE_NAMES) <= set(store.list_tables())
     assert "reviews" in store.list_tables()
     assert st.P2_TABLE_NAMES == ("reviews",)
+    assert st.P3_TABLE_NAMES == ("fastlane_requests", "knowledge_samples")
 
     report = ReviewReport(
         round_no=1, provider="mock_hetero", model_ref="x/review", context_id="rev-1-1-abc",
