@@ -455,7 +455,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_PASS
         return int(code) if isinstance(code, int) else EXIT_USAGE
 
+    # 主入口约定 `handler=`（本文件各子命令都用它）；界面早期用 `func=`，这里一并容忍，
+    # 免得两边约定差一个字就把 `tickets` 变成 print_help。
     handler: Optional[Callable[[argparse.Namespace], int]] = getattr(args, "handler", None)
+    if handler is None:
+        handler = getattr(args, "func", None)
     if handler is None:
         parser.print_help()
         return EXIT_PASS
