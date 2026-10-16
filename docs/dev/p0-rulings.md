@@ -402,6 +402,34 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
    谁机器上残留了这个变量，都不许把台架的临时库顶掉。这是台架的硬要求（与 R-19/R-22 同级）。
 4. A12 的端口仍按 R-22.1：台架读 `KFPA_PG_PORT`，默认 `55440`，禁用 55432–55434。
 
+## R-26 A12 的真因：CLI 的配置查找依赖 cwd（不是 PG/DSN 问题）
+
+**实测（我在 main `0d84690` 上手动复现）**：
+
+```
+cwd = <任意非仓库目录>
+$ python -m kfpa round --design <repo>/examples/design-r1.md --round 2 --dry-run --json --workdir <tmp>/wd
+[core] 角色配置错误：角色配置不存在：config\models.yaml → rc=4
+$ python -m kfpa round ... --config <repo>/config/models.yaml     → rc=0（绿）
+```
+
+`init` 不需要角色表所以 rc=0；`round` 需要 `config/models.yaml`，**默认路径是相对 cwd 的字面量**
+→ 任何从别的目录调用的消费者（A12 台架、CI、用户在自己项目里调）都会挂在 rc=4。
+这才是 A12「PG 里没有任何表」的真因（台架把 round 判红后自然没数据），与 `KFPA_DB_URL` / DSN 无关。
+
+**裁决 R-26**：`config/models.yaml`（以及其它随包资源，如 `prompts/*.j2`）**必须能在任意 cwd 下定位**。
+解析顺序：
+
+1. `--config` 显式路径；
+2. 环境变量 `KFPA_CONFIG`；
+3. cwd 及其所有父目录下的 `config/models.yaml`；
+4. 包/仓库安装位置（由 `kfpa.__file__` 上溯，找到含 `config/models.yaml` 的目录）；
+5. 都没有 → 中文报错列出已试过的路径 + 退出码 4（**不猜、不回退到空配置**）。
+
+归属：磐石（`config.py` + `cli.py`）。同批做 R-25.1（`make_store` 优先级回退）。
+验收：在 `$env:TEMP` 下用绝对路径跑 `python -m kfpa round …` 必须 rc=0；
+A12 在独占端口上重跑应转为 PASS（不再是 SKIP）。
+
 ---
 
 ## 变更记录
@@ -421,3 +449,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 2.0 | 2026-10-16 | R-23 快车道承认不进 P1（P3 落库）；`diff_files` 三来源优先级（执行产物 → `--files` → `no_diff_source`） | Chief |
 | 2.1 | 2026-10-16 | R-24 账本角色断言只认实际调用 · compose 去固定 `container_name` + 台架独立项目名 · `fastlane check` 退出码 0 · `run_round(coverage=)` 形参名冻结 | Chief |
 | 2.2 | 2026-10-16 | R-25 存储优先级改回「显式 `--db` 优先于 `KFPA_DB_URL`」· 台架 A12 显式传 DSN · 台架子进程必须剥掉 `KFPA_DB_URL` | Chief |
+| 2.3 | 2026-10-16 | R-26 `config/models.yaml` 等随包资源必须能在任意 cwd 定位（A12 的真因）；归属磐石 | Chief |
