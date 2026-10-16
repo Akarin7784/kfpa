@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
 import sqlite3
 import subprocess
 import sys
@@ -66,16 +67,23 @@ def default_workdir(round_no: int) -> str:
 
 
 def _open_store(db_arg: str) -> Any:
-    """打开状态库：`--db` 若仍是默认 `kfpa.db`（或未给），交给 `make_store()` 走 `KFPA_DB_URL`。
+    """打开状态库（口径见 `kfpa.store.make_store`，R-22.1）：
 
-    这样 `KFPA_DB_URL=postgresql://…` 时，`init/round/gate/history/rollback` 全部落到 PG，
-    与 A12 双库对拍的口径一致；显式给了别的路径/DSN 时按用户给的来。
+    显式 DSN（`postgresql://…` / `sqlite://…`）> `KFPA_DB_URL` > 显式普通路径 > 默认 `kfpa.db`。
+    当环境变量压过显式普通路径时打一行中文提示——这种覆盖必须看得见，不许静默换库。
     """
-    from .store import make_store
+    from .store import DB_URL_ENV, make_store, mask_dsn
 
     explicit = str(db_arg or "").strip()
-    dsn = None if explicit in ("", "kfpa.db") else explicit
-    return make_store(dsn)
+    env_url = os.environ.get(DB_URL_ENV, "").strip()
+    is_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
+    if explicit and not is_dsn and env_url and explicit != "kfpa.db":
+        print(
+            f"[core] 提示：KFPA_DB_URL 优先于 --db {explicit} → 本次使用 {mask_dsn(env_url)}"
+            "（要强制本地 SQLite 请传 --db sqlite://<path>）",
+            file=sys.stderr,
+        )
+    return make_store(explicit or None)
 
 
 #: D2 R-10：注入件里与执行器相关、需要透传给 run_round 的值
