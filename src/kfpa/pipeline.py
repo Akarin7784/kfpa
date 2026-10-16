@@ -69,8 +69,8 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，运行期不依赖磐�
 #: 提示词模板目录
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-#: P1 默认 checkpoint 文件（D3-3.5：SqliteSaver，thread_id = kfpa-r{n}）
-CHECKPOINT_DB_DEFAULT = ".kfpa/checkpoints.sqlite"
+#: P1 默认 checkpoint 文件名（R-22.2：库固定在 `{workdir}/checkpoints.sqlite`）
+CHECKPOINT_DB_NAME = "checkpoints.sqlite"
 
 #: 高影响票硬规则的机器可判定标记（CLI 与测试都可据此断言）
 BLOCKED_MARK = "[KFPA-BLOCKED]"
@@ -613,13 +613,20 @@ def _stage_gate(
     package: TaskPackage,
     exec_result: ExecResult,
     attempt: int,
+    coverage: Any = None,
 ) -> GateReport:
-    report = gates.evaluate(package.round_no, package, exec_result, store, attempt=attempt)
+    """门禁判定；`coverage` 非 None 时才启用 G7（R-22.3：无报告不得判红）。"""
+    report = gates.evaluate(
+        package.round_no, package, exec_result, store, attempt=attempt, coverage=coverage
+    )
     store.save_gate_report(report)
+    coverage_note = ""
+    if coverage is not None:
+        coverage_note = f"｜G7 覆盖率={getattr(coverage, 'line_rate', 0.0):.1%}"
     _log(
         f"[6/6] 门禁判定（第 {attempt} 次尝试）：{report.state.value}"
         f"｜failing={','.join(report.failing_criteria) or '-'}"
-        f"｜reason_key={report.reason_key or '-'}"
+        f"｜reason_key={report.reason_key or '-'}{coverage_note}"
     )
     return report
 
@@ -689,6 +696,8 @@ def build_graph(
     dry_run: bool = True,
     injection: str = "none",
     checkpointer: Any = None,
+    coverage: Any = None,
+    coverage_json: str | Path | None = None,
 ) -> Any:
     """编译 LangGraph `StateGraph`（签名与 state 契约见 D2 R-14）。
 
@@ -704,7 +713,12 @@ def build_graph(
     - 节点只调纯函数 + Store + 执行器，节点内不写判据（D1-12 约束 2）。
     - `checkpointer=None` 时**不挂 checkpointer**，保证 R-14 的「`invoke` 只给三个入参」可直接跑；
       传入自定义 checkpointer 时由调用方按 LangGraph 约定给 `config`（如 `thread_id`）。
+    - **G7（R-22.3）**：只有给了 `coverage`（`CoverageReport`）或 `coverage_json`（pytest-cov 报告路径）
+      时才启用；都不给 → 门禁跳过 G7，默认 happy path 不因此判红。
     """
+    coverage_report = coverage
+    if coverage_report is None and coverage_json:
+        coverage_report = gates.load_coverage_report(coverage_json)
     try:
         from langgraph.graph import END, StateGraph
     except ImportError as exc:  # pragma: no cover - 依赖由 Chief 统一安装
@@ -796,7 +810,9 @@ def build_graph(
         exec_result = state.get("exec_result")
         if package is None or exec_result is None:  # pragma: no cover
             raise PipelineError("[pipeline] gate 缺少任务包或执行结果 → 检查 execute 出边")
-        report = _stage_gate(store, package, exec_result, int(state.get("attempt", 1)))
+        report = _stage_gate(
+            store, package, exec_result, int(state.get("attempt", 1)), coverage_report
+        )
         return {"gate": report, "avoid_patterns": [str(p) for p in store.list_avoid_patterns()]}
 
     def route_gate(state: RoundGraphState) -> str:
@@ -932,11 +948,17 @@ def _result_from_state(state: dict) -> RoundResult:
 # ---------------------------------------------------------------- 对外轮次入口
 
 
+def default_checkpoint_path(workdir: str | Path) -> Path:
+    """R-22.2 冻结口径：checkpoint 库固定为 `{workdir}/checkpoints.sqlite`。"""
+    return Path(workdir) / CHECKPOINT_DB_NAME
+
+
 def make_checkpointer(path: str | Path | None = None) -> Any:
-    """构造 P1 默认 checkpoint（`SqliteSaver`，D3-3.5）。
+    """构造 P1 默认 checkpoint（`SqliteSaver`，D3-3.5 / R-22.2）。
 
     - 缺 `langgraph-checkpoint-sqlite` → `DependencyMissingError`（CLI 映射退出码 4）；
-    - `path=None` → `CHECKPOINT_DB_DEFAULT`；父目录自动创建。
+    - `path=None` → 用当前目录下的 `CHECKPOINT_DB_NAME`（正常路径由 `run_round` 传 workdir）；
+      父目录自动创建。
     """
     try:
         import sqlite3
@@ -947,7 +969,7 @@ def make_checkpointer(path: str | Path | None = None) -> Any:
             "[pipeline] 缺少 langgraph-checkpoint-sqlite（P1 checkpoint）"
             " → 让 Chief 按 D3 §5 统一安装；或用 `checkpointer=None` 关闭（退出码 4）"
         ) from exc
-    target = Path(path or CHECKPOINT_DB_DEFAULT)
+    target = Path(path or CHECKPOINT_DB_NAME)
     target.parent.mkdir(parents=True, exist_ok=True)
     # SqliteSaver.from_conn_string() 返回上下文管理器，不能直接当 saver 传给 compile()；
     # 这里自持连接（check_same_thread=False）并由 saver 持有引用，进程内有效、落盘持久。
@@ -955,22 +977,28 @@ def make_checkpointer(path: str | Path | None = None) -> Any:
     return SqliteSaver(connection)
 
 
-def _resolve_checkpointer(checkpointer: Any, round_no: int) -> Any:
-    """`"auto"` → 默认 SqliteSaver；`None` → 不挂（P0 A8 的三键 invoke 仍可跑）。"""
+def _resolve_checkpointer(checkpointer: Any, round_no: int, workdir: Path) -> Any:
+    """解析 checkpointer（R-22.2 + CLI `--checkpoint-db`）：
+
+    - `None` → 不挂（P0 的三键 invoke 与 A8 仍可跑）；
+    - `"auto"`（默认）→ `{workdir}/checkpoints.sqlite` 上的 `SqliteSaver`；
+    - 其它字符串 → 当成 `--checkpoint-db` 给的路径；
+    - 其它对象 → 原样作为 saver 传给 `compile()`。
+    """
     if checkpointer is None:
         return None
     if checkpointer == "auto":
         _ = round_no  # thread_id 由调用方按 `kfpa-r{n}` 传给 invoke
-        return make_checkpointer()
+        return make_checkpointer(default_checkpoint_path(workdir))
+    if isinstance(checkpointer, (str, Path)):
+        return make_checkpointer(checkpointer)
     return checkpointer
 
 
 def _default_roles() -> dict[str, dict]:
     """尽力读 `config/models.yaml` 的角色表（拿不到就空表：model_ref 记空串，不编造）。"""
     try:
-        from .config import load_roles
-
-        return dict(load_roles())
+        return ledger_mod.roles_from_config()
     except Exception:  # pragma: no cover - 缺配置不该拖垮流水线
         return {}
 
@@ -991,20 +1019,24 @@ def run_round(
     ledger: Any = None,
     ledger_source: str = "mock",
     roles: Optional[dict[str, dict]] = None,
+    coverage: Any = None,
+    coverage_json: str | Path | None = None,
 ) -> RoundResult:
     """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14 + P1 D3-3.4/3.5）。
 
     - 未关闭 HIGH 票 → `state=TICKETS_OPEN` + `BLOCKED_MARK`（CLI 退出码 3）；
     - `injection` 只把 `apply_fail` / `test_fail` 转给执行器（R-10）；
     - 不同原因连续失败到 `max_attempts` → BLOCKED + `attempts_exhausted`（D1-5）；
-    - **P1**：`checkpointer="auto"` → 默认 `SqliteSaver`，`thread_id = f"kfpa-r{round_no}"`（同轮重跑复用；
-      显式传 `None` 关闭）；每次 `LLM.complete()` 经账本 wrapper 落一条 `LedgerEntry`（D3-3.4）；
-      PASS 轮把「任务包真的用到的隔离区候选」标记复用并按规则转正（D3-3.5）。
+    - **P1**：`checkpointer="auto"` → 默认 `SqliteSaver`（`{workdir}/checkpoints.sqlite`，R-22.2；
+      `thread_id = f"kfpa-r{round_no}"`，同轮重跑复用；显式传 `None` 关闭）；
+      每次 `LLM.complete()` 经账本 wrapper 落一条 `LedgerEntry`（D3-3.4）；
+      PASS 轮把「任务包真的用到的隔离区候选」标记复用并按规则转正（D3-3.5）；
+      `coverage` / `coverage_json` 只在显式提供时启用 G7（R-22.3）。
     """
     if ledger is None:
         ledger = ledger_mod.make_ledger(store)
     resolved_roles = roles if roles is not None else _default_roles()
-    resolved_checkpointer = _resolve_checkpointer(checkpointer, round_no)
+    resolved_checkpointer = _resolve_checkpointer(checkpointer, round_no, Path(workdir))
     graph = build_graph(
         store=store,
         llm=ledger_mod.wrap_llm(
@@ -1020,6 +1052,8 @@ def run_round(
         dry_run=dry_run,
         injection=injection,
         checkpointer=resolved_checkpointer,
+        coverage=coverage,
+        coverage_json=coverage_json,
     )
     payload = {"round_no": round_no, "design_text": design_text, "design_ref": design_ref}
     final = (
@@ -1046,6 +1080,9 @@ def run_round_via_graph(
     max_attempts: int = 3,
     dry_run: bool = True,
     injection: str = "none",
+    checkpointer: Any = "auto",
+    coverage: Any = None,
+    coverage_json: str | Path | None = None,
 ) -> RoundResult:
     """兼容别名：语义与 `run_round` 完全一致（两者都走 LangGraph）。"""
     return run_round(
@@ -1059,12 +1096,15 @@ def run_round_via_graph(
         max_attempts=max_attempts,
         dry_run=dry_run,
         injection=injection,
+        checkpointer=checkpointer,
+        coverage=coverage,
+        coverage_json=coverage_json,
     )
 
 
 __all__ = [
     "PROMPTS_DIR",
-    "CHECKPOINT_DB_DEFAULT",
+    "CHECKPOINT_DB_NAME",
     "BLOCKED_MARK",
     "EXECUTOR_INJECTIONS",
     "MAX_TICKETS_PER_ROUND",
@@ -1082,6 +1122,7 @@ __all__ = [
     "render_task_package",
     "build_review_prompt",
     "make_checkpointer",
+    "default_checkpoint_path",
     "run_round",
     "run_round_via_graph",
     "build_graph",
