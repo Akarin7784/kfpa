@@ -1,0 +1,112 @@
+"""角色配置加载与校验（docs/dev/p0-plan.md §2 / §3.3）。
+
+铁律：**模型字符串只允许出现在 `config/models.yaml` 与 `llm.py` 的适配器内部**。
+本模块只负责「把 yaml 读成结构、把角色名校验干净」，绝不硬编码任何模型名，
+也绝不把模型名往下游（pipeline / gates / ui）泄漏——下游只准用角色名。
+
+角色集合（与 schemas.py 的 CONTRACT_VERSION 1.0 一致）：
+    ARCHITECT / REVIEWER / FLASH / EMBEDDING
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Mapping
+
+#: 全部合法角色名（唯一权威列表，其它模块请从这里 import）
+ROLE_NAMES: tuple[str, ...] = ("ARCHITECT", "REVIEWER", "FLASH", "EMBEDDING")
+
+#: P0 最小闭环真正用到的角色：缺一个就直接报错（别的角色缺失可以容错）
+CORE_ROLES: tuple[str, ...] = ("ARCHITECT", "REVIEWER", "FLASH")
+
+#: 默认配置路径（相对仓库根目录）
+DEFAULT_CONFIG_PATH = "config/models.yaml"
+
+
+def normalize_role(role: str) -> str:
+    """把角色名规范成大写并校验；未知角色抛 ValueError（中文提示）。"""
+    name = str(role or "").strip().upper()
+    if name not in ROLE_NAMES:
+        allowed = " / ".join(ROLE_NAMES)
+        raise ValueError(f"未知角色：{role!r}（允许的角色：{allowed}）")
+    return name
+
+
+def load_config(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    """读取 models.yaml（只做语法层校验），返回整个配置字典。"""
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - 环境问题，非逻辑分支
+        raise RuntimeError(
+            "缺少 pyyaml：请让 Chief 统一安装（pip install pyyaml），不要在项目目录里自建 venv"
+        ) from exc
+
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"角色配置不存在：{path}（默认 {DEFAULT_CONFIG_PATH}；"
+            "请在仓库根目录运行，或用 --config 显式指定）"
+        )
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"角色配置解析失败：{path}：{exc}") from exc
+
+    if not isinstance(data, Mapping):
+        raise ValueError(f"角色配置格式错误：{path} 顶层必须是映射（收到 {type(data).__name__}）")
+    return dict(data)
+
+
+def validate_roles(roles: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """校验角色表并返回规范化副本。
+
+    规则（可被镜鉴逐条攻击）：
+    1. `roles` 必须是非空映射；
+    2. 角色名必须在 :data:`ROLE_NAMES` 内——多出未知角色 = 配置错误，直接报错（防拼写错误静默降级）；
+    3. :data:`CORE_ROLES` 必须齐全，且每项是映射、`model` 是非空字符串；
+    4. EMBEDDING 不参与 P0 验收，存在就必须合法，缺失不算错。
+    """
+    if not isinstance(roles, Mapping) or not roles:
+        raise ValueError("角色配置为空：models.yaml 里的 roles 必须是非空映射")
+
+    result: dict[str, dict[str, Any]] = {}
+    for raw_name, spec in roles.items():
+        name = normalize_role(str(raw_name))
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"角色 {name} 的配置必须是映射（收到 {type(spec).__name__}）")
+        model = spec.get("model")
+        if model is None or not str(model).strip():
+            raise ValueError(f"角色 {name} 缺少非空的 model 字段（模型绑定只能在 models.yaml 里改）")
+        result[name] = dict(spec)
+
+    missing = [name for name in CORE_ROLES if name not in result]
+    if missing:
+        raise ValueError(f"角色配置缺少 P0 必需角色：{' / '.join(missing)}（允许缺失：EMBEDDING）")
+    return result
+
+
+def load_roles(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, dict[str, Any]]:
+    """加载 + 校验，返回 `{角色名: 角色配置}`。下游只读这里的键。"""
+    return validate_roles(load_config(config_path).get("roles"))
+
+
+def role_config(roles: Mapping[str, Any], role: str) -> dict[str, Any]:
+    """取单个角色配置；未绑定时抛 RuntimeError（中文提示）。"""
+    name = normalize_role(role)
+    spec = roles.get(name) if isinstance(roles, Mapping) else None
+    if not isinstance(spec, Mapping) or not str(spec.get("model") or "").strip():
+        raise RuntimeError(f"角色 {name} 未在 config/models.yaml 中绑定 model")
+    return dict(spec)
+
+
+__all__ = [
+    "ROLE_NAMES",
+    "CORE_ROLES",
+    "DEFAULT_CONFIG_PATH",
+    "normalize_role",
+    "load_config",
+    "validate_roles",
+    "load_roles",
+    "role_config",
+]

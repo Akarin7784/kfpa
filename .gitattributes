@@ -1,0 +1,2 @@
+# D1-10：编码 UTF-8 + LF，避免 Windows CRLF 干扰 diff 与快照指纹（package_hash）。
+* text=auto eol=lf
