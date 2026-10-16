@@ -797,11 +797,13 @@ def check_a24(ctx: Ctx, c: Check) -> None:
                 reasons = [f"<escalations() 抛 {type(exc).__name__}: {exc}>"]
         c.add(ok=bool(reasons), note=f"A24：{label} 的 reasons = {reasons}")
         if not reasons:
-            c.fail(f"A24：{label} 判假但没给出 reasons（D5：不许只给个布尔）。")
+            c.fail(f"A24：{label} 判假但 `FastlaneRequest.escalations()` 给了空 reasons"
+                   "（D5：不许只给个布尔）—— 这条断的是**契约方法**（`schemas.py`，Chief 归属）；"
+                   "实现方 `fastlane.escalate_reasons()` 已能指名，红点在契约侧。")
         elif label == "no_diff_source":
             if not any("no_diff_source" in r for r in reasons):
-                c.fail(f"A24：diff_files 为空时 reasons 没指名 `no_diff_source`（R-23 第三来源）："
-                       f"{reasons}")
+                c.fail(f"A24：diff_files 为空时契约 `escalations()` 没指名 `no_diff_source`"
+                       f"（R-23 第三来源，`schemas.py` 归属 Chief）：{reasons}")
         elif not any(label in r for r in reasons):
             c.fail(f"A24：reasons 没指名是哪条判据（{label}）：{reasons}")
 
