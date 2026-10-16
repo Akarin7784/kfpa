@@ -1,4 +1,4 @@
-"""模型路由（docs/dev/p0-plan.md §3.3；Mock 剧本见 D1-7 与 D2 裁决 R-3 / R-5 / R-10）。
+"""模型路由（docs/dev/p0-plan.md §3.3；Mock 剧本见 D1-7 与 D2 裁决 R-3 / R-5 / R-10 / R-17）。
 
 三类实现：
 - :class:`MockLLM` —— P0 验收路径：**不推理**，按 prompt 里的 marker 或关键词选剧本、从输入文本抽机读行，
@@ -7,11 +7,12 @@
   绝不裸抛 AuthenticationError，也绝不 ImportError 崩；
 - `provider="mock"|"litellm"` 由 :func:`build_llm` 统一装配。
 
-剧本选择优先级（D2 R-3，D1-7 的 `[KFPA:...]` marker 仍然兼容）：
-    1. `KFPA_TASK=qa_tickets` / `KFPA_TASK=task_package`（长流 prompt 里写的 marker，**优先**）
-    2. `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` / `[KFPA:REVIEW]`（D1-7 原 marker）
-    3. 关键词兜底（質問票/歧义/ticket/qa、任务包/六段/package）
-    4. 都没有 → `MockScriptError`（D1-7：禁止静默返回空串）
+剧本选择优先级（D2 R-17 / R-3）：
+    1. `KFPA_TASK=qa_tickets` / `KFPA_TASK=task_package` —— **唯一规范 marker**（长流 prompt 里写的）；
+    2. `[KFPA:GEN_TICKETS]` / `[KFPA:BUILD_PACKAGE]` / `[KFPA:REVIEW]` —— D1-7 的 **永久兼容别名**
+       （R-17 明令：不许以「过渡期」为由删除；别名与规范 marker 都必须有测试覆盖）；
+    3. 关键词兜底（質問票/歧义/ticket/qa、任务包/六段/package）；
+    4. 都没有 → `MockScriptError`（D1-7：禁止静默返回空串）。
 
 铁律：模型字符串只能从 `config/models.yaml` 的角色配置里取，本文件不写任何字面量模型名。
 """
@@ -34,11 +35,11 @@ from .config import (
 
 # ---------------------------------------------------------------- marker
 
-#: D2 R-3：长流 prompt 里的 marker（优先）
+#: D2 R-17：唯一规范 marker（k=v 形式，便于加参数与 grep）
 MARKER_TASK_QA = "KFPA_TASK=qa_tickets"
 MARKER_TASK_PACKAGE = "KFPA_TASK=task_package"
 
-#: D1-7 的标记（兼容保留）
+#: D1-7 的 marker —— **永久兼容别名，不得删除**（R-17）
 MARKER_GEN_TICKETS = "[KFPA:GEN_TICKETS]"
 MARKER_BUILD_PACKAGE = "[KFPA:BUILD_PACKAGE]"
 MARKER_REVIEW = "[KFPA:REVIEW]"
