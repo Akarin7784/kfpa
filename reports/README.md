@@ -53,6 +53,22 @@ python -m streamlit run src/kfpa/ui/eval_page.py
 | `review-eval-demo.json` | **合成示例**输入（4 条样本：1 漏检 / 1 误报 / 2 正确），用于离线自测渲染链路 |
 | `review-eval-demo.md` | 由上面渲染的 Markdown 报告（示例） |
 | `review-eval-demo.html` | 由上面渲染的**单文件 HTML**（内联 CSS、无 CDN/外链/脚本） |
+| `review-eval-mock.json` | **生产端联调产物**：长流 `eval.py` 真跑 24 条种子集（`provider=mock`）输出的 D4 冻结形状 JSON |
+| `review-eval-mock.md` / `.html` | 由上面这份真实生产者输出渲染的报告（链路证据） |
 
-`review-eval.json|md|html`（无 `-demo`）是正式产物，由长流 `kfpa eval review` 跑出后渲染，
-不在本目录预先提交（避免把合成数据当真实度量）。
+`review-eval-mock.*` 的生成方式（跨分支联调，两边都在本地）：
+
+```powershell
+# 生产端（长流 clone，工作目录即其仓库根）
+$env:PYTHONPATH="src"
+python -c "from kfpa.eval import evaluate, render_report; print(render_report(evaluate(provider='mock', baseline_provider='mock'), 'json'))" > review-eval-mock.json
+# 渲染端（本 clone）
+python -m kfpa.ui.eval_page --in reports/review-eval-mock.json --format markdown --full
+python -m kfpa.ui.eval_page --in reports/review-eval-mock.json --format html     --full
+```
+
+> `provider=mock` 时两组同为同源剧本，指标退化（24 条：漏检 12 / 误报 12 / 一致率 0.5），只作**接口链路证据**；
+> 正式的 `mock_hetero` vs `mock` 对比要等磐石 `p2/router` 落地后再跑（`review-eval.json|md|html` 为正式名，届时生成）。
+
+`review-eval.json|md|html`（无后缀标记）是正式产物，由长流 `kfpa eval review` 跑出后渲染，
+不在本目录预先提交（避免把合成或退化数据当真实度量）。
