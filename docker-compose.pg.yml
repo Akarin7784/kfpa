@@ -8,7 +8,8 @@
 services:
   pg:
     image: postgres:16-alpine
-    container_name: kfpa-pg
+    # 不给固定 `container_name`（D2 R-24.2）：固定全局名会让多个工作树 / 多个 clone /
+    # 台架与人工实例互相撞名（已经撞过一次）。由 Compose 按项目前缀命名（<project>-pg-1）。
     restart: unless-stopped
     environment:
       POSTGRES_USER: kfpa
