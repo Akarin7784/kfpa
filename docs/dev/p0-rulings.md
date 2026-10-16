@@ -38,6 +38,8 @@
 - 无 marker 时，退回磐石已实现的关键词判定（質問票/歧义/ticket/qa、任务包/六段/package）。
 - 返回结构以磐石现有实现为准：`{"tickets":[...]}` / `{feature,goal,acceptance,boundaries,interface_contract,prohibitions,feedback,closed_tickets}`。
 - **`ticket_id` 由 `pipeline` 分配并覆盖 mock 返回值**（`R{round}-{seq:03d}`，D1-1）；mock 的 `T-001` 一律忽略。
+  实现口径（防 `QATicket(**raw)` 的 duplicate keyword 炸）：`raw.pop("ticket_id", None)` 之后再构造，
+  绝不要把 `ticket_id` 和 pipeline 生成的票号同时传进构造函数。
 - 默认 2 张票、impact 不含 high（保 A2 一条命令跑完整轮）；A3 用 `build_llm(roles, provider="mock", high_impact=True)` 造高影响票。
 
 ## R-4 `count_same_failure` 口径与升级时点
@@ -67,6 +69,30 @@
   ①抛 `RuntimeError`（不是 AuthenticationError 裸抛）②消息含中文提示与 `--provider mock`
   ③不产生网络长阻塞（可 mock 掉底层调用）。允许在无网络环境下 skip 真实调用，但**包装逻辑必须被断言**。
 
+## R-8 `tickets list --impact` 下推到 Store（界面不要本地过滤）
+
+- 界面问：§3.7 有 `--impact`，§3.2 的 `list_tickets(round_no, status)` 没有 impact 参数。
+- **裁决：下推到 DB，界面不本地过滤。** `p0-plan.md` §3.2 的签名按本条读作：
+
+  ```python
+  def list_tickets(self, round_no: int | None = None,
+                   status: TicketStatus | None = None,
+                   impact: TicketImpact | None = None) -> list[QATicket]: ...
+  ```
+
+- 这是 **`store.py` 的方法签名**变更，不是数据契约变更 —— `schemas.py` 不动，
+  **不升 `CONTRACT_VERSION`**（契约版本只管 `schemas.py` 里的数据结构）。
+- 实施顺序：磐石在 PR #3 上补 `impact` 参数（SQL `WHERE` 过滤，索引 `ix_tickets_round` 已含 impact）→
+  界面 rebase 后改成传参、删掉本地过滤 → 再合 #4。
+
+## R-9 `tickets batch-close` 语义与退出码（禁止用 1）
+
+- 未知票号 → **整体不写**，退出码 **2**（输入/用法错误）。
+- 某条答案为空 → 视为输入错误，**整体不写**，退出码 **2**。
+- 已关闭票重复提交 → **幂等跳过**，打印「跳过 + 原因」，退出码 **0**。
+- 其余全部成功 → 退出码 **0**。
+- **`1` 不再是合法退出码**（R-1 作废），界面 PR #4 里的「有跳过即退出码 1」必须改掉。
+
 ---
 
 ## 变更记录
@@ -74,3 +100,4 @@
 | 版本 | 日期 | 裁决 | 作者 |
 |---|---|---|---|
 | 1.0 | 2026-10-16 | R-1 退出码 · R-2 运行方式 · R-3 Mock 剧本 · R-4 失败计数 · R-5 REVIEWER · R-6 票号 · R-7 异常包装与 A9 | Chief |
+| 1.1 | 2026-10-16 | R-3 补 `ticket_id` 去重口径 · R-8 `--impact` 下推 Store · R-9 batch-close 退出码（禁用 1） | Chief |
