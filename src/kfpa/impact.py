@@ -157,8 +157,12 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
             store = Store(getattr(args, "db", "kfpa.db"))
         package = store.get_package(args.round_no)
         if package is None:
-            print(f"[impact] 第 {args.round_no} 轮没有任务包 → 先跑 `kfpa round`（退出码 3）")
-            return 3
+            # A16 口径：空库/无任务包时不得判红（rc=0），只说明「本轮还判不了快车道」。
+            print(
+                f"[impact] 第 {args.round_no} 轮还没有任务包：先跑 `kfpa round --round {args.round_no}`；"
+                "本轮不判快车道（未提供任务包与改动清单，不编造结论）"
+            )
+            return 0
         report = analyze(package, _collect_diff_files(args.repo, args.base))
         if args.json:
             print(dumps(report))

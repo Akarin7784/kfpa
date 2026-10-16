@@ -69,8 +69,8 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，运行期不依赖磐�
 #: 提示词模板目录
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-#: P1 默认 checkpoint 文件（D3-3.5：SqliteSaver，thread_id = kfpa-r{n}）
-CHECKPOINT_DB_DEFAULT = ".kfpa/checkpoints.sqlite"
+#: P1 默认 checkpoint 文件名（R-22.2：库固定在 `{workdir}/checkpoints.sqlite`）
+CHECKPOINT_DB_NAME = "checkpoints.sqlite"
 
 #: 高影响票硬规则的机器可判定标记（CLI 与测试都可据此断言）
 BLOCKED_MARK = "[KFPA-BLOCKED]"
@@ -932,11 +932,17 @@ def _result_from_state(state: dict) -> RoundResult:
 # ---------------------------------------------------------------- 对外轮次入口
 
 
+def default_checkpoint_path(workdir: str | Path) -> Path:
+    """R-22.2 冻结口径：checkpoint 库固定为 `{workdir}/checkpoints.sqlite`。"""
+    return Path(workdir) / CHECKPOINT_DB_NAME
+
+
 def make_checkpointer(path: str | Path | None = None) -> Any:
-    """构造 P1 默认 checkpoint（`SqliteSaver`，D3-3.5）。
+    """构造 P1 默认 checkpoint（`SqliteSaver`，D3-3.5 / R-22.2）。
 
     - 缺 `langgraph-checkpoint-sqlite` → `DependencyMissingError`（CLI 映射退出码 4）；
-    - `path=None` → `CHECKPOINT_DB_DEFAULT`；父目录自动创建。
+    - `path=None` → 用当前目录下的 `CHECKPOINT_DB_NAME`（正常路径由 `run_round` 传 workdir）；
+      父目录自动创建。
     """
     try:
         import sqlite3
@@ -947,7 +953,7 @@ def make_checkpointer(path: str | Path | None = None) -> Any:
             "[pipeline] 缺少 langgraph-checkpoint-sqlite（P1 checkpoint）"
             " → 让 Chief 按 D3 §5 统一安装；或用 `checkpointer=None` 关闭（退出码 4）"
         ) from exc
-    target = Path(path or CHECKPOINT_DB_DEFAULT)
+    target = Path(path or CHECKPOINT_DB_NAME)
     target.parent.mkdir(parents=True, exist_ok=True)
     # SqliteSaver.from_conn_string() 返回上下文管理器，不能直接当 saver 传给 compile()；
     # 这里自持连接（check_same_thread=False）并由 saver 持有引用，进程内有效、落盘持久。
@@ -955,22 +961,28 @@ def make_checkpointer(path: str | Path | None = None) -> Any:
     return SqliteSaver(connection)
 
 
-def _resolve_checkpointer(checkpointer: Any, round_no: int) -> Any:
-    """`"auto"` → 默认 SqliteSaver；`None` → 不挂（P0 A8 的三键 invoke 仍可跑）。"""
+def _resolve_checkpointer(checkpointer: Any, round_no: int, workdir: Path) -> Any:
+    """解析 checkpointer（R-22.2 + CLI `--checkpoint-db`）：
+
+    - `None` → 不挂（P0 的三键 invoke 与 A8 仍可跑）；
+    - `"auto"`（默认）→ `{workdir}/checkpoints.sqlite` 上的 `SqliteSaver`；
+    - 其它字符串 → 当成 `--checkpoint-db` 给的路径；
+    - 其它对象 → 原样作为 saver 传给 `compile()`。
+    """
     if checkpointer is None:
         return None
     if checkpointer == "auto":
         _ = round_no  # thread_id 由调用方按 `kfpa-r{n}` 传给 invoke
-        return make_checkpointer()
+        return make_checkpointer(default_checkpoint_path(workdir))
+    if isinstance(checkpointer, (str, Path)):
+        return make_checkpointer(checkpointer)
     return checkpointer
 
 
 def _default_roles() -> dict[str, dict]:
     """尽力读 `config/models.yaml` 的角色表（拿不到就空表：model_ref 记空串，不编造）。"""
     try:
-        from .config import load_roles
-
-        return dict(load_roles())
+        return ledger_mod.roles_from_config()
     except Exception:  # pragma: no cover - 缺配置不该拖垮流水线
         return {}
 
@@ -1004,7 +1016,7 @@ def run_round(
     if ledger is None:
         ledger = ledger_mod.make_ledger(store)
     resolved_roles = roles if roles is not None else _default_roles()
-    resolved_checkpointer = _resolve_checkpointer(checkpointer, round_no)
+    resolved_checkpointer = _resolve_checkpointer(checkpointer, round_no, Path(workdir))
     graph = build_graph(
         store=store,
         llm=ledger_mod.wrap_llm(
@@ -1064,7 +1076,7 @@ def run_round_via_graph(
 
 __all__ = [
     "PROMPTS_DIR",
-    "CHECKPOINT_DB_DEFAULT",
+    "CHECKPOINT_DB_NAME",
     "BLOCKED_MARK",
     "EXECUTOR_INJECTIONS",
     "MAX_TICKETS_PER_ROUND",
@@ -1082,6 +1094,7 @@ __all__ = [
     "render_task_package",
     "build_review_prompt",
     "make_checkpointer",
+    "default_checkpoint_path",
     "run_round",
     "run_round_via_graph",
     "build_graph",
