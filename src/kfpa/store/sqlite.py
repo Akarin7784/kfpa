@@ -874,6 +874,59 @@ class SqliteStore:
         ).fetchone()
         return None if row is None else _fastlane_from_row(row)
 
+    def update_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """整对象写回（长流 `fastlane._decide()` 的落库口）：**审计优先，拒绝翻案**。
+
+        - 行不存在 → 整条落库（`plan` 已登记过，这里当「保存」用，不新增异常路径）；
+        - 行已决（approved/rejected/escalated）：
+          - 传入状态与库里一致 → 返回库里那条（幂等，**不覆盖首次 `decided_by/decided_at`**）；
+          - 传入状态不同 → **返回库里那条，一个字段都不改**（`ESCALATED`/`REJECTED` 不许被翻成
+            `APPROVED`；要翻必须新开请求 —— D5-3.2 / A23，模块层 `fastlane.ack` 会抛 conflict）；
+        - 行仍 `pending` → 整条写回（正常状态迁移）。
+
+        与 :meth:`ack_fastlane_request` 的分工：那个是存储层的「单字段承认」便利口，
+        这个是模块层状态机把整条请求算完之后的写回口，两者的审计不变量一致。
+        """
+        current = self.get_fastlane_request(request.request_id)
+        if current is not None and _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = excluded.round_no,
+                summary         = excluded.summary,
+                diff_files      = excluded.diff_files,
+                new_interface   = excluded.new_interface,
+                new_data_model  = excluded.new_data_model,
+                touched_modules = excluded.touched_modules,
+                status          = excluded.status,
+                batch_id        = excluded.batch_id,
+                decided_by      = excluded.decided_by,
+                decided_at      = excluded.decided_at,
+                note            = excluded.note
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
     def list_fastlane_requests(
         self,
         status: Optional[FastlaneStatus | str] = None,

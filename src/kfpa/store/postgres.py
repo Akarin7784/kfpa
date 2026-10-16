@@ -587,6 +587,47 @@ class PostgresStore:
         ).fetchone()
         return None if row is None else _fastlane_from_row(row)
 
+    def update_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
+        """整对象写回（同 SQLite 侧语义：审计优先，已决行不覆盖、不翻案）。"""
+        current = self.get_fastlane_request(request.request_id)
+        if current is not None and _enum_value(current.status) != FastlaneStatus.PENDING.value:
+            return current
+        self._conn.execute(
+            """
+            INSERT INTO fastlane_requests(request_id, round_no, summary, diff_files,
+                                         new_interface, new_data_model, touched_modules,
+                                         status, batch_id, decided_by, decided_at, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(request_id) DO UPDATE SET
+                round_no        = EXCLUDED.round_no,
+                summary         = EXCLUDED.summary,
+                diff_files      = EXCLUDED.diff_files,
+                new_interface   = EXCLUDED.new_interface,
+                new_data_model  = EXCLUDED.new_data_model,
+                touched_modules = EXCLUDED.touched_modules,
+                status          = EXCLUDED.status,
+                batch_id        = EXCLUDED.batch_id,
+                decided_by      = EXCLUDED.decided_by,
+                decided_at      = EXCLUDED.decided_at,
+                note            = EXCLUDED.note
+            """,
+            (
+                request.request_id,
+                request.round_no,
+                request.summary,
+                dumps(list(request.diff_files)),
+                1 if request.new_interface else 0,
+                1 if request.new_data_model else 0,
+                dumps(list(request.touched_modules)),
+                _enum_value(request.status),
+                request.batch_id,
+                request.decided_by,
+                float(request.decided_at or 0.0),
+                request.note,
+            ),
+        )
+        return self.get_fastlane_request(request.request_id)  # type: ignore[return-value]
+
     def list_fastlane_requests(
         self,
         status: Optional[FastlaneStatus | str] = None,

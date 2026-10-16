@@ -75,8 +75,9 @@ def test_protocol_declares_p3_signatures():
     """`StoreProtocol` 必须声明 P3 六个方法（否则 PG 驱动漏实现也不会被发现）。"""
     store = st.Store(":memory:")
     assert isinstance(store, st.StoreProtocol)
-    for name in ("add_fastlane_request", "get_fastlane_request", "list_fastlane_requests",
-                 "ack_fastlane_request", "add_knowledge_sample", "list_knowledge_samples"):
+    for name in ("add_fastlane_request", "get_fastlane_request", "update_fastlane_request",
+                 "list_fastlane_requests", "ack_fastlane_request", "add_knowledge_sample",
+                 "list_knowledge_samples"):
         assert callable(getattr(store, name, None)), name
     store.close()
 
@@ -142,6 +143,54 @@ def test_list_fastlane_requests_filters_and_order():
     assert [r.request_id for r in store.list_fastlane_requests(status="pending")] == [
         "fl-1-1", "fl-1-2", "fl-2-2"]
     assert store.list_fastlane_requests(status="rejected") == []
+    store.close()
+
+
+def test_update_fastlane_request_persists_pending_and_upserts_missing():
+    """整对象写回（`fastlane._decide()` 的口）：pending 行整条落库；缺行当保存用。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    pending = store.get_fastlane_request("fl-1-1")
+    pending.summary = "微型规格（改过）"
+    pending.status = FastlaneStatus.APPROVED
+    pending.decided_by = "panshi"
+    pending.decided_at = 123.0
+    pending.batch_id = "flb-1-1"
+    got = store.update_fastlane_request(pending)
+    assert got.status is FastlaneStatus.APPROVED and got.decided_by == "panshi"
+    assert got.decided_at == 123.0 and got.batch_id == "flb-1-1"
+    assert got.summary == "微型规格（改过）"
+
+    # 缺行 → 整条落库（不新增异常路径）
+    fresh = store.update_fastlane_request(_req("fl-1-9", summary="未 plan 过"))
+    assert fresh.request_id == "fl-1-9" and fresh.status is FastlaneStatus.PENDING
+    store.close()
+
+
+def test_update_fastlane_request_never_rewrites_decided_row():
+    """已决行：同状态幂等返回库里那条（不覆盖首次 decided_by/decided_at）。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1"))
+    first = store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
+    tampered = store.get_fastlane_request("fl-1-1")
+    tampered.decided_by = "hacker"
+    tampered.decided_at = 999.0
+    got = store.update_fastlane_request(tampered)
+    assert got.decided_by == "panshi" and got.decided_at == first.decided_at
+    assert got.batch_id == "b-1"
+    store.close()
+
+
+def test_update_fastlane_request_refuses_flip_to_approved():
+    """A23 兜底：即使调用方绕过模块层状态机，存储层也不许把 escalated/rejected 翻成 approved。"""
+    store = st.Store(":memory:")
+    store.add_fastlane_request(_req("fl-1-1", status=FastlaneStatus.ESCALATED))
+    forged = store.get_fastlane_request("fl-1-1")
+    forged.status = FastlaneStatus.APPROVED
+    forged.decided_by = "panshi"
+    got = store.update_fastlane_request(forged)
+    assert got.status is FastlaneStatus.ESCALATED and got.decided_by == ""
+    assert store.get_fastlane_request("fl-1-1").status is FastlaneStatus.ESCALATED
     store.close()
 
 
@@ -388,6 +437,10 @@ def test_pg_driver_same_signature_and_same_semantics():
         store.ack_fastlane_request("fl-1-1", by="panshi", batch_id="b-1")
         store.ack_fastlane_request("fl-1-2", by="panshi", batch_id="b-1")
         store.ack_fastlane_request("fl-1-1", by="someone-else", batch_id="b-2")   # 幂等
+        # 长流 `_decide()` 的整对象写回口，两驱动必须一致
+        req = store.get_fastlane_request("fl-1-2")
+        req.summary = "改过"
+        store.update_fastlane_request(req)
         store.add_knowledge_sample(KnowledgeSample(cid="K1", sampled_at=0.0, sampled_by="panshi",
                                                    rate=0.2, passed=False))
 
