@@ -549,6 +549,26 @@ A18/A20 FAIL**。
 | 界面 | `cli.py` 的 `tickets` / 页面分支（与磐石分列不同函数） |
 | 镜鉴 | `tests/**` 落地（R-30 交接路径）、`verify_p2 --coverage-out` 复核、A18 期望改口径 |
 
+## R-32 A20 白名单拆成「纯逻辑」与「需外部服务」两类；PG 驱动的覆盖交给 A12
+
+- 镜鉴问：`store/postgres.py`（184 行）在 **clean env（无 Docker）下永远 0%**，而 A20 就是 clean env 跑的
+  → 门槛到不了 80%。这是**我的白名单设计问题**：R-22.4 把 `store/**` 整包划进门槛，没区分
+  「纯逻辑」与「需要外部服务」。
+- **裁决**：
+  1. **A20 门槛（clean env 必须能跑）只算纯逻辑白名单**：
+     `schemas.py`、`config.py`、`cli.py`、`gates.py`、`pipeline.py`、`review.py`、`eval.py`、
+     `store/__init__.py`、`store/sqlite.py`。
+     **`store/postgres.py` 从 A20 门槛排除**（与 `ui/**`、`executor.py`、`scripts/**` 同理）。
+  2. **PG 驱动的覆盖由 A12 双库对拍保证**（有 Docker 时真跑：9 表、票号、账本、门禁态、
+     `package_hash` 全一致），集成级验收比逐行覆盖更贴近风险。
+  3. 新增**可选报告项 A20b**：有 Docker 时输出 `store/postgres.py` 覆盖率与行数，**只报告、不作门槛**；
+     无 Docker 时显式 `SKIP`（可见，不算通过）。
+  4. 重算门槛：纯逻辑白名单 1761 语句，当前 1321（**75.0%**），**还需 +88 语句**到 80%
+     —— 主要在 `gates.py`（129 行未覆盖）与 `pipeline.py`（105 行未覆盖）。
+- 归属不变（R-31）：长流 `gates.py`/`pipeline.py`；磐石 `store/sqlite.py`、`store/__init__.py`
+  与「适配器依赖类 `RuntimeError` → rc=4」；界面 `cli.py` 的 `tickets`/页面分支；
+  镜鉴 `tests/**` 落地（R-30 交接路径）+ 台架 A18 期望改 rc 三分 + A20/A20b 口径。
+
 ---
 
 ## 变更记录
@@ -572,3 +592,4 @@ A18/A20 FAIL**。
 | 2.4 | 2026-10-16 | R-27 A12 探针必须做驱动归一（PG 元组 vs SQLite 标量），禁止改产品代码迁就探针 | Chief |
 | 2.5 | 2026-10-16 | R-28 回灌区只取「本轮 + 上一轮」失败（spec §5.2 原文），禁止全库历史导致 `package_hash` 漂移 | Chief |
 | 2.6 | 2026-10-17 | R-29 升版守卫=全部台架 · R-30 测试归属与交接路径 · R-31 A18 rc 口径纠正（未知 provider=2）+ A20 覆盖率缺口拆解（67.5%，不放水） | Chief |
+| 2.7 | 2026-10-17 | R-32 A20 白名单拆分：排除需外部服务的 `store/postgres.py`（覆盖交给 A12），纯逻辑门槛重算 75.0%，还需 +88 语句 | Chief |
