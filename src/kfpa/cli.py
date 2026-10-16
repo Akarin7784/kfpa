@@ -67,22 +67,17 @@ def default_workdir(round_no: int) -> str:
 
 
 def _open_store(db_arg: str) -> Any:
-    """打开状态库（口径见 `kfpa.store.make_store`，R-22.1）：
+    """打开状态库（口径见 `kfpa.store.make_store`，**R-25.1**）：
 
-    显式 DSN（`postgresql://…` / `sqlite://…`）> `KFPA_DB_URL` > 显式普通路径 > 默认 `kfpa.db`。
-    当环境变量压过显式普通路径时打一行中文提示——这种覆盖必须看得见，不许静默换库。
+    优先级 = 显式 `--db`（DSN 或普通路径）> `KFPA_DB_URL` > 默认 `kfpa.db`；
+    `KFPA_DB_URL` 只在「没给 `--db`」或「`--db` 就是默认 `kfpa.db`」时生效。
+
+    （早期版本反过来让环境变量压过显式路径，制造过「环境变量残留 → 台架临时库全被顶成同一个 PG」
+    的假红，R-25.1 已改回常规约定；判断逻辑统一在 `make_store()`，本函数只负责把默认值让给环境变量。）
     """
-    from .store import DB_URL_ENV, make_store, mask_dsn
+    from .store import make_store
 
     explicit = str(db_arg or "").strip()
-    env_url = os.environ.get(DB_URL_ENV, "").strip()
-    is_dsn = explicit.lower().startswith(("postgresql://", "postgres://", "sqlite://"))
-    if explicit and not is_dsn and env_url and explicit != "kfpa.db":
-        print(
-            f"[core] 提示：KFPA_DB_URL 优先于 --db {explicit} → 本次使用 {mask_dsn(env_url)}"
-            "（要强制本地 SQLite 请传 --db sqlite://<path>）",
-            file=sys.stderr,
-        )
     return make_store(explicit or None)
 
 
