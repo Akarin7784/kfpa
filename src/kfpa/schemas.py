@@ -429,16 +429,23 @@ class FastlaneRequest:
     note: str = ""
 
     def judged_fastlane(self) -> bool:
-        """三判据全真才算快车道（D5-3.2）。判定只做纯计算，编排不进这里。"""
+        """三判据全真**且 diff 来源可得**才算快车道（D5-3.2 / R-23 裁决 2）。
+
+        判定只做纯计算，编排不进这里。`diff_files` 为空 = 没有 diff 来源（R-23 的第三来源
+        `no_diff_source`）→ 波及面无从判断，按 R-23「不猜、不默认 True」返回 False。
+        """
         return (
             not self.new_interface
             and not self.new_data_model
             and len(set(self.touched_modules)) <= 1
+            and bool(self.diff_files)
         )
 
     def escalations(self) -> list[str]:
-        """不满足判据的原因清单 —— 不许只给布尔（D5-3.2）。"""
+        """不满足判据的原因清单 —— 不许只给布尔（D5-3.2 / R-35）。"""
         reasons: list[str] = []
+        if not self.diff_files:
+            reasons.append("no_diff_source")      # R-23 第三来源：无 diff 来源 = 不可判
         if self.new_interface:
             reasons.append("new_interface")
         if self.new_data_model:
