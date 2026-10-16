@@ -17,9 +17,9 @@ services:
       # 保证按 UTF-8 / C 排序初始化，避免不同宿主机排序规则差异影响对拍
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      # 默认 55432（D3 §1.5）。本机若已被别的项目占用，用环境变量覆盖即可，
-      # 例如：$env:KFPA_PG_PORT="55435"; docker compose -f docker-compose.pg.yml up -d
-      - "${KFPA_PG_PORT:-55432}:5432"
+      # 默认 55440（D2 R-22.1）。本机 55432/55433/55434 已被其它项目占用，KFPA 不得使用；
+      # 需要更换时：$env:KFPA_PG_PORT="55441"; docker compose -f docker-compose.pg.yml up -d
+      - "${KFPA_PG_PORT:-55440}:5432"
     healthcheck:
       # pg_isready 通过后 up -d 才能视为「可用」，A12 对拍前先等健康
       test: ["CMD-SHELL", "pg_isready -U kfpa -d kfpa -h 127.0.0.1"]
