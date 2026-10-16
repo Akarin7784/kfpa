@@ -597,14 +597,64 @@ def check_a21(ctx: Ctx, c: Check) -> None:
             data = None
             c.add(ok=False, note=f"报告 JSON 解析失败：{exc}")
         if data is not None:
-            need = ("total", "missed", "false_alarms", "agreement",
-                    "baseline_missed", "baseline_false_alarms", "baseline_agreement")
-            blob = json.dumps(data, ensure_ascii=False)
-            missing = [k for k in need if k not in blob]
-            c.add(ok=not missing, note=f"报告含四项指标 + baseline 对比列：缺 {missing or '无'}")
-            if missing:
-                c.fail(f"A21：报告缺字段 {missing}（D4 §3.4 四项指标 + baseline）。")
-            c.warn("A21：报告结构是嵌套/扁平均可，我只校验字段可达性与可复算性。")
+            # D4 §3.4（Chief 冻结的报告形状）：
+            # {corpus, generated_at, provider, baseline_provider, metrics{…}, samples[…]}
+            top_need = ("corpus", "generated_at", "provider", "baseline_provider",
+                        "metrics", "samples")
+            top_missing = [k for k in top_need if k not in data]
+            c.add(ok=not top_missing,
+                  note=f"报告顶层键 = {sorted(data)}；缺 {top_missing or '无'}")
+            if top_missing:
+                c.fail(f"A21：报告顶层缺 {top_missing}（D4 §3.4 冻结形状："
+                       "corpus/generated_at/provider/baseline_provider/metrics/samples）。")
+            c.add(ok=isinstance(data.get("generated_at"), (int, float)),
+                  note=f"generated_at = {data.get('generated_at')!r}（应为 epoch 数值）")
+            if not isinstance(data.get("generated_at"), (int, float)):
+                c.fail("A21：`generated_at` 不是 epoch 数值。")
+            metrics = data.get("metrics") or {}
+            if not isinstance(metrics, dict):
+                c.fail(f"A21：`metrics` 应为对象，实际 {type(metrics).__name__}。")
+                metrics = {}
+            metric_fields = ("corpus", "total", "missed", "false_alarms", "agreement",
+                             "baseline_missed", "baseline_false_alarms", "baseline_agreement")
+            mmiss = [k for k in metric_fields if k not in metrics]
+            c.add(ok=not mmiss, note=f"metrics 键 = {sorted(metrics)}；缺 {mmiss or '无'}")
+            if mmiss:
+                c.fail(f"A21：`metrics` 缺 {mmiss}（必须与 schemas.ReviewMetrics 一一对应）。")
+            samples = data.get("samples")
+            c.add(ok=isinstance(samples, list) and bool(samples),
+                  note=f"samples 条数 = {len(samples) if isinstance(samples, list) else 'N/A'}")
+            if not isinstance(samples, list):
+                c.fail("A21：`samples` 必须是数组（渲染层要逐条标出漏检/误报，不许自己推断）。")
+                samples = []
+            bad = [s for s in samples if not isinstance(s.get("missed"), bool)
+                   or not isinstance(s.get("false_alarm"), bool)]
+            c.add(ok=not bad,
+                  note=f"samples 每条自带 missed/false_alarm 布尔：不合规 {len(bad)} 条")
+            if bad:
+                c.fail("A21：`samples` 里存在缺 `missed`/`false_alarm` 布尔（或写成非布尔）的条目 —— "
+                       "D4 §3.4 要求逐条给出，渲染层不得自行推断。")
+            c.add(ok=len(samples) == int(metrics.get("total") or -1),
+                  note=f"len(samples) = {len(samples)} vs metrics.total = {metrics.get('total')}")
+            if isinstance(samples, list) and metrics.get("total") is not None \
+                    and len(samples) != int(metrics.get("total") or -1):
+                c.fail("A21：`samples` 条数与 `metrics.total` 不一致。")
+            # 可复算：指标必须与逐样本明细自洽
+            if samples and all(isinstance(s.get("missed"), bool) for s in samples):
+                sum_missed = sum(1 for s in samples if s.get("missed"))
+                sum_fa = sum(1 for s in samples if s.get("false_alarm"))
+                c.add(ok=sum_missed == int(metrics.get("missed") or -1),
+                      note=f"复算漏检：samples 求和 {sum_missed} vs metrics.missed "
+                           f"{metrics.get('missed')}")
+                if sum_missed != int(metrics.get("missed") or -1):
+                    c.fail("A21：`metrics.missed` 与逐样本 `missed` 求和不一致（不可复算）。")
+                c.add(ok=sum_fa == int(metrics.get("false_alarms") or -1),
+                      note=f"复算误报：samples 求和 {sum_fa} vs metrics.false_alarms "
+                           f"{metrics.get('false_alarms')}")
+                if sum_fa != int(metrics.get("false_alarms") or -1):
+                    c.fail("A21：`metrics.false_alarms` 与逐样本 `false_alarm` 求和不一致。")
+            c.warn("A21：「缺 baseline_* 判无法判定」是渲染层（interface 侧 ui/eval_page.py）的口径，"
+                   "台架只保证生产端 `metrics` 永远带 baseline_* 字段。")
 
     # 独立复算 + 边界（纯函数）
     try:
