@@ -99,18 +99,22 @@ python -m kfpa.ui.knowledge_page --db kfpa.db --out-dir reports --format both
 
 | 文件 | 说明 |
 |---|---|
-| `fastlane-demo.md` / `.html` | **演示产物**：承认台账渲染链路（已承认 / 待承认 / 已升级三态 + `batch_id`/`decided_by`/`decided_at`）。行是演示行，不是真库读出 |
-| `knowledge-report.md` / `.html` | **正式产物**：真 SQLite 库（4 条候选：2 隔离 / 1 转正 / 1 丢弃）经 `kfpa knowledge list --json` 读出后渲染 |
+| `fastlane-flb-1-1.md` / `.html` | **真产物**：真 SQLite 库经 `kfpa fastlane plan` → 界面承认（真 `batch-ack` 子进程）→ 回读后渲染（含 `batch_id=flb-1-1` / `decided_by` / `decided_at`，以及一条 `escalated` 对照行） |
+| `knowledge-report.md` / `.html` | **真产物**：真 SQLite 库经 `kfpa knowledge ingest/promote/sample --fail` 后，由 `knowledge list --json` + `knowledge report --json` 渲染（门槛 0.8 / 隔离区 1 / 已转正 1 / 已丢弃 2 / 抽检留痕 1 / 回避模式清单） |
 
-> 快车道台账暂时只有**演示产物**：`fastlane_requests` 表随 `migrations/0003_fastlane.sql`（p3/store）落地，
-> 落地后把 `python -m kfpa.ui.fastlane_page` 指向真库，即可得到 `reports/fastlane-<批次>.{md,html}`。
-> `fastlane-demo.*` 证明的是**渲染链路与离线可打印**，不是承认结论。
+**产物来源标注（重要）**：上面两份是在 **`#58`（长流 `p3/knowledge`）+ `#61`（磐石 `p3/store`）的临时合流树**上真跑出来的
+（两笔当时还没合进 `main`，`main` 上还没有 `kfpa fastlane` 与 `0003_fastlane.sql`）；
+过程**零补丁**：`plan/list/batch-ack` 与 `knowledge ingest/promote/sample` 全部走真子进程 CLI，落库是磐石的真 store。
+两笔合入 `main` 后按上面的「正式链路」复跑一遍即可刷新数字（产物里带生成时间，便于比对）。
+
+> 之前那份 `fastlane-demo.*`（演示行）已随真产物删除 —— 承认台账现在有真库可读了。
 
 ## 界面怎么用（P3）
 
 - 快车道**真承认**页：`kfpa/ui/fastlane_page.py`（写库走 D5 §3.2 冻结命令 `kfpa fastlane batch-ack`，
   写完回读 `fastlane list --json` 确认；`ESCALATED`/`REJECTED` 在勾选池里就取不到；
-  勾选条数必须与人手填的确认条数一致才放行）。
-- 沉淀闸门页：`kfpa/ui/knowledge_page.py`（隔离区 / 已转正 / 已丢弃 / 抽检留痕，只读）。
+  勾选条数必须与人手填的确认条数一致才放行；**二次承认按 D5 §3.2 幂等保留首次留痕**，
+  这种行进 `replayed` 并摊在页面上，不会冒领成这次写的）。
+- 沉淀闸门页：`kfpa/ui/knowledge_page.py`（隔离区 / 已转正 / 已丢弃 / 待抽检队列 / 抽检留痕 / 回避模式清单，只读）。
 - 整页（可选，不列入验收）：`KFPA_UI_NO_ACK=1` / `KFPA_UI_NO_KNOWLEDGE=1` 可分别关掉两页。
 

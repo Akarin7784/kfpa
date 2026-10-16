@@ -8,7 +8,9 @@ P1 的预览页仍在 ``kfpa/ui/fastlane.py``（判据侧预演，明确标注�
 
 1. **一键都不许凭空写库**：唯一写入口是 D5 §3.2 冻结的 CLI ——
    ``kfpa fastlane batch-ack --file <acks.yaml> --by <name>``；
-   写完后本页**回读** ``kfpa fastlane list --json`` 确认状态真的翻了、``decided_by`` 是我们传的人，
+   写完后本页**回读** ``kfpa fastlane list --json`` 确认状态真的翻了 ``approved``、
+   ``decided_by`` 是本次承认人或**此前已有的同一个人**（D5 §3.2 的幂等：二次承认保留首次留痕，
+   这种行进 ``replayed`` 并摊在页面上，不冒领成这次写的），
    回读不认就报「写入未确认」，**不谎报成功**。
 2. **``ESCALATED`` / ``REJECTED`` 不许被 ack 翻白**（D5 §3.2）：这些行在界面上根本不进勾选池，
    即使被硬塞进来也在 ``plan_ack()`` 里被拒并指名原因（要翻必须新开请求）。
@@ -419,8 +421,11 @@ def batch_ack(
     """**真承认**：``kfpa fastlane batch-ack --file acks.yaml --by <name>`` + 回读确认。
 
     返回字段：``ok`` / ``written`` / ``verified`` / ``batch_id`` / ``decided_by`` / ``decided_at``
-    / ``acknowledged`` / ``refused`` / ``reasons`` / ``stdout``。
-    ``ok`` 为真当且仅当：防误点过了 + CLI 退出码 0 + 回读看到状态翻成 ``approved`` 且 ``decided_by`` 相符。
+    / ``acknowledged`` / ``replayed`` / ``refused`` / ``reasons`` / ``stdout``。
+    ``ok`` 为真当且仅当：防误点过了 + CLI 退出码 0 + 回读看到每个请求都落在 ``approved``，
+    且 ``decided_by`` 要么是本次承认人、要么是**此前已有的**同一个人（D5 §3.2 的幂等：
+    二次承认不覆盖首次留痕 —— 这种情形进 ``replayed``，会摊在页面上，不冒领成这次写的）。
+    回读与预期任何一处不符 → ``ok=False`` + ``unverified``，**绝不谎报成功**。
     """
     rows = list(rows)
     verdict = plan_ack(rows, selected_ids, typed_count=typed_count, by=by)
@@ -471,14 +476,34 @@ def batch_ack(
         return result
 
     by_name = {row["request_id"]: row for row in after}
+    prior = {row["request_id"]: row for row in rows}
     unverified: list[dict[str, str]] = []
+    replayed: list[dict[str, str]] = []
     for request_id in verdict["accepted"]:
         now = by_name.get(request_id)
         if now is None:
             unverified.append({"request_id": request_id, "reason": "回读台账里找不到该请求"})
-        elif now["status"] != "approved":
+            continue
+        if now["status"] != "approved":
             unverified.append({"request_id": request_id, "reason": f"回读状态仍是 `{now['status']}`"})
-        elif now["decided_by"] and now["decided_by"] != verdict["by"]:
+            continue
+        if not now["decided_by"] or now["decided_by"] == verdict["by"]:
+            continue
+        # D5 §3.2 的幂等：二次承认**不覆盖**首次 decided_by/decided_at，返回原记录。
+        # 所以「承认人与本次不同」在**此前已有决定**时是正确行为，不算回读失败 ——
+        # 但必须显式摊出来，别让人以为是这次写的（真实集成跑抓到的假红，见 v0.2 修复）。
+        prior_by = str(prior.get(request_id, {}).get("decided_by") or "")
+        if prior_by and now["decided_by"] == prior_by:
+            replayed.append(
+                {
+                    "request_id": request_id,
+                    "reason": (
+                        f"本条此前已由 {prior_by} 承认，按 D5 §3.2 幂等保留首次留痕"
+                        f"（batch_id/decided_by/decided_at 未被本次覆盖）"
+                    ),
+                }
+            )
+        else:
             unverified.append(
                 {"request_id": request_id, "reason": f"回读 decided_by=`{now['decided_by']}` 与承认人 `{verdict['by']}` 不符"}
             )
@@ -486,6 +511,7 @@ def batch_ack(
     result.update(_pick_batch(after, verdict["accepted"]))
     result["verified"] = not unverified
     result["unverified"] = unverified
+    result["replayed"] = replayed
     result["acknowledged"] = [by_name.get(rid) or {"request_id": rid} for rid in verdict["accepted"]]
     result["ok"] = not unverified
     if unverified:
@@ -571,8 +597,17 @@ def render(
                 f"decided_at={_fmt_time(result.get('decided_at'))}）"
                 f"{_CMD_SEP}回读已确认"
             )
+            for item in result.get("replayed", []):
+                st.info(f"{item['request_id']}：{item['reason']}")
             if report_dir:
-                written = write_reports(rows, batch_id=result.get("batch_id") or "", out_dir=report_dir)
+                # 报告用**回读后**的行（承认人/时间/批次以库里为准），其余行照原样
+                fresh = {
+                    item.get("request_id"): item
+                    for item in result.get("acknowledged", [])
+                    if isinstance(item, dict) and item.get("request_id")
+                }
+                after_rows = [fresh.get(row["request_id"]) or row for row in rows]
+                written = write_reports(after_rows, batch_id=result.get("batch_id") or "", out_dir=report_dir)
                 if written.get("files"):
                     st.caption("台账报告：" + "、".join(written["files"]))
         else:

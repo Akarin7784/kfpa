@@ -21,22 +21,28 @@ tr:nth-child(even) td { background: #fafafa; }
 </head>
 <body>
 <h1>知识沉淀闸门报告</h1>
-<p class="meta">生成时间：2026-10-17 01:42:33 · 候选总数：4 · 隔离区 2 · 已转正 1 · 已丢弃 1</p>
+<p class="meta">生成时间：2026-10-17 02:27:24 · 候选总数：4 · 门槛 0.8 · 隔离区 1 · 已转正 1 · 已丢弃 2 · 待抽检 0 · 已抽检 1</p>
 <h2>隔离区（等后续轮次复用）</h2>
 <table><thead><tr><th>票号</th><th>轮次</th><th>类型</th><th>置信度</th><th>状态</th><th>成功复用轮次</th><th>内容</th></tr></thead><tbody>
-<tr><td>K1</td><td>1</td><td>正知识</td><td>0.92</td><td>隔离区（待后续轮次复用转正）</td><td>-</td><td>G7 覆盖率报告只在业主提供时启用；缺则标『仅报告』</td></tr>
-<tr><td>K3</td><td>2</td><td>负知识（回避模式）</td><td>0.71</td><td>隔离区（待后续轮次复用转正）</td><td>-</td><td>不要用 git 工作树状态判定快车道（R-23）</td></tr>
+<tr><td>K3</td><td>1</td><td>负知识（回避模式）</td><td>0.71</td><td>隔离区（待后续轮次复用转正）</td><td>-</td><td>K3 的沉淀内容（真 CLI 入闸）</td></tr>
 </tbody></table>
 <h2>已转正</h2>
 <table><thead><tr><th>票号</th><th>轮次</th><th>类型</th><th>置信度</th><th>状态</th><th>成功复用轮次</th><th>内容</th></tr></thead><tbody>
-<tr><td>K2</td><td>1</td><td>正知识</td><td>0.88</td><td>已转正</td><td>2</td><td>快车道三判据任一为假必须升级回完整设计回合</td></tr>
+<tr><td>K2</td><td>1</td><td>正知识</td><td>0.88</td><td>已转正</td><td>2</td><td>K2 的沉淀内容（真 CLI 入闸）</td></tr>
 </tbody></table>
 <h2>已丢弃（含抽检不过 → 回避模式）</h2>
 <table><thead><tr><th>票号</th><th>轮次</th><th>类型</th><th>置信度</th><th>状态</th><th>成功复用轮次</th><th>内容</th></tr></thead><tbody>
-<tr><td>K4</td><td>2</td><td>正知识</td><td>0.42</td><td>已丢弃</td><td>-</td><td>低置信度候选（0.42）应直接丢弃，不进隔离区</td></tr>
+<tr><td>K1</td><td>1</td><td>正知识</td><td>0.92</td><td>已丢弃</td><td>-</td><td>K1 的沉淀内容（真 CLI 入闸）</td></tr>
+<tr><td>K4</td><td>1</td><td>正知识</td><td>0.42</td><td>已丢弃</td><td>-</td><td>K4 的沉淀内容（真 CLI 入闸）</td></tr>
 </tbody></table>
-<h2>抽检队列 / 留痕</h2>
+<h2>待抽检队列</h2>
 <p class="meta">（空）</p>
+<h2>抽检留痕（knowledge_samples）</h2>
+<table><thead><tr><th>票号</th><th>抽样率</th><th>抽检人</th><th>时间</th><th>结论</th></tr></thead><tbody>
+<tr><td>K1</td><td>0.2000</td><td>jiemian</td><td>2026-10-17 02:27:23</td><td>不通过（→ 丢弃 + 回避模式）</td></tr>
+</tbody></table>
+<h2>回避模式清单（负知识，下一轮任务包回灌）</h2>
+<ul><li>K1 的沉淀内容（真 CLI 入闸）</li></ul>
 <p class="note">口径：D5 §3.3 —— 低于置信度门槛直接丢弃；隔离区只被后续轮次复用才转正（同轮不算）；抽检不过 → 丢弃并写入回避模式清单。本文件单文件离线可打印，无外部依赖。</p>
 </body>
 </html>
