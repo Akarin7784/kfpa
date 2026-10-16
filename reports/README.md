@@ -23,17 +23,28 @@ python -m streamlit run src/kfpa/ui/eval_page.py
 - 不给 `--out` 时输出名与输入同名、后缀随格式（`.md` / `.html` / `.json`）。
 - 退出码：`0` 成功 / `2` 参数与 JSON 解析错 / `4` 输入文件不存在或缺少 streamlit / `5` 写文件失败。
 
-## 接受的输入形状（宽松）
+## 输入形状（D4 §3.4 已冻结）
 
-`src/kfpa/ui/eval_page.py` 归一化时按顺序匹配，四种都认：
+正式形状（`kfpa eval review --out` 的输出，长流生产）：
 
-1. `schemas.ReviewMetrics` 实例（任何带 `total/missed/agreement` 的对象也行）；
-2. `{"metrics": {…}, "samples": [...]}`；
-3. 扁平指标 dict（`to_jsonable(ReviewMetrics)`），可选带 `samples` / `details` / `cases`；
-4. `{"groups": {"hetero": {…}, "baseline": {…}}, "samples": [...]}`。
+```json
+{
+  "corpus": "benchmarks/review/seed.jsonl",
+  "generated_at": 1792150000.0,
+  "provider": "mock_hetero",
+  "baseline_provider": "mock",
+  "metrics": { "corpus": "…", "total": 24, "missed": 1, "false_alarms": 0, "agreement": 0.958,
+               "baseline_missed": 3, "baseline_false_alarms": 1, "baseline_agreement": 0.833 },
+  "samples": [ { "id": "S001", "human_verdict": "fail", "review_verdict": "pass",
+                 "missed": true, "false_alarm": false,
+                 "findings": [ { "severity": "major", "location": "段4", "issue": "…", "criterion": "AC2" } ] } ]
+}
+```
 
-判据按 D4 §3.4：`missed ≤ baseline_missed` 且 `false_alarms ≤ baseline_false_alarms` 且
-`agreement ≥ baseline_agreement`；**没有 `baseline_*` 字段时判为「无法判定」**（不按 0 假设）。
+- `metrics` 字段名与 `schemas.ReviewMetrics` 一一对应；**结论（通过/不通过）由渲染层用 `passed()` 判**，报告不写死。
+- `samples` 每条**自带 `missed` / `false_alarm` 布尔**，渲染层**不得自行推断**；缺布尔时标「未标注」并在报告里给提示。
+- **缺 `baseline_*` 时判「无法判定」**，不按 0 假设。
+- 另为兼容保留：`schemas.ReviewMetrics` 实例、扁平指标 dict、`{"groups": {"hetero": …, "baseline": …}, "samples": […]}`。
 
 ## 本目录文件
 

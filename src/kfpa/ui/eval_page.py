@@ -87,6 +87,16 @@ def contract_version() -> str:
         return "unknown"
 
 
+def _fmt_time(value: Any) -> str:
+    """epoch 秒 → 本地时间；缺或非法 → 「未标注」。"""
+    if value in (None, ""):
+        return "未标注"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
 def _as_metrics(value: Any) -> dict[str, Any]:
     """只挑指标字段，缺的键留空（由 ``_fill_defaults`` 补）。"""
     raw = _to_jsonable(value)
@@ -124,26 +134,43 @@ def _fill_defaults(metrics: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _flag(sample: dict[str, Any], *keys: str) -> Optional[bool]:
+    """只认生产者给的显式布尔；缺或非布尔 → None。
+
+    D4 §3.4 冻结形状：``samples`` 每条自带 ``missed`` / ``false_alarm``，渲染层**不得**自行推断，
+    因此这里不做「按 human_verdict + verdict 反推」的兜底，只解析真值。
+    """
+    for key in keys:
+        if key not in sample:
+            continue
+        value = sample[key]
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes"):
+            return True
+        if text in ("false", "0", "no"):
+            return False
+    return None
+
+
 def _sample_row(sample: dict[str, Any], index: int) -> dict[str, Any]:
     human = str(sample.get("human_verdict") or sample.get("human") or "").strip().lower()
     verdict = str(
-        sample.get("verdict") or sample.get("hetero_verdict") or sample.get("review_verdict") or ""
+        sample.get("review_verdict") or sample.get("verdict") or sample.get("hetero_verdict") or ""
     ).strip().lower()
     baseline = str(sample.get("baseline_verdict") or sample.get("same_origin_verdict") or "").strip().lower()
 
-    missed = sample.get("missed")
-    if missed is None:
-        # D4 §3.4：人工标 fail 而评审给 pass（或没判定）→ 漏检
-        missed = human == "fail" and verdict in ("", "pass", "unknown")
-    false_alarm = sample.get("false_alarm", sample.get("false_positive"))
-    if false_alarm is None:
-        false_alarm = human == "pass" and verdict == "fail"
+    missed = _flag(sample, "missed")
+    false_alarm = _flag(sample, "false_alarm", "false_positive")
 
-    defects = sample.get("defects") or sample.get("injected_defects") or []
-    if isinstance(defects, dict):
-        defects = [defects]
-    if not isinstance(defects, list):
-        defects = []
+    findings = sample.get("findings") or sample.get("defects") or sample.get("injected_defects") or []
+    if isinstance(findings, dict):
+        findings = [findings]
+    if not isinstance(findings, list):
+        findings = []
 
     return {
         "id": str(sample.get("id") or sample.get("sample_id") or f"S{index:03d}"),
@@ -151,9 +178,10 @@ def _sample_row(sample: dict[str, Any], index: int) -> dict[str, Any]:
         "human": human or "未标注",
         "verdict": verdict or "未判定",
         "baseline": baseline or "-",
-        "missed": bool(missed),
-        "false_alarm": bool(false_alarm),
-        "defects": defects,
+        "missed": missed,
+        "false_alarm": false_alarm,
+        "flagged": missed is not None and false_alarm is not None,
+        "defects": findings,
     }
 
 
@@ -162,9 +190,11 @@ def _defect_text(defects: list[Any]) -> str:
     for item in defects:
         if isinstance(item, dict):
             criterion = item.get("criterion") or item.get("cid") or ""
+            severity = item.get("severity") or ""
             kind = item.get("kind") or item.get("type") or ""
+            issue = item.get("issue") or ""
             location = item.get("location") or ""
-            text = "／".join(str(x) for x in (criterion, kind, location) if x)
+            text = "／".join(str(x) for x in (criterion, severity, kind, issue, location) if x)
             parts.append(text or json.dumps(item, ensure_ascii=False))
         else:
             parts.append(str(item))
@@ -172,18 +202,31 @@ def _defect_text(defects: list[Any]) -> str:
 
 
 def normalize(payload: Any) -> dict[str, Any]:
-    """把各种输入形状归一成 ``{metrics, samples, groups, has_baseline, passed, conclusion}``。"""
+    """把各种输入形状归一成 ``{meta, metrics, samples, groups, has_baseline, passed, conclusion, notes}``。
+
+    D4 §3.4 冻结形状的顶层是 ``{corpus, generated_at, provider, baseline_provider, metrics, samples}``，
+    这里同时兼容扁平 dict / ``ReviewMetrics`` 实例 / ``groups`` 分组形态。
+    """
     raw = _to_jsonable(payload)
     groups: dict[str, dict[str, Any]] = {}
     samples_raw: list[dict[str, Any]] = []
     has_baseline = False
+    meta: dict[str, Any] = {"corpus": "", "generated_at": None, "provider": "", "baseline_provider": ""}
+    notes: list[str] = []
 
     if isinstance(raw, dict):
+        meta["corpus"] = str(raw.get("corpus") or "")
+        meta["generated_at"] = raw.get("generated_at")
+        meta["provider"] = str(raw.get("provider") or "")
+        meta["baseline_provider"] = str(raw.get("baseline_provider") or "")
+
         metrics_raw = raw.get("metrics") or raw.get("review_metrics")
         if metrics_raw is None:
             metrics_raw = raw  # 扁平结构
         has_baseline = any(field in metrics_raw for field in _BASELINE_FIELDS) if isinstance(metrics_raw, dict) else False
         metrics = _fill_defaults(_as_metrics(metrics_raw))
+        if not metrics["corpus"]:
+            metrics["corpus"] = meta["corpus"]
 
         for key in _SAMPLE_LIST_KEYS:
             value = raw.get(key)
@@ -206,8 +249,19 @@ def normalize(payload: Any) -> dict[str, Any]:
     else:
         metrics = _fill_defaults(_as_metrics(raw))
         has_baseline = any(hasattr(raw, field) for field in _BASELINE_FIELDS)
+        meta["corpus"] = metrics["corpus"]
 
     samples = [_sample_row(item, index) for index, item in enumerate(samples_raw, 1)]
+
+    unflagged = [s["id"] for s in samples if not s["flagged"]]
+    if unflagged:
+        notes.append(
+            f"{len(unflagged)} 条样本缺 missed/false_alarm 布尔（D4 §3.4 要求生产者给出）"
+            f"→ 渲染层不推断，按「未标注」处理：{'、'.join(unflagged[:8])}"
+            + ("…" if len(unflagged) > 8 else "")
+        )
+    if not has_baseline:
+        notes.append("缺 baseline_* 指标 → 结论判「无法判定」，不按 0 假设（D4 §3.4）")
 
     passed: Optional[bool]
     if has_baseline:
@@ -225,14 +279,17 @@ def normalize(payload: Any) -> dict[str, Any]:
         )
 
     return {
+        "meta": meta,
         "metrics": metrics,
         "samples": samples,
         "groups": groups,
         "has_baseline": has_baseline,
         "passed": passed,
         "conclusion": conclusion,
-        "missed_samples": [s for s in samples if s["missed"]],
-        "false_alarm_samples": [s for s in samples if s["false_alarm"]],
+        "notes": notes,
+        "unflagged": unflagged,
+        "missed_samples": [s for s in samples if s["missed"] is True],
+        "false_alarm_samples": [s for s in samples if s["false_alarm"] is True],
     }
 
 
@@ -317,10 +374,12 @@ def table_rows(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
 
 def _problem_of(sample: dict[str, Any]) -> str:
-    if sample["missed"]:
+    if sample["missed"] is True:
         return "漏检"
-    if sample["false_alarm"]:
+    if sample["false_alarm"] is True:
         return "误报"
+    if not sample["flagged"]:
+        return "未标注"
     return "—"
 
 
@@ -352,7 +411,8 @@ def render_markdown(payload: Any, *, full: bool = False) -> str:
         "# KFPA 同源盲区度量报告（P2 / A21）",
         "",
         f"- 种子集：`{metrics['corpus'] or '未标注'}`　样本数：**{metrics['total']}**",
-        f"- 契约版本：`{contract_version()}`",
+        f"- 异构 provider：`{data['meta']['provider'] or '未标注'}`　同源 baseline：`{data['meta']['baseline_provider'] or '未标注'}`",
+        f"- 生成时间：`{_fmt_time(data['meta'].get('generated_at'))}`　契约版本：`{contract_version()}`",
         "",
         "## 指标对照（异构 REVIEWER vs 同源 baseline）",
         "",
@@ -362,6 +422,10 @@ def render_markdown(payload: Any, *, full: bool = False) -> str:
         [[r["指标"], r["异构"], r["同源基线"], r["判据"], r["结果"]] for r in tables["metrics"]],
     )
     lines += ["", "## 结论", "", data["conclusion"], ""]
+    for note in data["notes"]:
+        lines.append(f"> ⚠️ {note}")
+    if data["notes"]:
+        lines.append("")
 
     if data["groups"]:
         lines += ["## 分组明细", ""]
@@ -412,6 +476,7 @@ th{background:#f3f4f6}
 .pass{color:#0a7d32;font-weight:600}
 .fail{color:#b42318;font-weight:600}
 .unknown{color:#9a6700;font-weight:600}
+.note{color:#9a6700;font-size:.88rem;margin:.2rem 0}
 .meta{color:#57606a;font-size:.85rem}
 code{background:#f3f4f6;padding:0 .2rem;border-radius:3px}
 """
@@ -443,12 +508,18 @@ def render_html(payload: Any, *, full: bool = False) -> str:
         "</head><body>",
         "<h1>KFPA 同源盲区度量报告（P2 / A21）</h1>",
         f'<p class="meta">种子集 <code>{html.escape(metrics["corpus"] or "未标注")}</code>'
-        f"　样本数 <b>{metrics['total']}</b>　契约 <code>{html.escape(contract_version())}</code></p>",
+        f"　样本数 <b>{metrics['total']}</b>"
+        f"　异构 <code>{html.escape(data['meta']['provider'] or '未标注')}</code>"
+        f"　同源 <code>{html.escape(data['meta']['baseline_provider'] or '未标注')}</code>"
+        f"　生成 {html.escape(_fmt_time(data['meta'].get('generated_at')))}"
+        f"　契约 <code>{html.escape(contract_version())}</code></p>",
         "<h2>指标对照（异构 REVIEWER vs 同源 baseline）</h2>",
         _table(["指标", "异构", "同源基线", "判据", "结果"], tables["metrics"]),
         "<h2>结论</h2>",
         f'<p class="{cls}">{html.escape(data["conclusion"])}</p>',
     ]
+    for note in data["notes"]:
+        parts.append(f'<p class="note">⚠️ {html.escape(note)}</p>')
 
     if data["groups"]:
         parts.append("<h2>分组明细</h2>")
@@ -516,6 +587,13 @@ def page(st, payload: Any, *, full: bool = True) -> dict[str, Any]:
     st.set_page_config(page_title="KFPA 同源盲区度量", layout="wide")
     st.title("KFPA 同源盲区度量报告")
     st.caption("P2 / A21：异构 REVIEWER vs 同源 baseline，判据＝不漏检、不增误报、不降一致率（D4 §3.4）。")
+    st.caption(
+        f"种子集 `{data['meta']['corpus'] or '未标注'}`　异构 `{data['meta']['provider'] or '未标注'}`"
+        f"　同源 `{data['meta']['baseline_provider'] or '未标注'}`"
+        f"　生成 {_fmt_time(data['meta'].get('generated_at'))}"
+    )
+    for note in data["notes"]:
+        st.warning(note)
 
     metrics = data["metrics"]
     left, middle, right = st.columns(3)
