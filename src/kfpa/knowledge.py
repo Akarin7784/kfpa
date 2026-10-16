@@ -1,10 +1,10 @@
 """知識沉淀闸门（P1 D3-3.5 + **P3 D5 §3.3 全量** / design.md §5.5 防知识库中毒）。
 
-规则表（D5 §3.3 冻结；括号内是 P1 旧值，已被 P3 取代）：
+规则表（D5 §3.3 + R-33）：
 
 | 阶段 | 规则 |
 |---|---|
-| 入隔离区 | `confidence >= CONFIDENCE_THRESHOLD`（**P3 = 0.6**，P1 旧值 0.80）且内容非空；低于门槛或空内容 → 直接 `dropped`，**不进隔离区** |
+| 入隔离区 | `confidence >= CONFIDENCE_THRESHOLD`（**0.80**，R-33 裁定维持 D3/A15 原文；D5 v1.0 误写成 0.6）且内容非空；低于门槛或空内容 → 直接 `dropped`，**不进隔离区** |
 | 隔离区 | 过门槛的落 `quarantine`；负知识（`kind=avoid`）只走回灌链路，永不转正 |
 | 转正 | `can_promote()`：被 **≥1 个后续轮次**（`reused_by` 里的轮次 `> candidate.round_no`）成功复用；**同轮复用不算**（防自证） |
 | 抽检 | 抽样率 `max(0.05, 0.20 - 0.05 * 成功复用次数)`；抽中者写 `KnowledgeSample` 留痕；`passed=False` → `DROPPED` **且**内容写进回避模式清单（负知识） |
@@ -13,11 +13,12 @@
 本模块是纯逻辑 + Store 读写，**不调用模型**；抽样用内容哈希做确定性判定（同输入同输出，
 台架可复现），不使用 `random`，否则抽检会变成概率性断言。
 
-P3 与 P1 的口径差异（**断言跟口径走**，别跟旧实现走）：
+P3 与 P1 的口径差异（**断言跟口径走**）：
 
-1. `CONFIDENCE_THRESHOLD` 0.80 → **0.6**（D5 §3.3.1，可被 `KFPA_CONFIDENCE_THRESHOLD` 覆盖）；
+1. 门槛**维持 0.80**（R-33：D5 v1.0 的 0.6 是笔误，A15 期望不回退）；
 2. 转正加「后续轮次」约束：同轮复用不再转正（D5 §3.3.2）；
-3. 新增抽检留痕与 `report()`（D5 §3.3.3/4）。
+3. 新增抽检留痕与 `report()`（D5 §3.3.3/4），出口名按 R-33 冻结：
+   `admit(store, candidate)` / `record_sample(store, cid, passed, *, sampled_by="", rate=0.0)`。
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ from .schemas import (
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注
     from .store import Store
 
-#: 入隔离区置信度门槛（**D5 §3.3.1 冻结 0.6**；P1 旧值 0.80）
-CONFIDENCE_THRESHOLD = 0.6
+#: 入隔离区置信度门槛（**D3 §3.5 / A15 原文 0.80**；R-33 裁定维持，D5 v1.0 的 0.6 是笔误）
+CONFIDENCE_THRESHOLD = 0.80
 #: 抽检率区间
 SAMPLE_RATE_MAX = 0.20
 SAMPLE_RATE_MIN = 0.05
@@ -264,33 +265,35 @@ def pending_sample(store: "Store") -> list[dict]:
     return [row for row in review_sample(store) if str(row["cid"]) not in sampled]
 
 
-def sample_candidate(
+def record_sample(
     store: "Store",
     cid: str,
-    *,
-    by: str = "",
     passed: bool = True,
+    *,
+    sampled_by: str = "",
+    rate: float = 0.0,
     now: Optional[float] = None,
 ) -> KnowledgeSample:
-    """对一条候选留痕并给结论（D5 §3.3.3）。
+    """对一条候选留痕并给结论（**R-33 冻结出口名**，A25 按名硬探）。
 
-    - 写 `KnowledgeSample`（含抽中时的动态抽样率，便于回看口径）；
+    - 写 `KnowledgeSample`（`rate` 缺省 0.0 = 用 `sampling_rate(len(reused_by))` 现场算，
+      便于回看当时口径）；
     - `passed=False` → 该候选 `DROPPED` **且**内容写进回避模式清单（负知识闭环）。
 
-    抽检是**人工动作**，所以不要求 `is_sampled()` 命中（显式 `--cid` 即强制抽样）；
-    未给 `--cid` 的「按率列队列」走 `pending_sample()`。
+    抽检是**人工动作**，所以不要求 `is_sampled()` 命中（显式给 `cid` 即强制抽样）；
+    未给 `cid` 的「按率列队列」走 `pending_sample()`。
     """
     candidate = store.get_candidate(cid)
     if candidate is None:
         raise KnowledgeError(
             f"[knowledge] 候选不存在：{cid} → 先用 `kfpa knowledge list` 查 cid"
         )
-    rate = sampling_rate(len(candidate.reused_by))
+    resolved_rate = float(rate) if float(rate) > 0 else sampling_rate(len(candidate.reused_by))
     sample = KnowledgeSample(
         cid=str(cid),
         sampled_at=float(now if now is not None else time.time()),
-        sampled_by=str(by or "").strip() or "unknown",
-        rate=rate,
+        sampled_by=str(sampled_by or "").strip() or "unknown",
+        rate=round(resolved_rate, 4),
         passed=bool(passed),
     )
     add = getattr(store, "add_knowledge_sample", None)
@@ -311,6 +314,18 @@ def sample_candidate(
                 )
             )
     return sample
+
+
+def sample_candidate(
+    store: "Store",
+    cid: str,
+    *,
+    by: str = "",
+    passed: bool = True,
+    now: Optional[float] = None,
+) -> KnowledgeSample:
+    """`record_sample` 的旧名包装（本 PR 内部仍用它，避免改名波及调用点）。"""
+    return record_sample(store, cid, passed, sampled_by=by, now=now)
 
 
 def report(store: "Store") -> dict[str, Any]:
@@ -396,14 +411,19 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
     sample = sub.add_parser("sample", help="抽检：给 --cid 即留痕；不给则列待抽检队列")
     sample.add_argument("--cid", default=None)
     sample.add_argument("--by", default="")
-    sample.add_argument("--failed", action="store_true", help="抽检结论：不通过 → dropped + 回避模式")
+    sample.add_argument("--fail", "--failed", dest="failed", action="store_true",
+                        help="抽检结论：不通过 → dropped + 回避模式")
+    sample.add_argument("--pass", "--passed", dest="passed", action="store_true",
+                        help="抽检结论：通过（默认）")
     sample.add_argument("--db", default="kfpa.db")
     sample.add_argument("--json", action="store_true")
 
-    verdict = sub.add_parser("verdict", help="对某候选下抽检结论（passed/failed，落留痕）")
+    verdict = sub.add_parser("verdict", help="对某候选下抽检结论（--pass/--fail，落留痕）")
     verdict.add_argument("cid")
-    verdict.add_argument("--passed", dest="passed", action="store_true", default=None)
-    verdict.add_argument("--failed", dest="failed", action="store_true")
+    verdict.add_argument("--pass", "--passed", dest="passed", action="store_true",
+                         help="抽检通过")
+    verdict.add_argument("--fail", "--failed", dest="failed", action="store_true",
+                         help="抽检不通过 → dropped + 回避模式")
     verdict.add_argument("--by", default="")
     verdict.add_argument("--db", default="kfpa.db")
     verdict.add_argument("--json", action="store_true")
@@ -478,8 +498,8 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
                 for row in queue:
                     print(f"  {row['cid']}（状态 {row['status']}，抽样率 {row['sample_rate']}）")
             return 0
-        sample = sample_candidate(
-            store, args.cid, by=args.by or _default_user(), passed=not args.failed
+        sample = record_sample(
+            store, args.cid, not args.failed, sampled_by=args.by or _default_user()
         )
         if args.json:
             print(dumps(sample))
@@ -492,12 +512,10 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
 
     def _verdict(args) -> int:
         store = _store(args.db)
-        passed = True
-        if args.failed:
-            passed = False
-        elif args.passed is not None:
-            passed = bool(args.passed)
-        sample = sample_candidate(store, args.cid, by=args.by or _default_user(), passed=passed)
+        passed = not bool(args.failed)
+        if getattr(args, "passed", False):
+            passed = True
+        sample = record_sample(store, args.cid, passed, sampled_by=args.by or _default_user())
         if args.json:
             print(dumps(sample))
             return 0
@@ -561,6 +579,7 @@ __all__ = [
     "review_sample",
     "list_samples",
     "pending_sample",
+    "record_sample",
     "sample_candidate",
     "report",
     "format_report",

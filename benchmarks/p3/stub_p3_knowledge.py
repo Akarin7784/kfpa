@@ -190,17 +190,26 @@ def env_without_dify():
 
 def run_fastlane() -> None:
     print("== fastlane（D5 §3.2 / A23 / A24）")
-    ok = FastlaneRequest(request_id="fl-1-1", round_no=1, summary="小改", touched_modules=["kfpa"])
+    ok = FastlaneRequest(request_id="fl-1-1", round_no=1, summary="小改",
+                         diff_files=["src/kfpa/a.py"], touched_modules=["kfpa"])
     expect("三判据全真 → judge=True", fastlane.judge(ok) is True)
     expect("全真时无升级原因", fastlane.escalate_reasons(ok) == [])
 
     bad = FastlaneRequest(request_id="fl-1-2", round_no=1, summary="动契约",
+                          diff_files=["src/kfpa/a.py"],
                           new_interface=True, new_data_model=True,
                           touched_modules=["kfpa", "migrations"])
     expect("判据为假 → judge=False", fastlane.judge(bad) is False)
     reasons = fastlane.escalate_reasons(bad)
     expect("升级原因逐条指名（不是布尔）",
            reasons == ["new_interface", "new_data_model", "touched_modules>1"], str(reasons))
+
+    # A24 冻结口径：diff_files 为空 = no_diff_source → judge=False 且 reasons 指名
+    no_source = FastlaneRequest(request_id="fl-1-9", round_no=1, summary="没来源", diff_files=[])
+    expect("diff_files 为空 → judge=False（不猜）", fastlane.judge(no_source) is False)
+    expect("diff_files 为空 → reasons 指名 no_diff_source",
+           fastlane.escalate_reasons(no_source) == [fastlane.NO_DIFF_SOURCE],
+           str(fastlane.escalate_reasons(no_source)))
 
     # 三种 diff 来源 + no_diff_source 不猜
     with tempfile.TemporaryDirectory() as tmp:
@@ -298,12 +307,14 @@ def run_fastlane() -> None:
             request_id=f"fl-6-{seq}", round_no=6, summary=f"s{seq}"))
     store.add_fastlane_request(FastlaneRequest(
         request_id="fl-6-4", round_no=6, summary="升级", status=FastlaneStatus.ESCALATED))
-    done, failed = fastlane.batch_ack(store, ["fl-6-1", "fl-6-2", "fl-6-4"], by="qa", now=7.0)
+    result = fastlane.batch_ack(store, ["fl-6-1", "fl-6-2", "fl-6-4"], "qa", now=7.0)
     expect("批内成功条目共享 batch_id",
-           len(done) == 2 and len({r.batch_id for r in done}) == 1 and bool(done[0].batch_id),
-           str([r.batch_id for r in done]))
+           len(result) == 2 and len({r.batch_id for r in result}) == 1 and bool(result.batch_id),
+           str([r.batch_id for r in result]))
+    expect("batch_ack 返回 list（R-33 冻结签名）且带批次与失败留痕",
+           isinstance(result, list) and result.batch_id == "flb-6-1")
     expect("批内失败条目被记录、其余照常承认",
-           len(failed) == 1 and "fl-6-4" in failed[0])
+           len(result.failed) == 1 and "fl-6-4" in result.failed[0])
 
     # 清单解析三形状
     expect("清单：逐行 + 注释 + 去重保序",
@@ -391,7 +402,8 @@ def run_fastlane() -> None:
 
 def run_knowledge() -> None:
     print("== knowledge（D5 §3.3 / A25）")
-    expect("门槛常量 = 0.6（D5 §3.3.1）", knowledge.CONFIDENCE_THRESHOLD == 0.6)
+    expect("门槛常量 = 0.80（R-33：D5 v1.0 的 0.6 是笔误，A15 期望不动）",
+           knowledge.CONFIDENCE_THRESHOLD == 0.80)
     old = os.environ.get(knowledge.THRESHOLD_ENV)
     try:
         os.environ[knowledge.THRESHOLD_ENV] = "0.9"
@@ -406,15 +418,15 @@ def run_knowledge() -> None:
             os.environ[knowledge.THRESHOLD_ENV] = old
 
     store = FakeStore()
-    low = knowledge.make_candidate("K-LOW", 1, "内容", confidence=0.59)
-    edge = knowledge.make_candidate("K-EDGE", 1, "内容", confidence=0.60)
+    low = knowledge.make_candidate("K-LOW", 1, "内容", confidence=0.79)
+    edge = knowledge.make_candidate("K-EDGE", 1, "内容", confidence=0.80)
     high = knowledge.make_candidate("K-HIGH", 1, "内容", confidence=0.85)
     empty = knowledge.make_candidate("K-EMPTY", 1, "   ", confidence=0.9)
     for candidate in (low, edge, high, empty):
         knowledge.admit(store, candidate)
-    expect("低于门槛 → 直接 dropped（不进隔离区）",
+    expect("低于门槛 0.79 → 直接 dropped（不进隔离区）",
            low.status is CandidateStatus.DROPPED)
-    expect("门槛边界 0.60 → quarantine（>= 算通过）",
+    expect("门槛边界 0.80 → quarantine（>= 算通过）",
            edge.status is CandidateStatus.QUARANTINE)
     expect("过门槛 → quarantine", high.status is CandidateStatus.QUARANTINE)
     expect("空内容 → dropped", empty.status is CandidateStatus.DROPPED)
@@ -654,6 +666,205 @@ def run_rag() -> None:
         os.environ.update(saved)
 
 
+def run_frozen_names() -> None:
+    """R-33 冻结出口名（台架按名硬探，探不到 = FAIL）——本桩先把名字与签名钉住。"""
+    print("== R-33 冻结出口名")
+    import inspect
+
+    for name in ("admit", "record_sample", "sampling_rate", "promotable", "mark_reused",
+                 "make_candidate", "is_sampled", "review_sample"):
+        expect(f"knowledge.{name} 可调用", callable(getattr(knowledge, name, None)))
+    sig = inspect.signature(knowledge.record_sample)
+    params = list(sig.parameters)
+    expect("knowledge.record_sample 签名 (store, cid, passed, *, sampled_by=\"\", rate=0.0)",
+           params[:3] == ["store", "cid", "passed"]
+           and sig.parameters["sampled_by"].kind is inspect.Parameter.KEYWORD_ONLY
+           and sig.parameters["rate"].kind is inspect.Parameter.KEYWORD_ONLY
+           and sig.parameters["rate"].default == 0.0, str(sig))
+    for name in ("judge", "plan", "ack", "batch_ack"):
+        expect(f"fastlane.{name} 可调用", callable(getattr(fastlane, name, None)))
+
+    store = FakeStore()
+    registered = fastlane.plan(store, 11, summary="小改", files=["src/kfpa/a.py"])
+    expect("fastlane.plan() 登记 pending 并落库",
+           isinstance(registered, FastlaneRequest)
+           and registered.request_id == "fl-11-1"
+           and registered.status is FastlaneStatus.PENDING
+           and store.get_fastlane_request("fl-11-1") is not None)
+    escalated = fastlane.plan(store, 11, summary="动数据模型", files=["src/kfpa/schemas.py"])
+    expect("fastlane.plan() 不满足判据 → ESCALATED 且指名",
+           escalated.status is FastlaneStatus.ESCALATED
+           and escalated.escalations() == ["new_data_model"], str(escalated.escalations()))
+    approved = fastlane.ack(store, "fl-11-1", "qa", now=11.0)
+    expect("fastlane.ack(store, request_id, by) 位置参数也认",
+           approved.status is FastlaneStatus.APPROVED and approved.decided_by == "qa")
+
+    store = FakeStore()
+    knowledge.admit(store, knowledge.make_candidate("K11-1", 11, "内容", confidence=0.9))
+    sample = knowledge.record_sample(store, "K11-1", False, sampled_by="qa", rate=0.15)
+    expect("record_sample 按冻结签名留痕（rate/sampled_by 显式生效）",
+           sample.rate == 0.15 and sample.sampled_by == "qa" and sample.passed is False
+           and store.get_candidate("K11-1").status is CandidateStatus.DROPPED)
+    expect("record_sample(passed=False) → 内容进回避模式",
+           store.list_avoid_patterns(11) == ["内容"])
+
+    parser = make_cli("impact_first")
+    store = FakeStore()
+    call_cli(parser, ["knowledge", "ingest", "--cid", "K12-1", "--round", "12",
+                      "--content", "c", "--confidence", "0.9"], store, knowledge)
+    rc_fail = call_cli(parser, ["knowledge", "verdict", "K12-1", "--fail", "--by", "qa"],
+                       store, knowledge)
+    expect("CLI：verdict --fail（D5 §3.3 冻结写法）→ dropped",
+           rc_fail == 0 and store.get_candidate("K12-1").status is CandidateStatus.DROPPED)
+    call_cli(parser, ["knowledge", "ingest", "--cid", "K12-2", "--round", "12",
+                      "--content", "d", "--confidence", "0.9"], store, knowledge)
+    rc_pass = call_cli(parser, ["knowledge", "verdict", "K12-2", "--pass", "--by", "qa"],
+                       store, knowledge)
+    expect("CLI：verdict --pass → 保持 quarantine",
+           rc_pass == 0 and store.get_candidate("K12-2").status is CandidateStatus.QUARANTINE)
+
+
+def run_fastlane_cli() -> None:
+    """快车道 CLI 全路径（A20 的 P3 增量：`fastlane.py` 要 ≥80%，CLI 分支不能靠台架子进程）。"""
+    print("== fastlane CLI 全路径")
+    parser = make_cli("impact_first")
+    store = FakeStore()
+    store.packages[1] = TaskPackage(round_no=1, feature="门店订单", goal="实现可承诺量校验",
+                                    acceptance=[], boundaries=["b"], interface_contract=["i"],
+                                    prohibitions=["p"])
+    plan_args = parser.parse_args(["fastlane", "plan", "--round", "1",
+                                   "--files", "src/kfpa/a.py", "--db", "x"])
+    original = fastlane._store_for
+    fastlane._store_for = lambda _db: store
+    try:
+        with redirect_stdout(io.StringIO()) as out:
+            rc_plan = plan_args.handler(plan_args)
+        expect("CLI：plan 文本输出（摘要取任务包）",
+               rc_plan == 0 and "fl-1-1" in out.getvalue() and "门店订单" in out.getvalue(),
+               out.getvalue().splitlines()[0] if out.getvalue() else "")
+        list_args = parser.parse_args(["fastlane", "list", "--db", "x"])
+        with redirect_stdout(io.StringIO()) as out_list:
+            rc_list = list_args.handler(list_args)
+        expect("CLI：list 文本表格", rc_list == 0 and "fl-1-1" in out_list.getvalue())
+        empty_store = FakeStore()
+        fastlane._store_for = lambda _db: empty_store
+        with redirect_stdout(io.StringIO()) as out_empty:
+            rc_empty = list_args.handler(list_args)
+        expect("CLI：list 空库给中文占位", rc_empty == 0 and "无快车道请求" in out_empty.getvalue())
+
+        fastlane._store_for = lambda _db: store
+        json_ack = parser.parse_args(["fastlane", "ack", "fl-1-1", "--by", "qa",
+                                      "--db", "x", "--json"])
+        with redirect_stdout(io.StringIO()) as out_ack:
+            rc_ack = json_ack.handler(json_ack)
+        expect("CLI：ack --json 输出稳定列",
+               rc_ack == 0 and '"request_id": "fl-1-1"' in out_ack.getvalue())
+
+        show_args = parser.parse_args(["fastlane", "show", "fl-1-1", "--db", "x"])
+        with redirect_stdout(io.StringIO()) as out_show:
+            rc_show = show_args.handler(show_args)
+        expect("CLI：show 文本含微型规格",
+               rc_show == 0 and "微型规格" in out_show.getvalue())
+        show_json = parser.parse_args(["fastlane", "show", "fl-1-1", "--db", "x", "--json"])
+        with redirect_stdout(io.StringIO()) as out_show_json:
+            rc_show_json = show_json.handler(show_json)
+        expect("CLI：show --json 带 micro_spec",
+               rc_show_json == 0 and "micro_spec" in out_show_json.getvalue())
+        show_missing = parser.parse_args(["fastlane", "show", "nope", "--db", "x"])
+        with redirect_stdout(io.StringIO()):
+            rc_show_missing = show_missing.handler(show_missing)
+        expect("CLI：show 查无此单 → rc=2", rc_show_missing == fastlane.EXIT_USAGE)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = Path(tmp) / "acks.yaml"
+            ack_file.write_text("acks:\n  - request_id: fl-13-1\n  - request_id: fl-13-2\n",
+                                encoding="utf-8")
+            store.add_fastlane_request(FastlaneRequest(
+                request_id="fl-13-1", round_no=13, summary="s"))
+            store.add_fastlane_request(FastlaneRequest(
+                request_id="fl-13-2", round_no=13, summary="升级",
+                status=FastlaneStatus.ESCALATED))
+            batch_args = parser.parse_args(["fastlane", "batch-ack", "--file", str(ack_file),
+                                            "--by", "qa", "--db", "x", "--json"])
+            with redirect_stdout(io.StringIO()) as out_batch:
+                rc_batch = batch_args.handler(batch_args)
+            expect("CLI：batch-ack --json（部分失败 → rc=3）",
+                   rc_batch == fastlane.EXIT_MANUAL and '"failed"' in out_batch.getvalue())
+            batch_text_file = Path(tmp) / "acks2.yaml"
+            batch_text_file.write_text("acks:\n  - request_id: fl-13-2\n", encoding="utf-8")
+            batch_text = parser.parse_args(["fastlane", "batch-ack", "--file",
+                                            str(batch_text_file), "--by", "qa", "--db", "x"])
+            with redirect_stdout(io.StringIO()) as out_batch_text:
+                rc_batch_text = batch_text.handler(batch_text)
+            expect("CLI：batch-ack 文本输出失败条",
+                   rc_batch_text == fastlane.EXIT_MANUAL and "✗" in out_batch_text.getvalue())
+
+        # reject 三态：pending → rejected；重复拒绝幂等；已 approved 不许拒
+        pending = FastlaneRequest(request_id="fl-14-1", round_no=14, summary="s")
+        store.add_fastlane_request(pending)
+        first_reject = fastlane.reject(store, "fl-14-1", by="qa", note="不需要", now=14.0)
+        second_reject = fastlane.reject(store, "fl-14-1", by="other", now=15.0)
+        expect("reject：PENDING → REJECTED 且二次幂等",
+               first_reject.status is FastlaneStatus.REJECTED
+               and second_reject.decided_by == "qa" and second_reject.decided_at == 14.0)
+        approved = FastlaneRequest(request_id="fl-14-2", round_no=14, summary="s",
+                                   status=FastlaneStatus.APPROVED, batch_id="b")
+        store.add_fastlane_request(approved)
+        rejected_approved = False
+        try:
+            fastlane.reject(store, "fl-14-2", by="qa")
+        except fastlane.FastlaneConflict:
+            rejected_approved = True
+        expect("reject：已 APPROVED 不许事后拒绝", rejected_approved)
+
+        # 顺序 B 下的 check 兜底实现（impact 没注册成）
+        parser_rev = make_cli("fastlane_first")
+        check_args = parser_rev.parse_args(["fastlane", "check", "--round", "1", "--db", "x"])
+        with redirect_stdout(io.StringIO()) as out_check:
+            rc_check = check_args.handler(check_args)
+        expect("CLI：check 兜底文本（有任务包 → 给判定）",
+               rc_check == 0 and "轮次 1" in out_check.getvalue(), out_check.getvalue()[:40])
+        check_json = parser_rev.parse_args(["fastlane", "check", "--round", "1",
+                                            "--files", "src/kfpa/a.py", "--db", "x", "--json"])
+        with redirect_stdout(io.StringIO()) as out_check_json:
+            rc_check_json = check_json.handler(check_json)
+        expect("CLI：check 兜底 --json（等价 impact.analyze）",
+               rc_check_json == 0 and '"fast_lane"' in out_check_json.getvalue())
+        fastlane._store_for = lambda _db: FakeStore()
+        check_empty = parser_rev.parse_args(["fastlane", "check", "--round", "9", "--db", "x"])
+        with redirect_stdout(io.StringIO()) as out_check_empty:
+            rc_check_empty = check_empty.handler(check_empty)
+        expect("CLI：check 兜底无任务包 → rc=0 + 中文提示",
+               rc_check_empty == 0 and "还没有任务包" in out_check_empty.getvalue())
+    finally:
+        fastlane._store_for = original
+
+    # micro_spec 模板缺失时的纯文本兜底
+    original_render = pipeline._render
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("template missing")
+
+    pipeline._render = _boom
+    try:
+        fallback = fastlane.micro_spec(FastlaneRequest(request_id="fl-15-1", round_no=15,
+                                                       summary="小改", diff_files=["a.py"]))
+    finally:
+        pipeline._render = original_render
+    expect("micro_spec 模板缺失 → 纯文本兜底（不崩）",
+           "fl-15-1" in fallback and "a.py" in fallback)
+
+    # escalate_reasons：非 no_diff_source 的正常分支
+    plain = FastlaneRequest(request_id="fl-15-2", round_no=15, summary="s",
+                            diff_files=["a.py"], new_interface=True)
+    expect("escalate_reasons 走 request.escalations()",
+           fastlane.escalate_reasons(plain) == ["new_interface"])
+    explain = fastlane.escalate_reasons(
+        FastlaneRequest(request_id="fl-15-3", round_no=15, summary="s",
+                        note=fastlane.NO_DIFF_SOURCE))
+    expect("escalate_reasons 优先报 no_diff_source", explain == [fastlane.NO_DIFF_SOURCE])
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -671,7 +882,9 @@ def main() -> int:
     print(f"KFPA P3 交接桩（长流 · R-30）  仓库={REPO}")
     print("-" * 72)
     run_fastlane()
+    run_fastlane_cli()
     run_knowledge()
+    run_frozen_names()
     run_rag()
     print("-" * 72)
     print(f"汇总：{len(PASSED) + len(FAILED)} 项 -> PASS {len(PASSED)} / FAIL {len(FAILED)}")

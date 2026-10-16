@@ -56,13 +56,19 @@ class FastlaneConflict(FastlaneError):
 
 
 def judge(request: FastlaneRequest) -> bool:
-    """三判据全真才算快车道（D5 §3.2）。纯函数，图只做编排。"""
+    """三判据全真才算快车道（D5 §3.2）；**拿不到改动清单（`diff_files` 为空）→ False**。
+
+    R-23.2 的第三来源是「不猜」：没有改动清单就**无法证明**「波及面 ≤ 1 个模块」，
+    这里既不许按 True 放行，也不许当「三判据全真」——A24 明确断这一条。
+    """
+    if not request.diff_files:
+        return False
     return bool(request.judged_fastlane())
 
 
 def escalate_reasons(request: FastlaneRequest) -> list[str]:
     """不满足判据的原因清单；`no_diff_source` 优先报出来（R-23.2 不猜）。"""
-    if str(request.note or "").strip() == NO_DIFF_SOURCE:
+    if str(request.note or "").strip() == NO_DIFF_SOURCE or not request.diff_files:
         return [NO_DIFF_SOURCE]
     return list(request.escalations())
 
@@ -234,12 +240,12 @@ def _decide(
 def ack(
     store: Any,
     request_id: str,
+    by: str = "",
     *,
-    by: str,
     batch_id: str = "",
     now: Optional[float] = None,
 ) -> FastlaneRequest:
-    """承认一条请求：`PENDING → APPROVED`。
+    """承认一条请求：`PENDING → APPROVED`（**R-33 冻结签名** `ack(store, request_id, by)`）。
 
     - 已是 `APPROVED` → **幂等**返回原记录（不覆盖首次 `decided_by/decided_at/batch_id`）；
     - `ESCALATED`/`REJECTED` → 抛 `FastlaneConflict`（rc=3，要翻必须新开请求）；
@@ -372,17 +378,64 @@ def parse_ack_file(text: str) -> list[str]:
     return out
 
 
+class BatchAckResult(list):
+    """`batch_ack()` 的返回值：**是 list**（R-33 冻结签名 `-> list[FastlaneRequest]`）。
+
+    同时带上批次留痕：`.batch_id` 与 `.failed`（失败原因清单，CLI 用它判 rc=3）。
+    """
+
+    def __init__(self, approved: list[FastlaneRequest], failed: list[str], batch_id: str = ""):
+        super().__init__(approved)
+        self.approved: list[FastlaneRequest] = list(approved)
+        self.failed: list[str] = list(failed)
+        self.batch_id: str = batch_id
+
+
+def plan(
+    store: Any,
+    round_no: int,
+    *,
+    summary: str = "",
+    package: Any = None,
+    files: Optional[list[str]] = None,
+    workdir: Optional[str] = None,
+) -> FastlaneRequest:
+    """**R-33 冻结出口名**：按三判据登记一条请求并落库（`PENDING`；不满足判据 → `ESCALATED`）。
+
+    `files=None` 且拿不到执行器产出 → `no_diff_source` → `ESCALATED`（R-23.2：不猜）。
+    自动取 `fl-<round>-<seq>`（可复算，不用 uuid）；`package` 缺省时按 `store.get_package()` 取。
+    """
+    resolved_package = package
+    if resolved_package is None:
+        getter = getattr(store, "get_package", None)
+        if callable(getter):
+            try:
+                resolved_package = getter(int(round_no))
+            except Exception:  # pragma: no cover - 老库/桩缺实现
+                resolved_package = None
+    request = make_request(
+        int(round_no),
+        next_seq(store, int(round_no)),
+        summary or _summary_of(resolved_package, int(round_no)),
+        package=resolved_package,
+        files=files,
+        workdir=workdir,
+    )
+    return save_request(store, request)
+
+
 def batch_ack(
     store: Any,
     request_ids: list[str],
+    by: str = "",
     *,
-    by: str,
     batch_id: str = "",
     now: Optional[float] = None,
-) -> tuple[list[FastlaneRequest], list[str]]:
-    """攒批承认：同批共享一个 `batch_id`；单条失败不拖垮整批。
+) -> BatchAckResult:
+    """攒批承认（**R-33 冻结签名**）：同批共享一个 `batch_id`；单条失败不拖垮整批。
 
-    返回 `(承认成功的记录, 失败原因清单)`。幂等条目（已 approved）也计入成功且保持原批次。
+    返回 `BatchAckResult`（**`list[FastlaneRequest]`**，附带 `.batch_id` / `.failed`）。
+    幂等条目（已 approved）也计入成功且保持原批次。
     """
     ids = [str(x).strip() for x in request_ids if str(x).strip()]
     if not ids:
@@ -392,10 +445,10 @@ def batch_ack(
     failed: list[str] = []
     for rid in ids:
         try:
-            done.append(ack(store, rid, by=by, batch_id=shared, now=now))
+            done.append(ack(store, rid, by, batch_id=shared, now=now))
         except FastlaneError as exc:  # 单条失败（状态冲突/查无此单）不影响其余
             failed.append(f"{rid}：{exc}")
-    return done, failed
+    return BatchAckResult(done, failed, batch_id=shared)
 
 
 def _round_of(store: Any, request_id: str) -> int:
@@ -460,26 +513,21 @@ def _status_row(request: FastlaneRequest) -> dict[str, Any]:
 
 def _cmd_plan(args: Any) -> int:
     store = _store_for(args.db)
-    package = None
-    get_package = getattr(store, "get_package", None)
-    if callable(get_package):
-        package = get_package(int(args.round_no))
     files = None
     if getattr(args, "files", None):
         files = [p.strip() for p in str(args.files).replace("；", ",").split(",") if p.strip()]
-    request = make_request(
+    request = plan(
+        store,
         int(args.round_no),
-        next_seq(store, int(args.round_no)),
-        _summary_of(package, int(args.round_no)),
-        package=package,
+        summary=getattr(args, "summary", "") or "",
         files=files,
         workdir=getattr(args, "workdir", None),
     )
-    save_request(store, request)
     if args.json:
         print(dumps(_status_row(request)))
         return EXIT_OK
     print(f"{request.request_id}｜第 {request.round_no} 轮｜状态 {request.status.value}")
+    print(f"  摘要：{request.summary}")
     print(f"  改动文件（R-23 三来源）：{'、'.join(request.diff_files) or '（无来源）'}")
     print(f"  判据：new_interface={request.new_interface} new_data_model={request.new_data_model} "
           f"touched_modules={request.touched_modules or '（无）'}")
@@ -539,19 +587,20 @@ def _cmd_batch_ack(args: Any) -> int:
         print(f"[fastlane] 读取承认清单失败：{path}（{exc}）", file=sys.stderr)
         return EXIT_IO
     try:
-        done, failed = batch_ack(store, ids, by=args.by, batch_id=getattr(args, "batch", "") or "")
+        result = batch_ack(store, ids, args.by, batch_id=getattr(args, "batch", "") or "")
     except FastlaneError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
+    failed = list(result.failed)
     if getattr(args, "json", False):
         print(dumps({
-            "batch_id": done[0].batch_id if done else "",
-            "approved": [_status_row(r) for r in done],
+            "batch_id": result.batch_id,
+            "approved": [_status_row(r) for r in result],
             "failed": failed,
         }))
     else:
-        print(f"批次 {done[0].batch_id if done else '-'}：承认 {len(done)} 条，失败 {len(failed)} 条")
-        for request in done:
+        print(f"批次 {result.batch_id or '-'}：承认 {len(result)} 条，失败 {len(failed)} 条")
+        for request in result:
             print(f"  ✓ {request.request_id}（by={request.decided_by}）")
         for item in failed:
             print(f"  ✗ {item}")
@@ -654,6 +703,7 @@ def register(subparsers: Any) -> None:  # pragma: no cover - 由 cli.py 挂载
     plan.add_argument("--db", default="kfpa.db")
     plan.add_argument("--files", default=None, help="改动文件清单（来源②；无执行产物时用）")
     plan.add_argument("--workdir", default=None)
+    plan.add_argument("--summary", default="", help="微型规格一句话（缺省取任务包 feature/goal）")
     plan.add_argument("--json", action="store_true")
 
     listing = group.add_parser("list", help="列快车道请求（可按状态过滤）")
@@ -700,10 +750,12 @@ __all__ = [
     "MICRO_SPEC_TEMPLATE",
     "FastlaneError",
     "FastlaneConflict",
+    "BatchAckResult",
     "judge",
     "escalate_reasons",
     "resolve_diff_files",
     "make_request",
+    "plan",
     "micro_spec",
     "save_request",
     "get_request",
