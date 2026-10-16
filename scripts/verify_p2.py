@@ -331,14 +331,13 @@ def check_a18(ctx: Ctx, c: Check) -> None:
         c.add(ok=roles is not None, note=f"load_roles() 可用 = {roles is not None} {rerr or ''}")
         if roles:
             provs = {k: str((v or {}).get("provider", "")) for k, v in roles.items()}
-            c.add(ok=all(provs.values()), note=f"每个角色都有 provider = {provs}")
             c.add(ok=provs.get("REVIEWER") == "mock_hetero",
                   note=f"REVIEWER 的 provider = {provs.get('REVIEWER')!r}（期望 'mock_hetero'）")
             if provs.get("REVIEWER") != "mock_hetero":
                 c.fail("A18：`config/models.yaml` 里 REVIEWER 未指向异构 provider（mock_hetero）。")
             for r in ("ARCHITECT", "FLASH"):
-                c.add(ok=provs.get(r) in ("mock", "", None) or provs.get(r) == "mock",
-                      note=f"{r} 的 provider = {provs.get(r)!r}（P2 仍走 mock）")
+                c.add(ok=provs.get(r, "") in ("", "mock"),
+                      note=f"{r} 的 provider = {provs.get(r)!r}（空串=走默认 mock，P2 允许）")
         resolver = getattr(cfg, "resolve_provider", None)
         if callable(resolver):
             try:
@@ -633,8 +632,8 @@ def check_a21(ctx: Ctx, c: Check) -> None:
                 vals = {f: getattr(m, f, None) for f in fields}
                 c.add(ok=all(v is not None for v in vals.values()),
                       note=f"ReviewMetrics 四项 + baseline = {vals}")
-                c.add(ok=bool(getattr(m, "total", 0)) >= 20,
-                      note=f"total = {getattr(m, 'total', None)}（与种子集样本数一致）")
+                c.add(ok=int(getattr(m, "total", 0) or 0) >= 20,
+                      note=f"total = {getattr(m, 'total', None)}（要求 >=20，与种子集样本数一致）")
                 c.add(ok=0.0 <= float(getattr(m, "agreement", 0.0)) <= 1.0,
                       note=f"agreement = {getattr(m, 'agreement', None)}（应在 0..1）")
                 passed = getattr(m, "passed", None)
