@@ -46,10 +46,12 @@ AVOID[test_fail] AC1：上次失败——断言未通过
 """
 
 # ---------- Store：D1-9 结构 + D2 R-8 过滤
+# 【镜鉴补丁·P1】schema_version 不写死：D3 把它从 "1" 升到 "2"，断言改为跟 SCHEMA_VERSION 常量对齐。
 s = Store(":memory:")
 check("D1-9 七表齐全（meta + 六业务表）", set(TABLE_NAMES) <= set(s.list_tables()), s.list_tables())
 check("BUSINESS_TABLES 六张", len(BUSINESS_TABLES) == 6)
-check("meta.schema_version", s.get_meta("schema_version") == SCHEMA_VERSION)
+check("SCHEMA_VERSION 合法（P0=1 / P1=2）", SCHEMA_VERSION in ("1", "2"), SCHEMA_VERSION)
+check("meta.schema_version 与 SCHEMA_VERSION 一致", s.get_meta("schema_version") == SCHEMA_VERSION)
 s.set_meta("schema_version", SCHEMA_VERSION)
 check("set_meta 幂等", s.get_meta("schema_version") == SCHEMA_VERSION)
 
