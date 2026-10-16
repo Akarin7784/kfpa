@@ -290,12 +290,43 @@ def reject(
     return update_request(store, request)
 
 
-def parse_ack_file(text: str) -> list[str]:
-    """解析 `batch-ack --file`：JSON 数组/对象 或 逐行清单（YAML 标量列表的等价子集）。
+def _extract_ids(payload: Any) -> list[str]:
+    """从 JSON/YAML 载入的结构里捞 `request_id`（保序去重）；形状不符给空清单。"""
+    out: list[str] = []
 
-    无第三方依赖（pyyaml 在本机是可选），支持的形状：
-    `["fl-1-1","fl-1-2"]` · `{"requests": [...]}` · 逐行 `- fl-1-1` / `fl-1-1` / `request_id: fl-1-1`；
-    空行与 `#` 注释忽略；重复项去重但**保序**。
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    if isinstance(payload, dict):
+        for key in ("acks", "requests", "request_ids", "ids"):
+            if key in payload:
+                return _extract_ids(payload[key])
+        add(payload.get("request_id") or payload.get("id"))
+        return out
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                add(item.get("request_id") or item.get("id"))
+            else:
+                add(item)
+        return out
+    if payload is not None:
+        add(payload)
+    return out
+
+
+def parse_ack_file(text: str) -> list[str]:
+    """解析 `batch-ack --file`：**冻结形状** `acks: [{request_id, note?}]`（D5 §3.2，界面生成）。
+
+    兼容形状（同一个函数，无需调用方改）：
+
+    - YAML（装了 pyyaml 时）`acks:` / `requests:` / `request_ids:` 列表，元素是 dict 或标量；
+    - JSON `["fl-1-1"]` · `{"acks": [{"request_id": "fl-1-1"}]}`；
+    - 逐行清单 `- fl-1-1` / `fl-1-1` / `request_id: fl-1-1`（无 pyyaml 时的兜底）。
+
+    空行与 `#` 注释忽略；重复项去重但**保序**；`note` 等其它键不参与解析。
     """
     out: list[str] = []
     raw = str(text or "").strip()
@@ -303,29 +334,39 @@ def parse_ack_file(text: str) -> list[str]:
         return out
     if raw[0] in "[{":
         try:
-            payload = json.loads(raw)
+            ids = _extract_ids(json.loads(raw))
         except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict):
-            for key in ("requests", "request_ids", "ids", "acks"):
-                if isinstance(payload.get(key), list):
-                    payload = payload[key]
-                    break
-        if isinstance(payload, list):
-            for item in payload:
-                text_item = item.get("request_id") if isinstance(item, dict) else item
-                value = str(text_item or "").strip()
-                if value and value not in out:
-                    out.append(value)
-            return out
+            ids = []
+        if ids:
+            return ids
+    try:  # 冻结形状是 YAML；没装 pyyaml 就退回逐行解析（不新增依赖）
+        import yaml  # type: ignore[import-untyped]
+
+        loaded = yaml.safe_load(raw)
+        if isinstance(loaded, dict) or (isinstance(loaded, list) and loaded):
+            ids = _extract_ids(loaded)
+            if ids:
+                return ids
+    except Exception:  # noqa: BLE001 - ImportError / YAMLError 都退回逐行解析
+        pass
     for line in raw.splitlines():
         text_line = line.split("#", 1)[0].strip()
         if not text_line:
             continue
+        if text_line.endswith(":") and " " not in text_line.rstrip(":"):
+            continue  # 块头（`acks:`）不是条目本身
         if text_line.startswith("-"):
             text_line = text_line[1:].strip()
-        if text_line.startswith("request_id:"):
-            text_line = text_line.split(":", 1)[1].strip()
+        if ":" in text_line:
+            key, _, value = text_line.partition(":")
+            key = key.strip().lower()
+            value = value.strip()
+            if key in ("request_id", "id"):
+                text_line = value
+            elif key in ("acks", "requests", "request_ids", "ids"):
+                text_line = value
+            else:
+                continue  # `note:` 等其它键忽略
         if text_line and text_line not in out:
             out.append(text_line)
     return out

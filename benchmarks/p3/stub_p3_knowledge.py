@@ -314,6 +314,34 @@ def run_fastlane() -> None:
            fastlane.parse_ack_file('{"requests": [{"request_id": "fl-7-5"}]}') == ["fl-7-5"])
     expect("清单：空文本 → 空", fastlane.parse_ack_file("  \n#x\n") == [])
 
+    # 冻结形状（D5 §3.2 + 界面 build_acks_yaml）：`acks: [{request_id, note?}]`
+    frozen = ("# KFPA 快车道承认批次\n"
+              "acks:\n"
+              "  - request_id: fl-7-6\n"
+              "    note: 已人工确认\n"
+              "  - request_id: fl-7-7\n")
+    expect("清单：冻结形状 acks:[{request_id,note?}]",
+           fastlane.parse_ack_file(frozen) == ["fl-7-6", "fl-7-7"],
+           str(fastlane.parse_ack_file(frozen)))
+    expect("清单：request_ids: 标量列表",
+           fastlane.parse_ack_file("request_ids:\n  - fl-7-8\n") == ["fl-7-8"])
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = _blocked
+    try:
+        fallback_ids = fastlane.parse_ack_file(frozen)
+    finally:
+        builtins.__import__ = real_import
+    expect("清单：没装 pyyaml 时逐行兜底仍认得冻结形状",
+           fallback_ids == ["fl-7-6", "fl-7-7"], str(fallback_ids))
+
     spec = fastlane.micro_spec(FastlaneRequest(request_id="fl-8-1", round_no=8, summary="小改"))
     expect("微型规格渲染（含 request_id 与三判据）",
            "fl-8-1" in spec and "new_interface" in spec)
