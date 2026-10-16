@@ -11,11 +11,11 @@
 
 | 项 | 值 |
 |---|---|
-| 验收台架 | `scripts/verify_p0.py`（本分支交付，A1–A9 共 12 条断言） |
-| 契约版本 | main `CONTRACT_VERSION 1.1`；裁决 D2 已到 **v1.4**（R-1 ~ R-17） |
-| 最近一次全量运行 | 2026-10-16 全链集成预演（本地临时分支 `verify/all`，R-16 合规）：`main@d46b41d` + `p0/core@0a5d25b` + `p0/ui@7892ac3` + `p0/pipeline@d2a3833` + `p0/verify` → **12 条断言 PASS 12 / FAIL 0 / SKIP 0**，`pytest 32 passed` |
-| 判定 | **集成态通过**；按 R-16 的合入顺序（#3 core → pipeline → #4 ui → #6 verify）逐段落 main 后，每个节点由镜鉴在 main 上复跑 A1–A9 |
-| 上一轮（分支单测） | `main@201e517` 台架自检：PASS 1 / FAIL 9（模块未交付；见 §4.1） |
+| 验收台架 | `scripts/verify_p0.py`（本分支交付，A1–A10 共 13 条断言） |
+| 契约版本 | main `CONTRACT_VERSION 1.1`；裁决 D2 已到 **v1.5**（R-1 ~ R-18） |
+| 最近一次全量运行 | 2026-10-16 全链集成预演（本地临时分支 `verify/all`，R-16 合规）：`main@0195ed7` + `p0/core@b6c6fb0` + `p0/ui@7892ac3` + `p0/pipeline@cad3ea2` + `p0/verify` → **13 条断言 PASS 10 / FAIL 3**，3 条红全部由同一个缺陷引起（R-18 编码兜底未落地，见 §4.5） |
+| 判定 | **不通过（1 阻塞）**：`cli.main()` 缺 R-18 的 `reconfigure(encoding="utf-8")`，重定向且不设 `PYTHONIOENCODING` 时 `--help` / `tickets list` / `round --json` 全部 `rc=1` + `UnicodeEncodeError` |
+| 上一轮（同一集成树，早两小时） | `main@d46b41d` + `core@0a5d25b` + `ui@7892ac3` + `pipeline@d2a3833` → PASS 12 / FAIL 0；**该轮 A1/A7 是假绿**（台架当时设了 `PYTHONIOENCODING`，见 §4.5） |
 
 台架**不给未交付模块发通过**：契约文件缺失一律报 FAIL 并列出「缺哪个文件、归谁写」；
 `A8` 即使 pytest 返回 0，只要冒烟被 skip 也判 **FAIL**（skip 不等于通过）。
@@ -138,11 +138,32 @@ A8 的图冒烟按 R-14 冻结契约（关键字参数签名 / `GRAPH_NODES` / `
 | A3 用 `str(t.status).endswith("closed")` 判票状态 | `str(TicketStatus.CLOSED)` == `"TicketStatus.CLOSED"`，永远判否 | 统一走 `.value`（`status_value()` helper） |
 | A3 断言放行后 `rounds.state == released` | `RELEASED` 是放行时点的瞬态，整轮跑完是 `snapshotted` | 改为断言拦停时 `tickets_open`、放行后不在 `tickets_open/blocked` |
 
-### 4.5 仍然开放
+### 4.5 R-18 编码健壮性（A10）—— 本轮唯一阻塞，也是「假绿」实证
 
-1. **【建议 · 验收表命令未同步 R-2/R-11】** `p0-plan §4` 的示例命令仍写 `python -m kfpa …`
+Chief 在 PR #6 指出：我前几轮报的 A1/A7 `rc=0` 可能是**环境相关的假绿**。核对后确认成立 ——
+台架的 `Ctx.env` 给所有子进程设了 `PYTHONIOENCODING=utf-8`，把这道题吞掉了。台架已按 R-18.4 改为
+`clean_env=True`（不传 `PYTHONIOENCODING` / `PYTHONUTF8`）复跑 A1/A7，并新增 **A10**。补跑后缺陷现形：
+
+```
+python -c "import sys; print(sys.stdout.encoding, sys.stdout.isatty())"  →  cp1252 False
+src/kfpa/cli.py  grep 'reconfigure|PYTHONIOENCODING'                     →  0 命中
+
+main@0195ed7 + core@b6c6fb0 + ui@7892ac3 + pipeline@cad3ea2（clean-env，capture_output）
+  --help                        → rc=1  UnicodeEncodeError   （D1-5 期望 0）
+  init                          → rc=0                        ✅
+  tickets list                  → rc=1  UnicodeEncodeError   （D1-5 期望 0）
+  round --dry-run --json        → rc=1  UnicodeEncodeError   （D1-5 期望 0/10/11/3）
+```
+
+台架侧 A1、A7、A10 三条因此全红（同一个根因）。修法见 R-18.1：`cli.main()` 最前把
+`sys.stdout/stderr` `reconfigure(encoding="utf-8", errors="replace")`。
+`pipeline.py`（长流）已自带第二层降级（阶段日志 `except UnicodeEncodeError`），但救不了 `--help` 与 `tickets`。
+
+### 4.6 仍然开放
+
+1. **【阻塞】** 上条的 R-18 主兜底未落地（归磐石）。
+2. **【建议 · 验收表命令未同步 R-2/R-11】** `p0-plan §4` 的示例命令仍写 `python -m kfpa …`
    （R-2 要求 `PYTHONPATH=src`），A5 行仍是那条会误杀 `llm.py` 的裸 grep（R-11 已给出两条新命令）。
-2. **【建议 · D1-12 已由 R-14 补上图契约】** 先前的「A8 缺输入契约」已裁定，台架与其对齐，本条关闭。
 
 ---
 
@@ -155,3 +176,4 @@ A8 的图冒烟按 R-14 冻结契约（关键字参数签名 / `GRAPH_NODES` / `
 | 0.3 | 2026-10-16 | 对齐 R-8/R-9/R-10/R-11：A5 三拆、A3 改纯 CLI `--inject high_ticket`、新增 A7.2；PR #3/#4 集成实测 2 阻塞 / 1 重要 / 1 建议 | 镜鉴 |
 | 0.4 | 2026-10-16 | 对齐 R-13/R-14/R-15/R-17；修台架四处误判；全链集成预演 **12/12 通过**（core 0a5d25b / ui 7892ac3 / pipeline d2a3833 / main d46b41d） | 镜鉴 |
 | 0.3 | 2026-10-16 | 对齐 R-8/R-9/R-10/R-11：A5 三拆为 A5.1/A5.2/A5.3、A3 改纯 CLI `--inject high_ticket`、新增 A7.2；补 PR #3/#4 集成实测结论（2 阻塞 / 1 重要 / 1 建议） | 镜鉴 |
+| 0.5 | 2026-10-16 | 新增 A10（R-18）与 `clean_env` 复跑 A1/A7；六表改七表（D1-9 含 meta）；A9 落到 `tests/test_llm_adapter.py`；集成预演 13 条 PASS 10 / **FAIL 3（R-18 编码兜底未落地，已到 PR #3）** | 镜鉴 |
