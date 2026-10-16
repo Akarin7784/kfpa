@@ -9,6 +9,7 @@ __pycache__/
 kfpa.db
 runs/
 *.db
+.kfpa/
 
 # 本地临时输出（勿提交）
 /*.txt
