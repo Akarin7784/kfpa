@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kfpa"
+version = "0.1.0"
+description = "KFPA —— 知识优先的流水线式多智能体软件生产架构（P0 最小闭环）"
+readme = "README.md"
+requires-python = ">=3.10"
+# P0 验收路径只需要这两个（Chief 已统一安装）。
+# litellm / aider / streamlit 一律 optional：缺包时业务代码必须优雅报错，不许 ImportError 崩。
+dependencies = [
+    "pyyaml>=6.0",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+llm = ["litellm"]
+exec = ["aider-chat"]
+ui = ["streamlit"]
+dev = ["pytest"]
+
+[project.scripts]
+kfpa = "kfpa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"kfpa" = ["prompts/*.j2"]
+
+# pytest 直接吃 src 布局：镜鉴不需要先装包也能跑 tests/
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
