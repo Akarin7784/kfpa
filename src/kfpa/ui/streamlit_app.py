@@ -15,8 +15,9 @@
 - **A17 的 headless 入口**：``render_tickets(db_path=…)`` 直接返回台账表格数据（list[dict]），
   不需要浏览器、不 import streamlit；``render_headless(db_path=…)`` 则是「真跑一次 AppTest 再取数据」；
 - 台账列与攒批事务规则**不变**（D1-8 / R-9），攒批复用 ``kfpa.ui.cli`` 的解析与落库；
-- 快车道页在 ``kfpa/ui/fastlane.py``（D3 §2/§3.6/§3.7）：**只做预览**（R-23，P1 不落库、
-  按钮文案写明「P3 才接攒批承认入库」），判定走 ``kfpa.impact.analyze``；
+- 快车道判定页在 ``kfpa/ui/fastlane.py``（D3 §2/§3.6/§3.7）：只做**判定预演**（不写库）；
+  P3 的**真承认**页在 ``kfpa/ui/fastlane_page.py``（写 ``fastlane_requests``，D5 §3.2/§3.6），
+  沉淀闸门页在 ``kfpa/ui/knowledge_page.py``（D5 §3.3/§3.6）；判定走 ``kfpa.impact.analyze``；
   ``diff_files`` 按 R-23 三来源优先级（执行产物 → ``--files`` → 无来源则 ``fast_lane=None``），
   界面预览可选展示层来源 ``--git-diff``（CLI 判定不得依赖 git）；
 - 数据层（``load_ticket_rows`` / ``fastlane.load_reports``）不 import streamlit，可直接 headless 断言；
@@ -219,16 +220,20 @@ def collect_page_data(
     *,
     store=None,
     include_fastlane: bool = True,
+    include_ack: bool = True,
+    include_knowledge: bool = True,
     diff_files: Optional[dict[int, list[str]]] = None,
     cli_files: Optional[list[str]] = None,
     use_git: bool = False,
 ) -> dict[str, Any]:
-    """页面/headless 共用的数据组装：台账行 + 快车道预览行 + 提示。"""
+    """页面/headless 共用的数据组装：台账行 + 快车道判定 + 承认台账 + 沉淀闸门。"""
     store = store or _open_store(db_path)
     raw = _list_tickets(store)
     rows = _ticket_rows(raw)
     hints: list[str] = []
     fastlane_rows: list[dict[str, Any]] = []
+    ack_rows: list[dict[str, Any]] = []
+    knowledge: dict[str, Any] = {"candidates": [], "samples": [], "hint": ""}
     if include_fastlane:
         try:
             from kfpa.ui import fastlane
@@ -244,10 +249,30 @@ def collect_page_data(
                 hints.append(hint)
         except Exception as exc:  # 快车道页坏掉不拖垮台账
             hints.append(f"[kfpa-ui] 快车道页加载失败：{exc} → 先看 kfpa tickets list 是否正常")
+    if include_ack:
+        try:
+            from kfpa.ui import fastlane_page
+
+            ack_rows, ack_hint = fastlane_page.list_requests(db=str(db_path))
+            if ack_hint:
+                hints.append(ack_hint)
+        except Exception as exc:  # P3 承认页坏掉不拖垮台账
+            hints.append(f"[kfpa-ui] 快车道承认页加载失败：{exc}")
+    if include_knowledge:
+        try:
+            from kfpa.ui import knowledge_page
+
+            knowledge = knowledge_page.load_overview(db=str(db_path))
+            if knowledge.get("hint"):
+                hints.append(str(knowledge["hint"]))
+        except Exception as exc:
+            hints.append(f"[kfpa-ui] 沉淀闸门页加载失败：{exc}")
     return {
         "db": str(db_path),
         "tickets": rows,
         "fastlane": fastlane_rows,
+        "fastlane_ack": ack_rows,
+        "knowledge": knowledge,
         "hints": hints,
         "open_high": sum(1 for r in rows if r["impact_raw"] == "high" and r["status_raw"] == "open"),
     }
@@ -261,6 +286,8 @@ def page(
     db_path: Optional[str] = None,
     *,
     include_fastlane: bool = True,
+    include_ack: bool = True,
+    include_knowledge: bool = True,
     preview_log: Optional[str] = None,
     cli_files: Optional[list[str]] = None,
     use_git: bool = False,
@@ -280,8 +307,8 @@ def page(
     st.set_page_config(page_title=_PAGE_TITLE, layout="wide")
     st.title(_PAGE_TITLE)
     st.caption(
-        "P1：質問票台账 + 快车道承认。台账列与攒批事务同 D1-8 / R-9；"
-        "未关闭高影响票会挡住任务包生成（退出码 3）。"
+        "P1：質問票台账；P3：快车道**承认落库**（D5 §3.2）与知识沉淀闸门（D5 §3.3）。"
+        "台账列与攒批事务同 D1-8 / R-9；未关闭高影响票会挡住任务包生成（退出码 3）。"
     )
 
     store = _open_store(db)
@@ -290,6 +317,8 @@ def page(
         db,
         store=store,
         include_fastlane=include_fastlane,
+        include_ack=include_ack,
+        include_knowledge=include_knowledge,
         cli_files=cli_files,
         use_git=use_git,
     )
@@ -386,11 +415,48 @@ def page(
 
         fastlane.render(st, data["fastlane"], ack=_ack)
 
+    if include_ack:
+        from kfpa.ui import fastlane_page
+
+        ack_rows = data.get("fastlane_ack") or []
+
+        def _real_ack(picked: list[str], typed: int) -> dict[str, Any]:
+            # P3 / D5 §3.2：唯一写入口是 `kfpa fastlane batch-ack`，写完回读确认
+            return fastlane_page.batch_ack(
+                ack_rows,
+                picked,
+                by=_default_actor(),
+                typed_count=typed,
+                db=str(data.get("db") or db),
+            )
+
+        fastlane_page.render(st, ack_rows, ack=_real_ack, by=_default_actor())
+
+    if include_knowledge:
+        from kfpa.ui import knowledge_page
+
+        knowledge_page.render(st, data.get("knowledge") or {"candidates": [], "samples": [], "hint": ""})
+
     st.caption(
-        "台账列 / 攒批事务：D1-8 · R-9；快车道判据：D3 §3.6；快车道承认：P3（R-23，本页仅预览）；"
+        "台账列 / 攒批事务：D1-8 · R-9；快车道判据：D3 §3.6；快车道承认落库：P3 D5 §3.2（"
+        "`batch_id`/`decided_by`/`decided_at`）；沉淀闸门：P3 D5 §3.3。"
         f"契约 {_contract_version()}。"
     )
     return data
+
+
+def _default_actor() -> str:
+    """承认人默认值（D5 §3.2 的 `$USER`）；拿不到就留空，由页面要求人手填。"""
+    for name in ("KFPA_ACTOR", "USERNAME", "USER"):
+        value = os.environ.get(name)
+        if value and str(value).strip():
+            return str(value).strip()
+    try:
+        import getpass
+
+        return str(getpass.getuser() or "")
+    except Exception:
+        return ""
 
 
 def _contract_version() -> str:
@@ -409,6 +475,8 @@ def render_headless(
     db_path: str = DEFAULT_DB,
     *,
     include_fastlane: bool = True,
+    include_ack: bool = True,
+    include_knowledge: bool = True,
     cli_files: Optional[list[str]] = None,
     use_git: bool = False,
     timeout: int = 60,
@@ -421,10 +489,15 @@ def render_headless(
         raise UIDependencyError(_STREAMLIT_HINT) from exc
 
     os.environ[_ENV_DB] = str(db_path or DEFAULT_DB)
-    if not include_fastlane:
-        os.environ["KFPA_UI_NO_FASTLANE"] = "1"
-    else:
-        os.environ.pop("KFPA_UI_NO_FASTLANE", None)
+    for flag, enabled in (
+        ("KFPA_UI_NO_FASTLANE", include_fastlane),
+        ("KFPA_UI_NO_ACK", include_ack),
+        ("KFPA_UI_NO_KNOWLEDGE", include_knowledge),
+    ):
+        if enabled:
+            os.environ.pop(flag, None)
+        else:
+            os.environ[flag] = "1"
     if cli_files:
         os.environ[_ENV_FILES] = ",".join(str(f) for f in cli_files)
     else:
@@ -470,7 +543,9 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
     parser.add_argument("--db", default=None, help=f"SQLite 库路径（默认 {DEFAULT_DB}，环境变量 {_ENV_DB}）")
     parser.add_argument("--headless", action="store_true", help="不进浏览器，用 AppTest 渲染一次（A17）")
     parser.add_argument("--json", action="store_true", help="headless 时输出 schemas.dumps 单行 JSON")
-    parser.add_argument("--no-fastlane", action="store_true", help="不渲染快车道预览页")
+    parser.add_argument("--no-fastlane", action="store_true", help="不渲染快车道判定页")
+    parser.add_argument("--no-ack", action="store_true", help="不渲染快车道承认页（P3 D5 §3.2，写库页）")
+    parser.add_argument("--no-knowledge", action="store_true", help="不渲染知识沉淀闸门页（P3 D5 §3.3）")
     parser.add_argument(
         "--files",
         default=None,
@@ -517,6 +592,8 @@ def main(
     args = _parse(argv)
     resolved_db = db_path or db or args.db or _env_db()
     include_fastlane = not args.no_fastlane and not os.environ.get("KFPA_UI_NO_FASTLANE")
+    include_ack = not args.no_ack and not os.environ.get("KFPA_UI_NO_ACK")
+    include_knowledge = not args.no_knowledge and not os.environ.get("KFPA_UI_NO_KNOWLEDGE")
     cli_files = _files_from_args(args)
     use_git = _git_preview_enabled(args)
     if getattr(args, "preview_log", None):
@@ -530,6 +607,8 @@ def main(
             data = render_headless(
                 resolved_db,
                 include_fastlane=include_fastlane,
+                include_ack=include_ack,
+                include_knowledge=include_knowledge,
                 cli_files=cli_files or None,
                 use_git=use_git,
             )
@@ -561,6 +640,8 @@ def main(
             st,
             resolved_db,
             include_fastlane=include_fastlane,
+            include_ack=include_ack,
+            include_knowledge=include_knowledge,
             cli_files=cli_files or None,
             use_git=use_git,
         )

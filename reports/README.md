@@ -77,3 +77,40 @@ python -m kfpa.ui.eval_page --in reports/review-eval.json --format html     --fu
 
 > `review-eval-mock.*`（`provider=mock`，两组同为同源剧本，24 条：漏检 12 / 误报 12 / 一致率 0.5）
 > 只作**接口链路证据**，不作为度量结论；结论以上面的正式产物为准。
+
+# P3 产物（D5 §3.6 / 界面）
+
+## 正式链路
+
+```powershell
+$env:PYTHONPATH="src"
+
+# 快车道承认台账（p3/store 的 0003 迁移落地后）：写 reports/fastlane-<批次>.md|html
+python -m kfpa.ui.fastlane_page --db kfpa.db --out-dir reports --format both
+
+# 沉淀闸门报告：写 reports/knowledge-report.md|html
+python -m kfpa.ui.knowledge_page --db kfpa.db --out-dir reports --format both
+```
+
+两条都不发网络、不引外部资源：HTML 是**单文件**（内联 CSS、无 CDN、无外链、无脚本），
+可直接离线打开或打印（`@media print`）。批次名会被清洗（`[^A-Za-z0-9._-]` → `-`），不会写出 `reports/` 之外。
+
+## 本目录文件（P3 增量）
+
+| 文件 | 说明 |
+|---|---|
+| `fastlane-demo.md` / `.html` | **演示产物**：承认台账渲染链路（已承认 / 待承认 / 已升级三态 + `batch_id`/`decided_by`/`decided_at`）。行是演示行，不是真库读出 |
+| `knowledge-report.md` / `.html` | **正式产物**：真 SQLite 库（4 条候选：2 隔离 / 1 转正 / 1 丢弃）经 `kfpa knowledge list --json` 读出后渲染 |
+
+> 快车道台账暂时只有**演示产物**：`fastlane_requests` 表随 `migrations/0003_fastlane.sql`（p3/store）落地，
+> 落地后把 `python -m kfpa.ui.fastlane_page` 指向真库，即可得到 `reports/fastlane-<批次>.{md,html}`。
+> `fastlane-demo.*` 证明的是**渲染链路与离线可打印**，不是承认结论。
+
+## 界面怎么用（P3）
+
+- 快车道**真承认**页：`kfpa/ui/fastlane_page.py`（写库走 D5 §3.2 冻结命令 `kfpa fastlane batch-ack`，
+  写完回读 `fastlane list --json` 确认；`ESCALATED`/`REJECTED` 在勾选池里就取不到；
+  勾选条数必须与人手填的确认条数一致才放行）。
+- 沉淀闸门页：`kfpa/ui/knowledge_page.py`（隔离区 / 已转正 / 已丢弃 / 抽检留痕，只读）。
+- 整页（可选，不列入验收）：`KFPA_UI_NO_ACK=1` / `KFPA_UI_NO_KNOWLEDGE=1` 可分别关掉两页。
+

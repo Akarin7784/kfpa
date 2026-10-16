@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>快车道承认台账（批次 demo）</title>
+<style>
+:root { color-scheme: light; }
+body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; color: #1b1b1f; }
+h1 { font-size: 1.5rem; border-bottom: 2px solid #444; padding-bottom: .4rem; }
+h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; width: 100%; font-size: .86rem; }
+th, td { border: 1px solid #bbb; padding: .35rem .5rem; text-align: left; vertical-align: top; }
+th { background: #f0f0f3; }
+tr:nth-child(even) td { background: #fafafa; }
+.meta { font-size: .85rem; color: #444; }
+.badge { display: inline-block; padding: .05rem .4rem; border: 1px solid #888; border-radius: .25rem; font-size: .78rem; }
+.note { font-size: .8rem; color: #555; margin-top: 1.2rem; }
+@media print { body { margin: 0; max-width: none; } a { color: inherit; text-decoration: none; } }
+</style>
+</head>
+<body>
+<h1>快车道承认台账（批次 demo）</h1>
+<p class="meta">生成时间：2026-10-17 01:42:33 · 请求总数：3 · 已承认（可直跑） 1；已升级回完整设计回合 1；待承认 1</p>
+<h2>台账</h2>
+<table><thead><tr><th>请求号</th><th>轮次</th><th>状态</th><th>批次</th><th>承认人</th><th>承认时间</th><th>摘要</th><th>改动文件</th></tr></thead><tbody>
+<tr><td>fl-1-1</td><td>1</td><td>已承认（可直跑）</td><td>demo</td><td>jiemian</td><td>2026-10-16 19:26:40</td><td>给 G7 报告加一列未覆盖行数（不动接口、不动数据模型，只碰 gates）</td><td>src/kfpa/gates.py</td></tr>
+<tr><td>fl-1-2</td><td>1</td><td>待承认</td><td>-</td><td>-</td><td>-</td><td>补一条 release 快照的打印（只碰 ledger）</td><td>src/kfpa/ledger.py</td></tr>
+<tr><td>fl-2-1</td><td>2</td><td>已升级回完整设计回合</td><td>-</td><td>-</td><td>-</td><td>想给 TaskPackage 加字段 → 碰数据模型</td><td>src/kfpa/gates.py</td></tr>
+</tbody></table>
+<p class="note">口径：D5 §3.2 —— 
+承认留痕取自 <code>fastlane_requests</code>；<code>ESCALATED</code>/<code>REJECTED</code> 不许被翻成 <code>approved</code>。 
+本文件单文件离线可打印，无外部依赖。</p>
+</body>
+</html>

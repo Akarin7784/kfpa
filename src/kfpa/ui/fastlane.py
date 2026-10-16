@@ -6,9 +6,10 @@
 
 R-23 两条硬口径：
 
-1. **快车道「承认」不进 P1**：P1 不新增表、不动 ``schema_version``、不升契约；
-   本页只做预览与提示，任何按钮文案必须写明「预览：P3 才接攒批承认入库」，
-   禁止做出已持久化的假象（``acknowledge()`` 只返回预览结果，不写库）。
+1. **本模块是历史预览层**：R-23 要求 P1 不落库，本模块保留为判定预演；
+   P3 的真承认（写 ``fastlane_requests``、留 ``batch_id/decided_by/decided_at``）在
+   ``kfpa/ui/fastlane_page.py``（D5 §3.2/§3.6）。本模块任何按钮文案仍必须写明「不写库」
+   （``acknowledge()`` 只返回预览结果）。
 2. **``diff_files`` 三来源优先级**：``ExecResult.files_changed`` → 显式 ``--files`` →
    都拿不到则 ``fast_lane=None`` + ``reason="no_diff_source"``（**不猜、不默认 True**）。
    界面预览另有展示层来源 ``git diff --name-only HEAD``（默认关闭，需显式开启），
@@ -46,12 +47,13 @@ IMPACT_MISSING_HINT = (
     "等该模块合入 main 后重跑即可。"
 )
 
-#: R-23：本页是预览，不是入库
+#: R-23 的历史口径：**本模块**仍是纯预演（不写库）；P3 的真承认在 ``kfpa/ui/fastlane_page.py``
 PREVIEW_BANNER = (
-    "R-23：快车道「承认」不进 P1 —— 本页只做预览与提示，P3 才接攒批承认入库（不写库、不新增表）。"
+    "R-23 的历史口径：本模块只做判定预演，不写库、不新增表 —— P3 的**真承认**"
+    "（写 fastlane_requests，留 batch_id/decided_by/decided_at）在 `kfpa/ui/fastlane_page.py`（D5 §3.2/§3.6）。"
 )
-#: R-23 要求的按钮文案
-ACK_BUTTON_LABEL = "预览：确认放行 {n} 轮（P3 才接攒批承认入库）"
+#: R-23 要求的按钮文案（本模块是预演，别让它看起来像入库）
+ACK_BUTTON_LABEL = "预演（不写库）：确认放行 {n} 轮 —— 入库请用快车道承认页（P3）"
 
 #: 判定来源（R-23 三来源 + 界面展示层）
 SOURCE_EXEC = "exec_result"
@@ -390,7 +392,7 @@ def acknowledge(
         "actor": actor,
         "note": note,
         "at": stamp,
-        "hint": "R-23：P1 只做预览，P3 才接攒批承认入库（本页不写库、不新增表）。",
+        "hint": "本模块只做预演，不写库；P3 的真承认走 kfpa/ui/fastlane_page.py（D5 §3.2）。",
     }
 
     if preview_log:
@@ -432,7 +434,7 @@ def _table_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def render(st, rows: list[dict[str, Any]], *, ack=None, key_prefix: str = "fastlane") -> list[int]:
     """Streamlit 段落：**预览**判定 + 勾选 + 预览确认；返回被选中的轮次（headless 可断言）。"""
-    st.subheader("快车道预览（P1 不做入库）")
+    st.subheader("快车道判定预演（不写库）")
     st.info(PREVIEW_BANNER)
     st.caption("判据（D3 §3.6）：不改接口契约 / 不改数据模型 / 波及 ≤1 模块，三者全真才可走快车道。")
 
