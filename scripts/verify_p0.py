@@ -261,11 +261,28 @@ def spec_reason_key(category: str, target: str) -> str:
     ).hexdigest()[:12]
 
 
+def make_store_for(store_mod, db) -> object:
+    """兼容两种 Store 工厂形态：P0 的 `Store(path)` 与 P1 的 `make_store(dsn)`（D3 §3.2）。
+
+    P1 把 `Store` 改画成 Protocol 之后，直接 `Store(path)` 会立刻炸；优先走 `make_store`，
+    保证 P0 门禁在 store 双驱动重构后不回归（D3 §6.2）。
+    """
+    factory = getattr(store_mod, "make_store", None)
+    if callable(factory):
+        try:
+            st = factory(str(db))
+            if st is not None:
+                return st
+        except Exception:  # noqa: BLE001
+            pass
+    return store_mod.Store(str(db))
+
+
 def seed_ticket(store_mod, db: Path, *, ticket_id: str, round_no: int, impact: str,
                 status: str = "OPEN", location: str = "design.md §5.1") -> str:
     """用 §3.2 契约 API 造票（不碰被测 CLI，保证 A3/A7 独立于 mock 剧本）。"""
     sc = importlib.import_module("kfpa.schemas")
-    st = store_mod.Store(str(db))
+    st = make_store_for(store_mod, db)
     try:
         st.init_schema()
     except Exception:  # noqa: BLE001
@@ -405,7 +422,7 @@ def check_a2(ctx: Ctx, c: Check) -> None:
         c.add(ok=False, note=f"import kfpa.store 失败：{serr}")
         c.fail(f"kfpa.store 不可导入（{OWNERS['src/kfpa/store.py']}）：{serr}")
         return
-    st = store_mod.Store(str(db))
+    st = make_store_for(store_mod, db)
     try:
         tickets = st.list_tickets(1)
         c.add(ok=len(tickets) >= 1, note=f"Store.list_tickets(1) 返回 {len(tickets)} 张票")
@@ -477,7 +494,7 @@ def check_a3(ctx: Ctx, c: Check) -> None:
 
     # R-13：拦停时 rounds.state 必须是 tickets_open（这个时点可观测）
     try:
-        rd0 = store_mod.Store(str(db)).get_round(2)
+        rd0 = make_store_for(store_mod, db).get_round(2)
         s0 = status_value(rd0.state) if rd0 is not None else ""
     except Exception as exc:  # noqa: BLE001
         s0 = f"<{type(exc).__name__}: {exc}>"
@@ -514,7 +531,7 @@ def check_a3(ctx: Ctx, c: Check) -> None:
     if ev2["rc"] == EXIT_CONFIRM:
         c.fail("A3：关票后仍被硬规则拦停（退出码 3）—— 关闭状态没生效。")
     try:
-        st = store_mod.Store(str(db))
+        st = make_store_for(store_mod, db)
         t = st.get_ticket(tid)
         st_val = status_value(t.status) if t is not None else ""
         c.add(ok=t is not None and st_val == "closed" and bool((t.answer or "").strip()),
@@ -585,7 +602,7 @@ def check_a4(ctx: Ctx, c: Check) -> None:
         return
 
     def new_store(tag: str):
-        st = store_mod.Store(str(ctx.fresh_db(tag)))
+        st = make_store_for(store_mod, ctx.fresh_db(tag))
         try:
             st.init_schema()
         except Exception:  # noqa: BLE001
@@ -693,7 +710,7 @@ def check_a4(ctx: Ctx, c: Check) -> None:
     if ev["rc"] not in (EXIT_NEEDS_FIX, EXIT_BLOCKED):
         c.fail(f"A4：--inject test_fail 退出码 {ev['rc']}，既不是 10 也不是 11。")
     try:
-        st = store_mod.Store(str(db))
+        st = make_store_for(store_mod, db)
         reports = st.list_gate_reports(1)
         states = [(r.attempt, r.state.value, getattr(r, "escalated", None),
                    getattr(r, "same_reason_count", None)) for r in reports]
@@ -918,7 +935,7 @@ def check_a6(ctx: Ctx, c: Check) -> None:
     snap = {}
     try:
         store_mod = importlib.import_module("kfpa.store")
-        st = store_mod.Store(str(db))
+        st = make_store_for(store_mod, db)
         snaps = st.list_snapshots()
         c.add(ok=len(snaps) >= 1, note=f"Store.list_snapshots() 返回 {len(snaps)} 条")
         if snaps:
@@ -974,7 +991,7 @@ def _ensure_tickets(ctx: Ctx, db: Path, tag: str) -> tuple[list[str], str]:
         store_mod = importlib.import_module("kfpa.store")
     except Exception as exc:  # noqa: BLE001
         return [], f"import kfpa.store 失败：{type(exc).__name__}: {exc}"
-    st = store_mod.Store(str(db))
+    st = make_store_for(store_mod, db)
     ids = []
     try:
         ids = [t.ticket_id for t in st.list_tickets()]
@@ -1146,7 +1163,7 @@ def check_a7_rules(ctx: Ctx, c: Check) -> None:
     try:
         seed_ticket(store_mod, db, ticket_id="R1-911", round_no=1, impact="MEDIUM")
         seed_ticket(store_mod, db, ticket_id="R1-912", round_no=1, impact="HIGH")
-        st = store_mod.Store(str(db))
+        st = make_store_for(store_mod, db)
         got = st.list_tickets(impact=sc.TicketImpact.HIGH)
         ok = [t.ticket_id for t in got] == ["R1-912"]
         c.add(ok=ok, note=f"R-8：list_tickets(impact=HIGH) 返回 {[t.ticket_id for t in got]}"
