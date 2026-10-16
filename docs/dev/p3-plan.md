@@ -111,6 +111,18 @@ knowledge_hits: list[str] = field(default_factory=list)   # 形如 "K1#reused=2"
   `kfpa fastlane plan --round N [--files a,b]` · `kfpa fastlane list [--status pending]` ·
   `kfpa fastlane ack <request_id> --by <name>` · `kfpa fastlane batch-ack --file acks.yaml --by <name>` ·
   `kfpa fastlane show <request_id>`
+- **该组的唯一 owner 是 `kfpa/fastlane.py`（R-34）**：P1 的 `check` 一并由它注册（内部转
+  `kfpa.impact.analyze`），`kfpa.impact` 不再注册 `fastlane`；`cli.py` 插件清单里
+  `("kfpa.impact", ".impact")` → `("kfpa.fastlane", ".fastlane")`。
+- **`acks.yaml` 文件 schema（R-34 冻结）**：
+
+  ```yaml
+  acks:
+    - request_id: fl-1-1
+      note: 可选的承认备注
+  ```
+
+  缺 `acks` 键或元素缺 `request_id` → **rc=2 + 中文**（用法错误），不许静默跳过、不许凭空补行。
 - **幂等与留痕**：同一 `request_id` 二次承认不重复写行、不覆盖首次 `decided_by/decided_at`，返回原记录；
   攒批承认同批共享 `batch_id`；`ESCALATED`/`REJECTED` 的请求**不许**被 `ack` 翻成 `APPROVED`（要翻必须新开请求）。
 - **存什么**：`fastlane_requests` 表（SQLite 与 PG 同签名），`kfpa fastlane list --json` 输出稳定列。

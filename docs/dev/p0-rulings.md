@@ -598,6 +598,34 @@ P3 收口判据不变：A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆�
 
 ---
 
+## R-34 快车道：`kfpa fastlane` 子命令组唯一 owner · `acks.yaml` 文件 schema 冻结
+
+界面在 `p3/ui`（#56）里报了两条会挡住 A23/A24 真跑的接口问题，逐条裁：
+
+1. **`fastlane` 子命令组只能有一个 owner**：`src/kfpa/impact.py:189` 早已
+   `add_parser("fastlane")`（当时只有 `check`），而 D5 §3.2 要 `src/kfpa/fastlane.py` 注册
+   `plan/list/ack/batch-ack/show` —— 两个模块同时注册同名组会 argparse 冲突，且
+   `tests/test_cli_inprocess.py` 断言 `kfpa fastlane check` 必须继续可用。裁决：
+   - **`kfpa.fastlane`（长流）是该组唯一 owner**：它把 `check` 一并注册（内部转 `kfpa.impact.analyze`），
+     再加 `plan/list/ack/batch-ack/show`；
+   - **`kfpa.impact`（磐石）不再注册 `fastlane`**；`analyze()` 保留为库函数（`check` 仍调它）。
+     `cli.py` 插件清单里 `("kfpa.impact", ".impact")` 由 `("kfpa.fastlane", ".fastlane")` 取代。
+   - 判据：`kfpa fastlane --help` 里五个子命令齐、`kfpa fastlane check …` 行为与 P1 一致、
+     `kfpa impact --help` 不再存在。
+2. **`batch-ack --file acks.yaml` 的文件 schema 冻结**（D5 只写了命令没写文件）：
+
+   ```yaml
+   acks:
+     - request_id: fl-1-1
+       note: 可选的承认备注
+   ```
+
+   顶层键 `acks`，元素必须含 `request_id`；`note` 可选；缺 `acks` 键或元素缺 `request_id` →
+   **rc=2 + 中文**（用法错误），不许静默跳过或凭空补行。实现方 `kfpa.fastlane.parse_ack_file()`
+   与界面 `build_acks_yaml()` 已按此形状对接（#56 里两端互证），本条只是把它写进权威文档。
+
+---
+
 ## 变更记录
 
 | 版本 | 日期 | 裁决 | 作者 |
@@ -621,3 +649,4 @@ P3 收口判据不变：A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆�
 | 2.6 | 2026-10-17 | R-29 升版守卫=全部台架 · R-30 测试归属与交接路径 · R-31 A18 rc 口径纠正（未知 provider=2）+ A20 覆盖率缺口拆解（67.5%，不放水） | Chief |
 | 2.7 | 2026-10-17 | R-32 A20 白名单拆分：排除需外部服务的 `store/postgres.py`（覆盖交给 A12），纯逻辑门槛重算 75.0%，还需 +88 语句 | Chief |
 | 2.8 | 2026-10-17 | R-33 P3 开工三问：沉淀门槛维持 0.80（D5 §3.3 笔误已改）· A25 闸门入口冻结名（`admit`/`record_sample`）· A26 复用 A12 的 PG 夹具（`KFPA_PG_PORT` 默认 55440）· `verify_p3` 的红是派工单而 A0 必须始终绿 | Chief |
+| 2.9 | 2026-10-17 | R-34 快车道接口收口：`kfpa.fastlane` 为 `fastlane` 组唯一 owner（`check` 一并注册、`impact` 不再注册）· `acks.yaml` 文件 schema 冻结（`acks: [{request_id, note?}]`，缺键 rc=2） | Chief |
