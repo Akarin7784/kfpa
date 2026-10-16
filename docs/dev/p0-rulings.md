@@ -282,6 +282,24 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
   三条都必须 rc=0（clean env）。
 - 首次执行记录：契约 1.0→1.1（守卫就位）、1.1→**1.2**（P1 D3-3.1，本 PR）。
 
+## R-21 升级守卫的同步义务归「发起变更者」；schema_version 不许在台架里写死
+
+- 磐石预告：D3 要求 `meta.schema_version = "2"`，而 `scripts/selfcheck_core.py` 有四处把 `"1"` 写死
+  （52/53/54/122 行），升版后必红。这是**预期内的守卫反应**，但同步义务要定清楚。
+- **裁决**：
+  1. **同步义务归「发起变更的人」**（R-20 的一般化）：谁升版，谁就在**同一个 PR** 里把受影响的守卫一并改掉，
+     越界修改必须在 PR 描述里明说，由该文件 owner 复验。`schema_version 1→2` → 磐石（`p1/store`）；
+     `CONTRACT_VERSION 1.1→1.2` → Chief（已按 R-20 执行，镜鉴已复验）。
+  2. **`schema_version` 与 `CONTRACT_VERSION` 口径不同，别混**：
+     - `CONTRACT_VERSION` 的守卫**故意写死**，逼你同步（升版不同步就红，这是特性）；
+     - `schema_version` 的断言**必须跟常量走** —— `scripts/selfcheck_core.py` 里那四处字面量
+       改成从 `kfpa.store` 导入的 `SCHEMA_VERSION`（含 `set_meta` 幂等检查）；
+       这样 2→3 不需要再改台架，也不会有「改了 store 忘了台架」的第二次踩坑。
+  3. **表常量语义**（照准磐石方案，命名不骗人）：
+     `BUSINESS_TABLES` / `TABLE_NAMES` **保留 P0 含义不变**（meta + 六表）；
+     新增 `P1_TABLE_NAMES = ("ledger", "knowledge")` 与 `ALL_TABLE_NAMES = TABLE_NAMES + P1_TABLE_NAMES`。
+     需要「当前所有表」的断言（A12 双库对拍、P1 台架）一律用 `ALL_TABLE_NAMES`（9 张）。
+
 ---
 
 ## 变更记录
@@ -296,3 +314,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.5 | 2026-10-16 | R-18 中文输出在非 UTF-8 控制台/重定向下必须不崩（新增验收 A10；R-2b 运行约定补充） | Chief |
 | 1.6 | 2026-10-16 | R-19 R-18 兜底必须覆盖独立脚本（`scripts/**` 自己也要能在 clean env 下跑）| Chief |
 | 1.7 | 2026-10-16 | R-20 契约升版必须同批同步「升版守卫」（Chief 直改三处 + 镜鉴复验）| Chief |
+| 1.8 | 2026-10-16 | R-21 升级守卫同步义务归发起变更者 · `schema_version` 断言跟常量走 · `ALL_TABLE_NAMES` 语义 | Chief |
