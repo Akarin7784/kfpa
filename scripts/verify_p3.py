@@ -285,6 +285,55 @@ def read_env_file(path: Path) -> dict:
 # ------------------------------------------------------------------ A0
 
 
+#: R-30 交接的 PG 残留自查工具（磐石 #72/#74，`--allow-skip` 形态）
+PG_RESIDUE_CHECKER = "benchmarks/p3_store/check_pg_residue.py"
+
+
+def _a0_ledger_guard(ctx: Ctx, c: Check) -> None:
+    """A0 台账 guard：覆盖率产物不许被 git 跟踪（R-30 交接卫生的姊妹条）。
+
+    `.coverage` 曾经是**被跟踪**文件：跑一次台架就把工作树弄脏，rebase 时还会撞进 diff
+    （#70 已 `git rm --cached`）。这类「测试自己造出来的文件被带进提交」今天出现过两次
+    （另一次是误带的杂散 SQLite 文件 `x`）—— 只靠自觉会回潮，所以钉成断言：
+    既查**跟踪**（真回潮就红），也查 `.gitignore` **覆盖**（重加时不会再漏）。
+    """
+    ev = ctx.run(["git", "ls-files"], timeout=60)
+    tracked = [ln.strip() for ln in (ev["stdout"] or "").splitlines()]
+    bad = sorted(n for n in tracked if n == ".coverage" or n.startswith(".coverage."))
+    c.add(cmd=ev["cmd"], rc=ev["rc"], ok=not bad,
+          note=f"A0：台账 guard —— `git ls-files` 里 `.coverage*` = {bad or '无'}")
+    if bad:
+        c.fail(f"A0：覆盖率产物被 git 跟踪 = {bad} —— 跑一次台架就把工作树弄脏（#70 摘过一次，"
+               "别回潮）：`git rm --cached` 并写进 `.gitignore`。")
+    gi = ctx.run(["git", "check-ignore", "-v", "--no-index", ".coverage"], timeout=60)
+    ignored = gi["rc"] == EXIT_PASS and ".gitignore" in (gi["stdout"] or "")
+    c.add(cmd=gi["cmd"], rc=gi["rc"], ok=ignored,
+          note=f"A0：`.coverage` 已被 `.gitignore` 覆盖 = {ignored}")
+    if not ignored:
+        c.fail("A0：`.gitignore` 没覆盖 `.coverage` —— 下一次跑覆盖率的产物又会被 `git add .` 带进来。")
+
+
+def _a0_pg_residue(ctx: Ctx, c: Check) -> None:
+    """A0 收尾：实现方桩在共享 PG 上不许留残渣（可复现、可证伪的命令，R-38）。
+
+    `--allow-skip`：clean env（没有 PG）时降级成 rc=0，但输出里必须有可见说明 ——
+    所以这条既不假红，也不假绿。工具自己是 #74 后的版本：非 PG 目标（典型是机器上残留的
+    `KFPA_DB_URL=sqlite://…`）直接 rc=2，**不会**再出现「连的是空 sqlite 却说 PG 无残留」。
+    """
+    checker = ctx.root / PG_RESIDUE_CHECKER
+    if not checker.is_file():
+        c.warn(f"A0：缺 PG 残留自查工具 `{PG_RESIDUE_CHECKER}`（R-30 交接物）—— 这条跳过。")
+        return
+    ev = ctx.run([ctx.python, str(checker), "--allow-skip"], timeout=120)
+    blob = (ev["stdout"] or "") + (ev["stderr"] or "")
+    c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=(ev["stdout"] or "")[:800],
+          stderr=(ev["stderr"] or "")[:400], ok=ev["rc"] == EXIT_PASS,
+          note="A0：共享 PG 上桩前缀残留 = 0（rc 三分：0 无残留 / 1 有残留 / 2 用法错误 / 4 不可达）")
+    if ev["rc"] != EXIT_PASS:
+        c.fail(f"A0：PG 残留自查 rc={ev['rc']}（0=无残留 / 1=有残留，点名的 request_id/cid 见下）"
+               f" / 2=目标不是 PG / 4=PG 不可达：\n{blob[-700:]}")
+
+
 def check_a0(ctx: Ctx, c: Check) -> None:
     """D5 §4 A0：P0/P1/P2 三条台架不回归 + `pytest` 全绿 + R-32 白名单覆盖率不下降。"""
     sc, serr = import_mod("kfpa.schemas")
@@ -410,6 +459,10 @@ def check_a0(ctx: Ctx, c: Check) -> None:
         c.add(ok=True, note=f"A0（A20b 口径报告项，非门槛）：{p} 行覆盖 "
                             f"{per_file[p]['rate']:.1%}"
                             f"（{per_file[p]['covered']}/{per_file[p]['statements']}）")
+    # A0 收尾（R-30/R-38）：这一轮跑完，工作树与共享 PG 都不许留残渣 —— 两条都是可证伪的命令。
+    _a0_ledger_guard(ctx, c)
+    _a0_pg_residue(ctx, c)
+
     if ctx.coverage_out:
         target = Path(ctx.coverage_out)
         target.parent.mkdir(parents=True, exist_ok=True)
