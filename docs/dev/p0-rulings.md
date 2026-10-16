@@ -205,6 +205,44 @@ def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
   就会在运行期静默炸成 `MockScriptError`。别名与规范 marker 都必须有测试覆盖。
 - 连带更新：`p0-design-addendum.md` D1-7 已加口径标注。
 
+## R-18 中文输出在非 UTF-8 控制台/重定向下必须不崩（Chief 实测抓到的产品缺陷）
+
+**现象（我在本地集成树上实测，`main + p0/core + p0/ui + p0/verify`）**：
+
+```
+$ python -c "import sys; print(sys.stdout.encoding, sys.stdout.isatty())"
+cp1252 False                      # stdout 被重定向时 Python 用 locale 编码
+
+$ python -m kfpa --help           → UnicodeEncodeError → rc=1   （应为 0）
+$ python -m kfpa init --db it.db  → UnicodeEncodeError → rc=1   （应为 0）
+$ python -m kfpa tickets list ... → UnicodeEncodeError → rc=1   （应为 0）
+$ $env:PYTHONIOENCODING="utf-8" 后重跑：rc=0 / 0 / 0，退出码全对
+```
+
+**影响面**：这是**产品缺陷**，不是环境噪音 —— 任何把输出重定向到文件/管道的用法都会炸：
+`--help`、`init`、`tickets *`、`round`（中文阶段日志）、`--json`（`dumps` 是 `ensure_ascii=False`，中文原样输出）。
+CI/验收台架只要捕获输出，就会把**全绿判成全红**（或反过来，让没捕获输出的台架给出假绿）。
+
+**裁决 R-18**：
+
+1. **代码兜底（必须做，归磐石）**：`cli.main()` 入口处把 `sys.stdout` / `sys.stderr` 重新配置为 UTF-8：
+
+   ```python
+   for _stream in (sys.stdout, sys.stderr):
+       try:
+           _stream.reconfigure(encoding="utf-8", errors="replace")
+       except (AttributeError, ValueError, OSError):
+           pass
+   ```
+
+   放在 `main()` 最前、`parse_args` 之前（`--help` 也要被覆盖）；`__main__.py` 与 console_scripts 两条入口都过 `main()`，一处即够。
+2. **运行约定补充（R-2b）**：验收与 CI 命令统一加 `$env:PYTHONIOENCODING="utf-8"`（bash: `PYTHONIOENCODING=utf-8`）。
+   代码兜底修好后这条是双保险，不做也可以跑绿；但**台架必须至少有一遍不设该变量**，否则测不出这类缺陷。
+3. **新增验收 A10**：在 stdout 被重定向（非 UTF-8）且**不设** `PYTHONIOENCODING` 的条件下，
+   `kfpa --help` / `kfpa init` / `kfpa tickets list` / `kfpa round --json` 均不得因编码崩溃（无 `UnicodeEncodeError`，rc 符合 D1-5）。
+4. **对台架的要求**：镜鉴的 A1/A7 此前报 `rc=0`，说明台架跑的时候吞掉了这层（设了变量或换了解码）。
+   请在不设 `PYTHONIOENCODING` 的条件下补跑 A1/A7/A10——这类「环境相关的假绿」比功能缺陷更危险。
+
 ---
 
 ## 变更记录
@@ -216,3 +254,4 @@ def build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
 | 1.2 | 2026-10-16 | R-10 A2/A3 不互斥 + `--inject high_ticket` · R-11 A5 白名单与两条验收命令 · R-12 main 基线核对与 rebase 要求 | Chief |
 | 1.3 | 2026-10-16 | R-13 放行判据（仅 HIGH 阻塞）· R-14 LangGraph state 契约与 `build_graph()` 签名 · R-15 界面小口径与 shim 处置 · R-16 集成预演纪律 | Chief |
 | 1.4 | 2026-10-16 | R-17 marker 规范（`KFPA_TASK=` 为准，`[KFPA:…]` 永久兼容别名）· D1-7 加口径标注 | Chief |
+| 1.5 | 2026-10-16 | R-18 中文输出在非 UTF-8 控制台/重定向下必须不崩（新增验收 A10；R-2b 运行约定补充） | Chief |
