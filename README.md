@@ -44,7 +44,9 @@
 
 ✅ **P1 正经版已交付**（2026-10-16）：PostgreSQL 双驱动 + 双库对拍、token 账本、checkpoint 落盘、G7 覆盖率门槛、沉淀闸门、快车道判据、Streamlit 台账。
 
-✅ **P2 评审位异构化已交付**（2026-10-17，main）：评审位接进主循环（G8 折算：`major + criterion` 才阻塞）、异构 provider 可换挡、同源盲区可量化度量、评审报告三形态（Markdown / HTML / 页面）。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
+✅ **P2 评审位异构化已交付**（2026-10-17）：评审位接进主循环（G8 折算：`major + criterion` 才阻塞）、异构 provider 可换挡、同源盲区可量化度量、评审报告三形态（Markdown / HTML / 页面）。
+
+✅ **P3 快车道 + 沉淀闸门全量已交付**（2026-10-17，main）：快车道**承认落库**（`fastlane_requests` 攒批承认 + 审计留痕 + 幂等/不可翻案）、沉淀闸门全量（置信度门槛 0.80 · 隔离区 · 后续轮次复用才转正 · 动态抽检 · 回避模式）、负知识回灌（R-28 轮次范围）、本地回退检索（RAG，Dify 惰性适配器）。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
 
 ### 快速开始（clean env，无需 API key）
 
@@ -60,19 +62,20 @@ python -m kfpa history --db kfpa.db                                  # 轮次快
 
 退出码（D1-5 / D2 R-1，rc 三分见 D2 R-31）：`0` 通过 · `2` 用法错误 · `3` 等待人工确认 · `4` 依赖/环境（含缺凭据）· `5` I/O 与 DB · `10` 需修复 · `11` 阻塞。
 
-### 验收结果（`main` `eca4837`，clean env 不设 `PYTHONIOENCODING`，PG 独占端口）
+### 验收结果（`main` `358ad46`，clean env 不设 `PYTHONIOENCODING`，**独占 PG** 端口 55440）
 
 | 台架 | 结果 |
 |---|---|
 | `python scripts/verify_p0.py` | **A1–A10 共 13 条断言 PASS 13 / FAIL 0 / SKIP 0** |
 | `python scripts/verify_p1.py` | **A11–A17 共 8 条断言 PASS 8 / FAIL 0 / SKIP 0**（A12 双库对拍在真 PG 上） |
 | `python scripts/verify_p2.py` | **A18–A22 共 6 条断言 PASS 6 / FAIL 0 / SKIP 0**（A20 先要求 `pytest` 全绿） |
+| `python scripts/verify_p3.py` | **A0 + A23–A27 共 6 条断言 PASS 6 / FAIL 0 / SKIP 0**（A0 内嵌 P0/P1/P2 + `pytest` rc=0 + 覆盖率门槛） |
 | `python scripts/selfcheck_core.py` | **FAILED: 无** |
-| `python -m pytest tests -q` | **194 passed** |
+| `python -m pytest tests -q` | **342 passed** |
 
-P2 关键数字：R-32 纯逻辑白名单行覆盖 **90.7%**（1605/1770，门槛 80%）；同源盲区度量 24 样本 —— 异构评审漏检 **0** vs 同源 **12**，一致率 **100% vs 50%**。
+P3 关键数字：R-32 纯逻辑白名单行覆盖 **96.3%**（1823/1893，门槛 80%）；P3 新模块 `fastlane.py` **83.3%** · `knowledge.py` **84.5%**（R-33 配套门槛各 ≥80%）；快车道 `acks` 三种坏形状全部 rc=2、`ESCALATED`/`REJECTED` 不可被 ack 翻白；负知识回灌只取「本轮+上一轮」且 SQLite/PG `package_hash` 一致。
 
-设计与裁决文档：[docs/dev/p0-plan.md](docs/dev/p0-plan.md)（施工图与 A1–A10）· [docs/dev/p0-design-addendum.md](docs/dev/p0-design-addendum.md)（D1 工程细节）· [docs/dev/p0-rulings.md](docs/dev/p0-rulings.md)（D2 裁决 R-1~R-32）· [docs/dev/p1-plan.md](docs/dev/p1-plan.md)（D3）· [docs/dev/p2-plan.md](docs/dev/p2-plan.md)（D4 契约 1.3）· 验收报告 [P0](docs/acceptance/p0-acceptance.md) / [P1](docs/acceptance/p1-acceptance.md) / [P2](docs/acceptance/p2-acceptance.md)。
+设计与裁决文档：[docs/dev/p0-plan.md](docs/dev/p0-plan.md)（施工图与 A1–A10）· [docs/dev/p0-design-addendum.md](docs/dev/p0-design-addendum.md)（D1 工程细节）· [docs/dev/p0-rulings.md](docs/dev/p0-rulings.md)（D2 裁决 R-1~R-38）· [docs/dev/p1-plan.md](docs/dev/p1-plan.md)（D3）· [docs/dev/p2-plan.md](docs/dev/p2-plan.md)（D4 契约 1.3）· [docs/dev/p3-plan.md](docs/dev/p3-plan.md)（D5 契约 1.4 / schema 4）· 验收报告 [P0](docs/acceptance/p0-acceptance.md) / [P1](docs/acceptance/p1-acceptance.md) / [P2](docs/acceptance/p2-acceptance.md) / [P3](docs/acceptance/p3-acceptance.md)。
 
 ## License
 
