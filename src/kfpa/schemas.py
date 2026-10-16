@@ -1,13 +1,15 @@
-"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.1）。
+"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.2）。
 
 本文件由 Chief 冻结：**任何人不得直接修改**。需要变更时在群里提，
-由 Chief 升版后统一改，改完必须同步 docs/dev/p0-plan.md §3.1。
+由 Chief 升版后统一改，改完必须同步 docs/dev/p0-plan.md §3.1（P0）与 docs/dev/p1-plan.md §3.1（P1）。
 
 变更记录：
 - 1.0 首版冻结（QATicket / TaskPackage / GateReport / ExecResult / ...）
 - 1.1 依 docs/dev/p0-design-addendum.md D1-3 / D1-4 补齐门禁所需字段：
       ExecResult 增加 error_category / failed_criteria / results；
       GateReport 增加 reason_key。
+- 1.2 依 docs/dev/p1-plan.md D3-3.1 增加 P1 三件：LedgerEntry（token 账本）、
+      KnowledgeCandidate + CandidateStatus（沉淀闸门）、CoverageReport（G7 覆盖率门槛）。
 
 设计约束：
 - 只用标准库（dataclasses / enum / json / hashlib），不吃第三方依赖，
@@ -24,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.2"
 
 # ---------------------------------------------------------------- 枚举
 
@@ -264,6 +266,66 @@ class RoundResult:
         return [t.ticket_id for t in self.tickets if t.is_open_high()]
 
 
+# ---------------------------------------------------------------- P1 增量（契约 1.2）
+
+
+@dataclass
+class LedgerEntry:
+    """token 账本一条（P1 D3-3.4）：每次 LLM 调用落一条，失败经济学要算账。"""
+
+    round_no: int
+    role: str                     # ARCHITECT / REVIEWER / FLASH / EMBEDDING
+    model_ref: str                # 从 config/models.yaml 的 model 字段取，代码里不许写死
+    tokens_in: int
+    tokens_out: int
+    cost: float = 0.0             # 未配置单价时为 0.0，不许编造
+    source: str = "mock"          # mock | litellm | langfuse
+    created_at: float = field(default_factory=time.time)
+
+    def total_tokens(self) -> int:
+        return int(self.tokens_in) + int(self.tokens_out)
+
+
+class CandidateStatus(str, Enum):
+    QUARANTINE = "quarantine"     # 待验证隔离区
+    PROMOTED = "promoted"         # 已转正
+    DROPPED = "dropped"           # 不合格，直接丢弃
+
+
+@dataclass
+class KnowledgeCandidate:
+    """知識沉淀候选（P1 D3-3.5 / design.md §5.5 防中毒）。"""
+
+    cid: str
+    round_no: int
+    kind: str                     # success | avoid（负知识同样值钱）
+    content: str
+    confidence: float             # 0.0 ~ 1.0
+    status: CandidateStatus = CandidateStatus.QUARANTINE
+    reused_by: list[int] = field(default_factory=list)   # 成功复用过它的轮次号
+    created_at: float = field(default_factory=time.time)
+
+    def can_promote(self) -> bool:
+        """转正条件：至少被 1 个成功轮次复用（D3-3.5）。"""
+        return self.status is CandidateStatus.QUARANTINE and len(self.reused_by) >= 1
+
+
+@dataclass
+class CoverageReport:
+    """覆盖率门槛报告（P1 D3-3.3 G7）。"""
+
+    line_rate: float              # 0.0 ~ 1.0
+    files: dict[str, float] = field(default_factory=dict)   # 文件 -> 行覆盖率
+    critical_paths_ok: bool = False    # A1–A10 台架是否全绿
+    threshold_line: float = 0.80
+
+    def failing_files(self) -> list[str]:
+        return sorted(f for f, rate in self.files.items() if rate < self.threshold_line)
+
+    def passed(self) -> bool:
+        return self.line_rate >= self.threshold_line and self.critical_paths_ok
+
+
 # ---------------------------------------------------------------- 工具
 
 
@@ -303,6 +365,10 @@ __all__ = [
     "Snapshot",
     "Round",
     "RoundResult",
+    "LedgerEntry",
+    "CandidateStatus",
+    "KnowledgeCandidate",
+    "CoverageReport",
     "to_jsonable",
     "dumps",
 ]
