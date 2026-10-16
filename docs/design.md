@@ -212,7 +212,9 @@ Flash 越笨，规约必须越精确。六段式模板（Jinja2 渲染）：
 
 ## 8. 路线图
 
-- [ ] **P0 懒人版**：LiteLLM + Aider + SQLite + Dify，一天跑通第一轮（设计→質問票→确认→编码→门禁）
+- [x] **P0 懒人版**：LiteLLM + Aider + SQLite + Dify，一天跑通第一轮（设计→質問票→确认→编码→门禁）
+  —— 已交付（2026-10-16）：SQLite + LangGraph 编排 + mock 执行器跑通全链，离线可验收；
+  真实 LiteLLM/Aider/Dify 为惰性可选适配器。实现与裁决见 `docs/dev/p0-*.md`，验收见 `docs/acceptance/p0-acceptance.md`。
 - [ ] **P1 正经版**：PostgreSQL + Langfuse + PR-Agent + Streamlit 質問票台账
 - [ ] **P2 评审位异构化**：接入第二个模型 API，消化同源盲区债务
 - [ ] **P3 快车道 + 沉淀闸门全量落地**，验证八成维护长尾的消化能力
