@@ -779,6 +779,14 @@ class SqliteStore:
         return [_review_from_row(r) for r in rows]
 
 
+def _severity_of(raw: object) -> Severity:
+    """评审 severity 宽容解析：未知/缺失一律归 INFO（D4-3.4「宽容解析」，不因格式差异炸门禁）。"""
+    try:
+        return Severity(str(raw))
+    except ValueError:
+        return Severity.INFO
+
+
 def _review_from_row(row: sqlite3.Row) -> ReviewReport:
     """把 reviews 行还原成 `ReviewReport`（findings 走 JSON，severity 还原成枚举）。"""
     try:
@@ -787,7 +795,7 @@ def _review_from_row(row: sqlite3.Row) -> ReviewReport:
         raw = []
     findings = [
         ReviewFinding(
-            severity=Severity(item.get("severity", Severity.INFO.value)),
+            severity=_severity_of(item.get("severity", Severity.INFO.value)),
             location=str(item.get("location", "")),
             issue=str(item.get("issue", "")),
             suggestion=str(item.get("suggestion", "")),

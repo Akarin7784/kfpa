@@ -86,14 +86,23 @@ _EXECUTOR_INJECTIONS = ("apply_fail", "test_fail")
 
 
 def _exception_exit_code(exc: BaseException) -> int:
-    """异常 → D1-5 / D2 R-1 退出码：依赖与环境 4，I/O 与数据库 5。"""
+    """异常 → D1-5 / **R-31 rc 三分**：依赖或凭据缺失 4、I/O 与数据库 5。
+
+    - `ImportError`（可选包未装）→ 4；
+    - `RuntimeError`：`DependencyMissingError`（`PipelineError` 子类）、litellm「未安装」、
+      「模型调用失败（无 key / 模型名错）」等运行期**依赖与凭据**问题 → 4
+      （`MockScriptError` 同属配置/环境类，一并归 4）；
+    - `OSError` / `sqlite3.Error` → 5；
+    - 其余 → 5（基础层故障）。
+    """
     if isinstance(exc, ImportError):
-        return EXIT_DEP_MISSING
-    text = str(exc)
-    if "未安装" in text or "缺少 pyyaml" in text:
         return EXIT_DEP_MISSING
     if isinstance(exc, (OSError, sqlite3.Error)):
         return EXIT_IO
+    text = str(exc).lower()
+    dep_signals = ("未安装", "缺少", "未配置", "凭据", "凭证", "api key", "api_key", "apikey", "依赖")
+    if isinstance(exc, RuntimeError) or any(signal in text for signal in dep_signals):
+        return EXIT_DEP_MISSING
     return EXIT_IO
 
 
