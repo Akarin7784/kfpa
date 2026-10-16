@@ -1,0 +1,60 @@
+{
+  "corpus": "benchmarks/review/seed.jsonl (demo 合成样本，非真实度量)",
+  "generated_at": 1792150000.0,
+  "provider": "mock_hetero",
+  "baseline_provider": "mock",
+  "metrics": {
+    "corpus": "benchmarks/review/seed.jsonl (demo 合成样本，非真实度量)",
+    "total": 4,
+    "missed": 1,
+    "false_alarms": 1,
+    "agreement": 0.75,
+    "baseline_missed": 2,
+    "baseline_false_alarms": 1,
+    "baseline_agreement": 0.5
+  },
+  "samples": [
+    {
+      "id": "S001",
+      "feature": "order-atp",
+      "human_verdict": "fail",
+      "review_verdict": "pass",
+      "missed": true,
+      "false_alarm": false,
+      "findings": [
+        {"severity": "major", "location": "段4 接口契约", "issue": "缺错误码", "criterion": "AC2"}
+      ]
+    },
+    {
+      "id": "S002",
+      "feature": "stock-lock",
+      "human_verdict": "pass",
+      "review_verdict": "fail",
+      "missed": false,
+      "false_alarm": true,
+      "findings": [
+        {"severity": "major", "location": "段2 验收标准", "issue": "误判幂等键", "criterion": "AC5"}
+      ]
+    },
+    {
+      "id": "S003",
+      "feature": "picking",
+      "human_verdict": "fail",
+      "review_verdict": "fail",
+      "missed": false,
+      "false_alarm": false,
+      "findings": [
+        {"severity": "major", "location": "段4", "issue": "单位口径错", "criterion": "AC1"}
+      ]
+    },
+    {
+      "id": "S004",
+      "feature": "delivery",
+      "human_verdict": "pass",
+      "review_verdict": "pass",
+      "missed": false,
+      "false_alarm": false,
+      "findings": []
+    }
+  ]
+}
