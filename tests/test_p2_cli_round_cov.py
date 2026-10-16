@@ -152,23 +152,26 @@ def test_coverage_json_is_loaded_and_participates_in_g7(tmp_path, capsys):
     assert rc == cli.EXIT_PASS, f"rc={rc} stderr={err[-300:]}"
 
 
-def test_unusable_coverage_json_is_nonzero_and_documented_gap(tmp_path, capsys):
-    """256-261 的中文提示写的是「退出码 4」，但 `GatesError` 继承 `RuntimeError`，
-    `except (OSError, ValueError)` 抓不到 → 实际走 274-289 归 5。
+def test_unusable_coverage_json_returns_4_and_documents_dead_branch(tmp_path, capsys):
+    """256-261 是**死分支**：`GatesError` 继承 `RuntimeError`，`except (OSError, ValueError)` 抓不到，
+    所以那段「覆盖率报告不可用 → 退出码 4」的中文永远不会打印，异常落到 274-289。
 
-    我不把 5 固化（那是把 bug 写进期望）：这里只要求「非零且落在 4/5」，
-    并把这个不一致记在测试里，等 Chief/磐石裁完再收紧。
+    #48 之后 `RuntimeError` 一律归 4，于是**退出码正好与提示一致（4）**，只有那段中文没了。
+    这里钉住 4（与 R-31/#48 的语义一致，不依赖死分支是否被修）。
     """
     db = _init_db(tmp_path)
     rc, _out, err = _run(capsys, _round_argv(db, tmp_path / "w8",
                                              "--coverage-json", str(tmp_path / "nope.json")))
-    assert rc != cli.EXIT_PASS
-    assert rc in (cli.EXIT_DEP_MISSING, cli.EXIT_IO)
-    assert "覆盖率报告" in err
+    assert rc == cli.EXIT_DEP_MISSING
+    assert "轮次执行失败" in err          # 走的是通用异常路径，不是 256-261 的专用提示
 
 
-def test_round_exception_becomes_chinese_and_rc5(tmp_path, capsys, monkeypatch):
-    """274-289：任何异常都要变成中文 + 退出码，不许裸栈。"""
+def test_round_exception_runtime_error_maps_to_4(tmp_path, capsys, monkeypatch):
+    """274-289：任何异常都要变成中文 + 退出码，不许裸栈。
+
+    `RuntimeError` 按 R-31/#48 属依赖与环境类 → **4**。#48 之前是 5，我用旧的 5 断言过一版，
+    rebase 到含 #48 的 main 后立刻红——断言必须跟着 R-31 走，不能跟着当时的实现走。
+    """
     db = _init_db(tmp_path)
 
     def boom(*_a, **_kw):
@@ -176,7 +179,7 @@ def test_round_exception_becomes_chinese_and_rc5(tmp_path, capsys, monkeypatch):
 
     monkeypatch.setattr(pipeline_mod, "run_round", boom)
     rc, _out, err = _run(capsys, _round_argv(db, tmp_path / "w9"))
-    assert rc == cli.EXIT_IO
+    assert rc == cli.EXIT_DEP_MISSING
     assert "轮次执行失败" in err and "Traceback" not in err
 
 
