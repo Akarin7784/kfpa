@@ -626,6 +626,28 @@ P3 收口判据不变：A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆�
 
 ---
 
+## R-35 快车道「无 diff 来源」必须进 `escalations()`，且 `judged_fastlane()` 不得默认真
+
+长流在 #58 报到：A24 读契约的 `FastlaneRequest.escalations()`，但 `diff_files=[]` 时它返回 `[]`，
+而他模块里的 `fastlane.escalate_reasons()` 会指名 `no_diff_source` —— 两处口径不一致，台架读谁都不是。
+
+- **根因是我的契约漏项**：R-23 裁决 2 写得很清楚 —— `diff_files` 的三来源都拿不到时是
+  **`fast_lane=None` + `reason="no_diff_source"`，「不猜、不默认 True」**。我把三判据搬进契约时只搬了三条，
+  漏了这条「不可判」，于是空 `diff_files` 会掉进「三判据全真 ⇒ 快车道」的默认 True 里，正是 R-23 禁止的。
+- **裁决（契约 1.4 内的方法语义修正，字段与线格式不变，无需升版）**：
+  1. `FastlaneRequest.judged_fastlane()` **增加 `bool(self.diff_files)` 条件** —— 没有 diff 来源 = 不可判，
+     一律返回 `False`；
+  2. `FastlaneRequest.escalations()` 在 `diff_files` 为空时**第一条**给出 `"no_diff_source"`，
+     其后才是三条判据原因；
+  3. `plan()` 遇到 `no_diff_source` 与遇到判据不满足同样处理：**转 `ESCALATED`**（回完整设计回合），
+     不许登记成可承认的 `PENDING`；
+  4. `kfpa.fastlane.escalate_reasons()` 直接委托契约方法（单一事实来源），
+     禁止在模块里另写一份口径；台架 A24 只读 `escalations()`。
+- 归属：契约方法由 Chief 改（本次 PR）；长流的模块改为委托；镜鉴的 A24 按 `escalations()` 断言
+  （空 `diff_files` 必须出现 `no_diff_source`，且该请求不许进 `PENDING`）。
+
+---
+
 ## 变更记录
 
 | 版本 | 日期 | 裁决 | 作者 |
@@ -650,3 +672,4 @@ P3 收口判据不变：A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆�
 | 2.7 | 2026-10-17 | R-32 A20 白名单拆分：排除需外部服务的 `store/postgres.py`（覆盖交给 A12），纯逻辑门槛重算 75.0%，还需 +88 语句 | Chief |
 | 2.8 | 2026-10-17 | R-33 P3 开工三问：沉淀门槛维持 0.80（D5 §3.3 笔误已改）· A25 闸门入口冻结名（`admit`/`record_sample`）· A26 复用 A12 的 PG 夹具（`KFPA_PG_PORT` 默认 55440）· `verify_p3` 的红是派工单而 A0 必须始终绿 | Chief |
 | 2.9 | 2026-10-17 | R-34 快车道接口收口：`kfpa.fastlane` 为 `fastlane` 组唯一 owner（`check` 一并注册、`impact` 不再注册）· `acks.yaml` 文件 schema 冻结（`acks: [{request_id, note?}]`，缺键 rc=2） | Chief |
+| 3.0 | 2026-10-17 | R-35 快车道「无 diff 来源」：`judged_fastlane()` 不默认 True、`escalations()` 首条给 `no_diff_source`、`plan()` 转 `ESCALATED`；模块禁写第二份口径 | Chief |

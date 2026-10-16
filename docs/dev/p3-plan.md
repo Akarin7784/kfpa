@@ -107,6 +107,10 @@ knowledge_hits: list[str] = field(default_factory=list)   # 形如 "K1#reused=2"
 - **判据（design §5.6，纯函数，图只做编排）**：`judge(request) -> bool`
   —— 三项全真才算快车道：不新增/不修改接口契约 · 不改数据模型 · 波及面 ≤ 1 个模块。
   任一为假 → `ESCALATED`，并在 reasons 里指名是哪一条（不许只给个布尔）。
+  **外加 R-23 的第三来源（R-35）**：`diff_files` 为空 = 没有 diff 来源 → 波及面无从判断，
+  **按「不猜、不默认 True」判 `False`**，`escalations()` 首条给 `no_diff_source`，同样转 `ESCALATED`；
+  `kfpa.fastlane.escalate_reasons()` 必须直接委托契约方法，不许另写一份口径。
+  **统一判据**：`request.judged_fastlane()`（契约方法，单一事实来源）—— 台架 A24 只读它 + `escalations()`。
 - **命令**（长流实现 `register()`，磐石挂清单）：
   `kfpa fastlane plan --round N [--files a,b]` · `kfpa fastlane list [--status pending]` ·
   `kfpa fastlane ack <request_id> --by <name>` · `kfpa fastlane batch-ack --file acks.yaml --by <name>` ·
