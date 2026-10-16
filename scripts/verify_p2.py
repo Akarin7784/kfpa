@@ -110,6 +110,7 @@ class Ctx:
     root: Path
     python: str
     tmp: Path
+    coverage_out: str = ""
 
     def __post_init__(self) -> None:
         self.tmp.mkdir(parents=True, exist_ok=True)
@@ -517,11 +518,25 @@ def check_a20(ctx: Ctx, c: Check) -> None:
 
     # 关键路径 = A0（P0+P1 台架）全绿，合并进 coverage.json 交给 G7
     merged = ctx.tmp / "merged-coverage.json"
-    merged.write_text(json.dumps({
-        "totals": {"percent_covered": rate * 100.0},
+    merged_payload = {
+        "totals": {"percent_covered": rate * 100.0,
+                   "whitelist_percent_covered": rate * 100.0},
         "files": {p: {"summary": {"percent_covered": 100.0}} for p in picked},
         "critical_paths_ok": True,
-    }, ensure_ascii=False), encoding="utf-8")
+        "generated_by": "scripts/verify_p2.py A20",
+        "whitelist_files": picked,
+        "whitelist_statements": stmts,
+    }
+    merged.write_text(json.dumps(merged_payload, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+    c.add(ok=True, note=f"A20：合并覆盖率报告（临时）= {merged}")
+    if ctx.coverage_out:
+        target = Path(ctx.coverage_out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(merged_payload, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
+        c.add(ok=target.exists(),
+              note=f"A20：合并覆盖率报告已落盘 → {target}（供 G7 与报告链路复用）")
     db = ctx.fresh_db("a20")
     work = ctx.tmp / "a20-work"
     work.mkdir(parents=True, exist_ok=True)
@@ -897,6 +912,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=str(REPO_ROOT), help="仓库根")
     ap.add_argument("--only", default="", help="只跑指定断言，逗号分隔，支持前缀")
     ap.add_argument("--json", dest="json_path", default="", help="把完整证据写到 JSON")
+    ap.add_argument("--coverage-out", dest="coverage_out", default="",
+                    help="把 A20 的合并覆盖率报告落盘到该路径（供 G7 与报告链路复用）")
     ap.add_argument("--list", action="store_true", help="列出全部断言即退出")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印每条证据的输出")
     args = ap.parse_args(argv)
@@ -920,7 +937,7 @@ def main(argv: list[str] | None = None) -> int:
             if not selected or any(row[0] == s or row[0].startswith(s + ".") for s in selected)]
 
     tmpdir = Path(tempfile.mkdtemp(prefix="kfpa-verify-p2-"))
-    ctx = Ctx(root=root, python=sys.executable, tmp=tmpdir)
+    ctx = Ctx(root=root, python=sys.executable, tmp=tmpdir, coverage_out=args.coverage_out)
     print(f"KFPA P2 验收台架  仓库={root}")
     print(f"python={ctx.python}   （R-2 PYTHONPATH=src；R-19 stdio 兜底；R-25.3 剥 KFPA_DB_URL）")
     print(f"P2 契约文件缺失={[f for f in P2_FILES if not (root / f).exists()]}")
