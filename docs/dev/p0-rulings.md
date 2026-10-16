@@ -332,6 +332,28 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 **派工**：磐石补 CLI 接线（三个子命令 + `--coverage-json` + `--checkpoint-db`）与 compose 端口；
 长流落 checkpoint 默认盘并提供 `register()`；界面对齐 A17；镜鉴按 1–3 条调整台架后复跑。
 
+## R-23 快车道承认不进 P1；`diff_files` 的三来源优先级（补 D3 两处空白）
+
+- 界面问的两处 D3 空白：①快车道承认的落库接口；②`impact.analyze()` 的 `diff_files` 从哪来。
+- **裁决 1：快车道「承认」不落库，P1 不做。**
+  - 依据路线图：design.md §8 把「快车道 + 沉淀闸门**全量**落地」放在 **P3**；P1 只交付**判据计算**与
+    `kfpa fastlane check --round N`（A16 的全部内容）。
+  - 因此 P1 **不新增** `fastlane_requests` 表、不动 `schema_version`、不升契约。
+  - 界面的快车道页只能做**预览与提示**：结论、三判据、边界清单都可展示；
+    任何「承认/放行」按钮的文案必须写明 **「预览：P3 才接攒批承认入库」**，禁止做出已持久化的假象。
+  - 将来落库走 P3 契约（新增 `fastlane_requests` 表 + `schema_version` 递增，按 R-21 同批同步守卫）。
+- **裁决 2：`diff_files` 三来源优先级**（`impact.analyze(task_package, diff_files)`）：
+
+  | 优先级 | 来源 | 适用 |
+  |---|---|---|
+  | 1 | `ExecResult.files_changed`（本轮执行器真实产出） | `kfpa fastlane check --round N` 默认路径 |
+  | 2 | CLI 显式传参 `--files a.py,b.py`（逗号分隔） | 无执行结果时的预判 |
+  | 3 | 都拿不到 → **`fast_lane=None` + `reason="no_diff_source"`** | 不猜、不默认 True |
+
+  - 界面预览可用 `git diff --name-only HEAD` 作**展示层**来源，但 **CLI 判定不得依赖 git 状态**
+    （脏工作树会给出假判据）。
+  - 判据本身不变：不新增/改接口契约、不改数据模型、波及 ≤1 模块，三者全真才 `True`。
+
 ---
 
 ## 变更记录
@@ -348,3 +370,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.7 | 2026-10-16 | R-20 契约升版必须同批同步「升版守卫」（Chief 直改三处 + 镜鉴复验）| Chief |
 | 1.8 | 2026-10-16 | R-21 升级守卫同步义务归发起变更者 · `schema_version` 断言跟常量走 · `ALL_TABLE_NAMES` 语义 | Chief |
 | 1.9 | 2026-10-16 | R-22 P1 首轮验收六红定位：PG 端口默认 55440 · checkpoint 落盘口径 · G7 仅在提供报告时启用 · 覆盖率白名单 · A14 只验机制 · A17 以台架口径为准 | Chief |
+| 2.0 | 2026-10-16 | R-23 快车道承认不进 P1（P3 落库）；`diff_files` 三来源优先级（执行产物 → `--files` → `no_diff_source`） | Chief |
