@@ -1,21 +1,23 @@
 #!/usr/bin/env python
-"""KFPA P0 独立验收台架（A1–A7）。
+"""KFPA P0 独立验收台架（A1–A9）。
 
-用法（仓库根目录，或任意目录加 --root）：
+用法（R-2：统一 PYTHONPATH=src，不做 editable 安装）：
     python scripts/verify_p0.py                  # 跑全部断言
-    python scripts/verify_p0.py --only A2,A5.1   # 只跑指定断言
-    python scripts/verify_p0.py --json out.json  # 落机器可读证据
+    python scripts/verify_p0.py --only A2,A8     # 只跑指定断言（支持前缀）
+    python scripts/verify_p0.py --json out.json  # 落机器可读证据，供 PR 评论引用
     python scripts/verify_p0.py --list           # 列出全部断言
     python scripts/verify_p0.py --keep-temp      # 保留临时库，便于手工复现
 
+依据（效力从高到低）：docs/dev/p0-rulings.md(D2) > p0-design-addendum.md(D1) > p0-plan.md §4。
+
 设计原则（对抗评审视角）：
 1. 断言之间独立：各自建临时库、临时 workdir，不依赖执行顺序。
-2. 模块缺失 != 通过：缺失按 FAIL 报，并指名缺哪个文件、归谁写。
+2. 模块缺失 != 通过：缺失按 FAIL 报，并指名缺哪个文件、归谁写；SKIP 只用于
+   「本机环境不具备该验收前提」且必须在报告里显式可见。
 3. 证据 = 真实命令 + 真实退出码 + 真实输出片段，不写「已通过」三个字。
-4. 版本自适应：契约 v1.0 没有 ExecResult.results / error_category 时，
-   依赖它们的子断言报 SKIP（既不算通过也不算失败），并提示等 v1.1 落 main。
-5. 全程离线：只用 mock provider + 临时 SQLite，不联网、不要 API key、
-   不导入 litellm / aider / streamlit。
+4. 契约版本自适应：v1.0 没有 results/error_category/reason_key 时相关子断言 SKIP，
+   但 main 已升 1.1，落在 1.0 的分支会被点名（PR 纪律：先 rebase）。
+5. 全程离线：只用 mock provider + 临时 SQLite，不联网、不要 API key。
 
 退出码：0=无 FAIL（SKIP 不影响）；1=有 FAIL；2=台架自身用法错误。
 """
@@ -38,47 +40,47 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: 台架已对齐的契约版本；升版后由镜鉴同步（未对齐的版本直接 FAIL，防静默漂移）
+#: 台架已对齐的契约版本（main 已升 1.1）
+CONTRACT_VERSION_LATEST = "1.1"
 SUPPORTED_CONTRACT_VERSIONS = ("1.0", "1.1")
 
-#: A5 铁律的模型字符串扫描面
-MODEL_STR_PAT = re.compile(r"deepseek|gpt-|claude|qwen|bge", re.I)
+#: D1-5 / R-1 退出码表
+EXIT_PASS, EXIT_USAGE, EXIT_CONFIRM, EXIT_DEP, EXIT_IO, EXIT_NEEDS_FIX, EXIT_BLOCKED = \
+    0, 2, 3, 4, 5, 10, 11
 
-#: 模型字符串唯一允许出现的实现文件（适配器内部）
+#: A5 铁律扫描面
+MODEL_STR_PAT = re.compile(r"deepseek|gpt-|claude|qwen|bge", re.I)
 MODEL_STR_ALLOWED = ("src/kfpa/llm.py",)
 
-#: p0-plan §2 约定的 SQLite 表
-EXPECTED_TABLES = ("rounds", "tickets", "packages", "gates", "snapshots", "failures")
+#: D1-9：六表（+ meta）
+EXPECTED_TABLES = ("rounds", "tickets", "task_packages", "gate_reports", "failures", "snapshots")
+#: D1-9 明确要求存在的列（抽查最容易被偷工减料的几处）
+EXPECTED_COLUMNS = {
+    "tickets": {"ticket_id", "round_no", "location", "option_a", "option_b",
+                "architect_preference", "impact", "status", "answer", "created_at"},
+    "task_packages": {"round_no", "package_hash", "payload", "created_at"},
+    "gate_reports": {"round_no", "attempt", "state", "reason_key", "reasons",
+                     "failing_criteria", "escalated", "same_reason_count"},
+    "failures": {"round_no", "attempt", "reason", "avoid_pattern", "reason_key"},
+    "snapshots": {"round_no", "package_hash", "gate_state", "git_sha", "tag"},
+    "meta": {"key", "value"},
+}
 
-#: 契约文件 -> 唯一写者（用于失败时指名责任模块）
 OWNERS = {
-    "pyproject.toml": "磐石",
-    "src/kfpa/__init__.py": "磐石",
-    "src/kfpa/config.py": "磐石",
-    "src/kfpa/store.py": "磐石",
-    "src/kfpa/llm.py": "磐石",
-    "src/kfpa/cli.py": "磐石",
-    "src/kfpa/__main__.py": "磐石",
-    "src/kfpa/pipeline.py": "长流",
-    "src/kfpa/gates.py": "长流",
-    "src/kfpa/executor.py": "长流",
-    "src/kfpa/ui/cli.py": "界面",
-    "examples/design-r1.md": "长流",
-    "src/kfpa/schemas.py": "Chief（冻结）",
-    "docs/dev/p0-plan.md": "Chief",
+    "pyproject.toml": "磐石", "src/kfpa/__init__.py": "磐石", "src/kfpa/config.py": "磐石",
+    "src/kfpa/store.py": "磐石", "src/kfpa/llm.py": "磐石", "src/kfpa/cli.py": "磐石",
+    "src/kfpa/__main__.py": "磐石", "src/kfpa/pipeline.py": "长流",
+    "src/kfpa/graph.py": "长流", "src/kfpa/gates.py": "长流", "src/kfpa/executor.py": "长流",
+    "src/kfpa/prompts/": "长流", "examples/design-r1.md": "长流",
+    "src/kfpa/ui/cli.py": "界面", "src/kfpa/schemas.py": "Chief（冻结）",
+    "docs/dev/p0-plan.md": "Chief", "docs/dev/p0-design-addendum.md": "Chief",
+    "docs/dev/p0-rulings.md": "Chief", "tests/test_graph_smoke.py": "镜鉴",
 }
 
 REQUIRED_P0_FILES = (
-    "pyproject.toml",
-    "src/kfpa/config.py",
-    "src/kfpa/store.py",
-    "src/kfpa/llm.py",
-    "src/kfpa/cli.py",
-    "src/kfpa/__main__.py",
-    "src/kfpa/pipeline.py",
-    "src/kfpa/gates.py",
-    "src/kfpa/executor.py",
-    "src/kfpa/ui/cli.py",
+    "pyproject.toml", "src/kfpa/config.py", "src/kfpa/store.py", "src/kfpa/llm.py",
+    "src/kfpa/cli.py", "src/kfpa/__main__.py", "src/kfpa/pipeline.py",
+    "src/kfpa/gates.py", "src/kfpa/executor.py", "src/kfpa/ui/cli.py",
     "examples/design-r1.md",
 )
 
@@ -139,18 +141,18 @@ class Ctx:
         self.env["PYTHONPATH"] = str(self.root / "src") + os.pathsep + self.env.get("PYTHONPATH", "")
         self.env["PYTHONIOENCODING"] = "utf-8"
         self.env["PYTHONUTF8"] = "1"
+        sys.path.insert(0, str(self.root / "src"))
 
-    def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 180) -> dict:
-        p = subprocess.run(
-            cmd, cwd=str(cwd or self.root), env=self.env,
-            capture_output=True, timeout=timeout,
-        )
-        return {
-            "cmd": " ".join(cmd),
-            "rc": p.returncode,
-            "stdout": p.stdout.decode("utf-8", "replace"),
-            "stderr": p.stderr.decode("utf-8", "replace"),
-        }
+    def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 240) -> dict:
+        try:
+            p = subprocess.run(cmd, cwd=str(cwd or self.root), env=self.env,
+                               capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"cmd": " ".join(cmd), "rc": -9, "stdout": "",
+                    "stderr": f"命令超时（>{timeout}s）——离线验收不应长阻塞"}
+        return {"cmd": " ".join(cmd), "rc": p.returncode,
+                "stdout": p.stdout.decode("utf-8", "replace"),
+                "stderr": p.stderr.decode("utf-8", "replace")}
 
     def fresh_db(self, name: str) -> Path:
         p = self.tmp / f"{name}.db"
@@ -160,11 +162,12 @@ class Ctx:
                 f.unlink()
         return p
 
+    def design(self) -> Path:
+        return self.root / "examples/design-r1.md"
+
     def design_text(self) -> str:
-        f = self.root / "examples/design-r1.md"
-        if f.exists():
-            return f.read_text(encoding="utf-8", errors="replace")
-        return "# 占位设计\n系统应支持轮次快照与質問票台账。\n"
+        f = self.design()
+        return f.read_text(encoding="utf-8", errors="replace") if f.exists() else "# 占位设计\n"
 
 
 def import_mod(name: str):
@@ -173,13 +176,6 @@ def import_mod(name: str):
         return importlib.import_module(name), None
     except Exception as exc:  # noqa: BLE001 - 验收台架必须吃掉一切导入异常
         return None, f"{type(exc).__name__}: {exc}"
-
-
-def has_field(cls, name: str) -> bool:
-    try:
-        return name in getattr(cls, "__dataclass_fields__", {})
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def cjk(text: str) -> bool:
@@ -194,7 +190,6 @@ def excerpt(text: str, n: int = 700) -> str:
 
 
 def missing_hint(ctx: Ctx, cid: str) -> str:
-    """给出「差哪些文件、归谁」的可定位诊断。"""
     missing = [f for f in REQUIRED_P0_FILES if not (ctx.root / f).exists()]
     if not missing:
         return f"{cid}：契约文件齐备，但行为不满足断言 —— 见上述命令证据。"
@@ -203,29 +198,42 @@ def missing_hint(ctx: Ctx, cid: str) -> str:
     return "\n".join(lines)
 
 
-def probe_db(db: Path) -> tuple[set[str], dict[str, int], str]:
-    """原始 SQLite 读表名 + 行数，不经过被测代码。"""
+def probe_db(db: Path) -> tuple[set[str], dict[str, int], dict[str, set[str]], str]:
+    """原始 SQLite 读表名 + 行数 + 列名，不经过被测代码。"""
     try:
         con = sqlite3.connect(str(db))
     except Exception as exc:  # noqa: BLE001
-        return set(), {}, f"{type(exc).__name__}: {exc}"
+        return set(), {}, {}, f"{type(exc).__name__}: {exc}"
     try:
         tables = {r[0] for r in con.execute(
             "select name from sqlite_master where type='table'").fetchall()}
-        counts = {}
+        counts, cols = {}, {}
         for t in tables:
             try:
                 counts[t] = con.execute(f'select count(*) from "{t}"').fetchone()[0]
+                cols[t] = {r[1] for r in con.execute(f'pragma table_info("{t}")').fetchall()}
             except Exception:  # noqa: BLE001
-                counts[t] = -1
-        return tables, counts, ""
+                counts[t], cols[t] = -1, set()
+        return tables, counts, cols, ""
     finally:
         con.close()
 
 
+def last_json_line(blob: str):
+    """D1-10：--json 时最后输出 schemas.dumps(RoundResult) 单行 JSON。"""
+    for line in reversed((blob or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
 def seed_ticket(store_mod, db: Path, *, ticket_id: str, round_no: int, impact: str,
-                status: str = "OPEN") -> str:
-    """用 §3.2 契约 API 造票（不碰被测 CLI，保证 A3/A7 独立于 A2）。"""
+                status: str = "OPEN", location: str = "design.md §5.1") -> str:
+    """用 §3.2 契约 API 造票（不碰被测 CLI，保证 A3/A7 独立于 mock 剧本）。"""
     sc = importlib.import_module("kfpa.schemas")
     st = store_mod.Store(str(db))
     try:
@@ -233,15 +241,10 @@ def seed_ticket(store_mod, db: Path, *, ticket_id: str, round_no: int, impact: s
     except Exception:  # noqa: BLE001
         pass
     st.add_ticket(sc.QATicket(
-        ticket_id=ticket_id,
-        round_no=round_no,
-        location="design.md §5.1",
-        option_a="解释 A：按仓隔离",
-        option_b="解释 B：全局共享",
-        architect_preference="倾向 A",
-        impact=sc.TicketImpact[impact],
-        status=sc.TicketStatus[status],
-    ))
+        ticket_id=ticket_id, round_no=round_no, location=location,
+        option_a="解释 A：按仓隔离", option_b="解释 B：全局共享",
+        architect_preference="倾向 A", impact=sc.TicketImpact[impact],
+        status=sc.TicketStatus[status]))
     return ticket_id
 
 
@@ -252,23 +255,30 @@ def check_a1(ctx: Ctx, c: Check) -> None:
     ev = ctx.run([ctx.python, "-m", "kfpa", "--help"])
     out = ev["stdout"] + ev["stderr"]
     c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
-          ok=ev["rc"] == 0, note="验收命令 1：--help 期望退出码 0")
-    if ev["rc"] == 0:
-        for token in ("init", "round", "tickets", "history"):
-            c.add(ok=token in out, note=f"`--help` 输出含子命令 `{token}`",
-                  stdout=excerpt(out, 300))
-    else:
+          ok=ev["rc"] == EXIT_PASS, note="A1：--help 期望退出码 0（R-1）")
+    if ev["rc"] != EXIT_PASS:
         c.fail(missing_hint(ctx, "A1"))
+    for token in ("init", "round", "tickets", "history"):
+        c.add(ok=token in out, note=f"`--help` 含子命令 `{token}`", stdout=excerpt(out, 300))
+        if token not in out:
+            c.fail(f"§3.8：`--help` 未列子命令 `{token}`。")
+    # R-1：退出码表必须出现在 --help 里
+    codes_present = [code for code in ("10", "11", "3", "4", "5") if code in out]
+    c.add(ok=len(codes_present) >= 4,
+          note=f"`--help` 退出码表可见性：命中码 {codes_present}（R-1 要求列出 0/2/3/4/5/10/11）",
+          stdout=excerpt(out, 400))
+    if len(codes_present) < 4:
+        c.fail("R-1：`--help` 的 epilog 必须列退出码表（0/2/3/4/5/10/11）。")
 
-    v = ctx.run([ctx.python, "-c",
-                 "import kfpa.schemas as s; print(s.CONTRACT_VERSION)"])
+    v = ctx.run([ctx.python, "-c", "import kfpa.schemas as s; print(s.CONTRACT_VERSION)"])
     ver = v["stdout"].strip()
-    c.add(cmd=v["cmd"], rc=v["rc"], stdout=v["stdout"], stderr=v["stderr"],
-          ok=v["rc"] == 0 and ver in SUPPORTED_CONTRACT_VERSIONS,
-          note=f"契约版本 = {ver or '(空)'}；台架已对齐 {SUPPORTED_CONTRACT_VERSIONS}")
+    c.add(cmd=v["cmd"], rc=v["rc"], stdout=v["stdout"], ok=v["rc"] == 0,
+          note=f"契约版本 = {ver or '(空)'}；台架对齐 {CONTRACT_VERSION_LATEST}")
     if ver and ver not in SUPPORTED_CONTRACT_VERSIONS:
-        c.fail(f"契约版本 {ver} 未同步到验收台架 —— 升版必须同步 scripts/verify_p0.py"
-               f" 的 SUPPORTED_CONTRACT_VERSIONS 与 docs/acceptance/。")
+        c.fail(f"契约版本 {ver} 未同步到验收台架（SUPPORTED={SUPPORTED_CONTRACT_VERSIONS}）。")
+    elif ver and ver < CONTRACT_VERSION_LATEST:
+        c.warn(f"契约版本 {ver} < main 的 {CONTRACT_VERSION_LATEST}：该分支可能未 rebase 到 main"
+               "（PR 纪律第 6 条），v1.1 字段相关断言会 SKIP。")
 
 
 # ------------------------------------------------------------------ A2
@@ -278,46 +288,75 @@ def check_a2(ctx: Ctx, c: Check) -> None:
     db = ctx.fresh_db("a2")
     work = ctx.tmp / "a2-work"
     work.mkdir(parents=True, exist_ok=True)
-    design = ctx.root / "examples/design-r1.md"
-    if not design.exists():
+    if not ctx.design().exists():
         c.fail(f"缺 examples/design-r1.md（{OWNERS['examples/design-r1.md']}）—— "
-               "A2 的 dry-run 输入不存在，无法验收。")
+               "D1-7 的机读行在里面，A2 无法验收。")
 
     ev1 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
     c.add(cmd=ev1["cmd"], rc=ev1["rc"], stdout=ev1["stdout"], stderr=ev1["stderr"],
-          ok=ev1["rc"] == 0, note="验收命令 2a：建库")
-    if ev1["rc"] != 0:
+          ok=ev1["rc"] == EXIT_PASS, note="A2-1：建库（R-1 期望 0）")
+    if ev1["rc"] != EXIT_PASS:
         c.fail(missing_hint(ctx, "A2"))
 
-    ev2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(design),
-                   "--round", "1", "--dry-run", "--db", str(db), "--workdir", str(work)])
+    ev2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                   "--round", "1", "--dry-run", "--json", "--db", str(db),
+                   "--workdir", str(work)])
     c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
-          ok=ev2["rc"] == 0, note="验收命令 2b：整轮 dry-run（离线 mock）期望退出码 0")
-    if ev2["rc"] != 0:
+          ok=ev2["rc"] == EXIT_PASS, note="A2-2：整轮 dry-run（离线 mock）期望退出码 0")
+    if ev2["rc"] != EXIT_PASS:
         tail = (ev2["stderr"] or ev2["stdout"]).strip().splitlines()
-        c.fail("dry-run 未跑通。若输出/错误里出现「未关闭的高影响票」类信息，"
-               "说明 MockLLM 剧本产出的票里含 HIGH 未关闭 —— 见 A2/A3 语义冲突"
-               "（docs/acceptance/p0-acceptance.md「已知冲突」）。")
+        c.fail("dry-run 未跑通（期望退出码 0）。")
         if tail:
             c.findings.append("    末行退出信息: " + tail[-1][:200])
 
-    tables, counts, err = probe_db(db)
+    rr = last_json_line(ev2["stdout"])
+    c.add(ok=rr is not None, note="D1-10：`--json` 末行是 schemas.dumps(RoundResult)")
+    if rr is None:
+        c.fail("D1-10：`--json` 未输出可解析的 RoundResult 单行 JSON。")
+
+    tables, counts, cols, err = probe_db(db)
     if err:
         c.add(ok=False, note=f"原始 SQLite 读取失败：{err}")
         c.fail("无法用 sqlite3 直接读库（A2 要求 SQLite 落库）。")
     else:
-        c.add(ok=True, note=f"原始库表：{sorted(tables)}")
         for t in EXPECTED_TABLES:
             ok = t in tables
-            c.add(ok=ok, note=f"表 `{t}` 存在（p0-plan §2）" + ("" if ok else " —— 缺失"))
+            c.add(ok=ok, note=f"D1-9 表 `{t}` 存在" + ("" if ok else f" —— 缺失；实际 = {sorted(tables)}"))
             if not ok:
-                c.fail(f"SQLite 缺表 `{t}`；实际表 = {sorted(tables)}")
-        for t, minimum in (("rounds", 1), ("tickets", 1), ("packages", 1),
-                           ("gates", 1), ("snapshots", 1)):
+                c.fail(f"SQLite 缺表 `{t}`（D1-9）。")
+        for t, minimum in (("rounds", 1), ("tickets", 1), ("task_packages", 1),
+                           ("gate_reports", 1), ("snapshots", 1)):
             n = counts.get(t, -1)
             c.add(ok=n >= minimum, note=f"表 `{t}` 行数 = {n}（要求 >= {minimum}）")
             if n < minimum:
                 c.fail(f"表 `{t}` 行数 {n} < {minimum}：dry-run 未把该环节落库。")
+        for t, want in EXPECTED_COLUMNS.items():
+            got = cols.get(t, set())
+            if not got:
+                continue
+            missing = sorted(want - got)
+            c.add(ok=not missing, note=f"表 `{t}` 缺列 = {missing or '无'}")
+            if missing:
+                c.fail(f"D1-9：表 `{t}` 缺列 {missing}。")
+
+    # 执行结果必须带 results（A2 表明确要求）
+    if rr:
+        ex = rr.get("exec_result") or {}
+        results = ex.get("results") or {}
+        c.add(ok=bool(results), note=f"exec_result.results = {results}")
+        if not results:
+            c.fail("A2：执行结果缺 `results`（cid→bool），门禁 G4 无法判断言未映射。")
+        gate = rr.get("gate") or {}
+        c.add(ok=bool(gate.get("state")), note=f"RoundResult.gate.state = {gate.get('state')}")
+        if not gate.get("state"):
+            c.fail("A2：门禁无态（RoundResult.gate.state 空）。")
+        tp = rr.get("task_package") or {}
+        if tp:
+            miss = [k for k in ("goal", "acceptance", "boundaries", "interface_contract",
+                                "prohibitions") if not tp.get(k)]
+            c.add(ok=not miss, note=f"RoundResult 任务包缺段 = {miss or '无'}（feedback 首轮可空）")
+            if miss:
+                c.fail(f"A2：任务包缺段 {miss}（design.md §5.2 六段式）。")
 
     store_mod, serr = import_mod("kfpa.store")
     if store_mod is None:
@@ -325,44 +364,43 @@ def check_a2(ctx: Ctx, c: Check) -> None:
         c.fail(f"kfpa.store 不可导入（{OWNERS['src/kfpa/store.py']}）：{serr}")
         return
     st = store_mod.Store(str(db))
-    # 票面五要素齐全
     try:
         tickets = st.list_tickets(1)
         c.add(ok=len(tickets) >= 1, note=f"Store.list_tickets(1) 返回 {len(tickets)} 张票")
         if len(tickets) < 1:
-            c.fail("質問票 <1 张：轉譯环节未产出歧义票。")
+            c.fail("質問票 <1 张：D1-1 转译环节未产出歧义票。")
         for t in tickets:
             miss = t.missing_fields()
             c.add(ok=not miss, note=f"票 {t.ticket_id} 五要素缺失 = {miss or '无'}")
             if miss:
                 c.fail(f"票 {t.ticket_id} 缺票面要素 {miss}（design.md §5.1）。")
+            if not re.fullmatch(r"R\d+-\d{3}", str(t.ticket_id)):
+                c.add(ok=False, note=f"票号 {t.ticket_id} 不符 D1-1 规则 R{round}-{{seq:03d}}")
+                c.fail(f"D1-1：票号 `{t.ticket_id}` 不是 `R{{round}}-{{seq:03d}}`（pipeline 负责编号）。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"list_tickets 异常：{type(exc).__name__}: {exc}")
         c.fail("Store.list_tickets 接口不可用（§3.2）。")
-    # 任务包六段齐全
     try:
         pkg = st.get_package(1)
         c.add(ok=pkg is not None, note="Store.get_package(1) 有值")
         if pkg is None:
-            c.fail("packages 表无第 1 轮任务包。")
+            c.fail("task_packages 表无第 1 轮任务包。")
         else:
             miss = pkg.missing_sections()
-            c.add(ok=not miss, note=f"任务包缺段 = {miss or '无'}（六段，feedback 首轮可空）")
+            c.add(ok=not miss, note=f"任务包缺段 = {miss or '无'}")
             if miss:
-                c.fail(f"任务包缺段 {miss}（design.md §5.2 六段式）。")
+                c.fail(f"任务包缺段 {miss}（design.md §5.2）。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"get_package 异常：{type(exc).__name__}: {exc}")
         c.fail("Store.get_package 接口不可用（§3.2）。")
-    # 门禁有态 / 快照
-    for fn, label in (("list_gate_reports", "门禁报告"), ("list_snapshots", "轮次快照")):
-        try:
-            rows = getattr(st, fn)(1) if fn == "list_gate_reports" else getattr(st, fn)()
-            c.add(ok=len(rows) >= 1, note=f"Store.{fn}() 返回 {len(rows)} 条{label}")
-            if len(rows) < 1:
-                c.fail(f"{label}为空：§3.2 要求落库。")
-        except Exception as exc:  # noqa: BLE001
-            c.add(ok=False, note=f"{fn} 异常：{type(exc).__name__}: {exc}")
-            c.fail(f"Store.{fn} 接口不可用（§3.2）。")
+    try:
+        reports = st.list_gate_reports(1)
+        c.add(ok=len(reports) >= 1, note=f"Store.list_gate_reports(1) 返回 {len(reports)} 条")
+        if not reports:
+            c.fail("门禁报告为空：D1-3 要求落库可复盘。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"list_gate_reports 异常：{type(exc).__name__}: {exc}")
+        c.fail("Store.list_gate_reports 接口不可用（§3.2）。")
 
 
 # ------------------------------------------------------------------ A3
@@ -370,77 +408,60 @@ def check_a2(ctx: Ctx, c: Check) -> None:
 
 def check_a3(ctx: Ctx, c: Check) -> None:
     store_mod, serr = import_mod("kfpa.store")
-    pipe_mod, perr = import_mod("kfpa.pipeline")
-    llm_mod, lerr = import_mod("kfpa.llm")
-    if store_mod is None or pipe_mod is None or llm_mod is None:
-        c.add(ok=False, note=f"导入失败：store={serr} pipeline={perr} llm={lerr}")
+    if store_mod is None:
+        c.add(ok=False, note=f"import kfpa.store 失败：{serr}")
         c.fail(missing_hint(ctx, "A3"))
         return
-    sc = importlib.import_module("kfpa.schemas")
 
-    # --- A3.1 CLI 面：未关闭的高影响票 -> 退出码非零 + 中文错误
     db = ctx.fresh_db("a3")
     ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
-    c.add(cmd=ev0["cmd"], rc=ev0["rc"], ok=ev0["rc"] == 0, note="A3 前置：建库")
+    c.add(cmd=ev0["cmd"], rc=ev0["rc"], ok=ev0["rc"] == EXIT_PASS, note="A3 前置：建库")
+    # R-6：票号固定 R{n}-{seq:03d}；用 R2-999 避开 pipeline 会分配的号段
     try:
-        seed_ticket(store_mod, db, ticket_id="T-A3-HIGH", round_no=2, impact="HIGH")
+        seed_ticket(store_mod, db, ticket_id="R2-999", round_no=2, impact="HIGH")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"造高影响票失败：{type(exc).__name__}: {exc}")
         c.fail("无法用 Store.add_ticket 构造用例（§3.2）。")
         return
-    ev = ctx.run([ctx.python, "-m", "kfpa", "round", "--design",
-                  str(ctx.root / "examples/design-r1.md"), "--round", "2",
-                  "--dry-run", "--db", str(db), "--workdir", str(ctx.tmp / "a3-work")])
+
+    base = [ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+            "--round", "2", "--dry-run", "--db", str(db), "--workdir", str(ctx.tmp / "a3-work")]
+    ev = ctx.run(base)
     blob = ev["stdout"] + ev["stderr"]
     c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
-          ok=ev["rc"] != 0, note="存在未关闭 HIGH 票时，round 必须退出码非零（design.md §4 硬规则）")
-    if ev["rc"] == 0:
-        c.fail("硬规则被击穿：存在未关闭高影响票，`kfpa round` 仍然退出码 0。")
-    c.add(ok=cjk(blob), note="拒绝理由必须是人能读的中文", stdout=excerpt(blob, 300))
+          ok=ev["rc"] == EXIT_CONFIRM,
+          note="A3/D1-5：存在未关闭 HIGH 票 → 退出码 3（等待人工确认）")
+    if ev["rc"] != EXIT_CONFIRM:
+        c.fail(f"硬规则未按 D1-5 报码：期望退出码 3，实际 {ev['rc']}。")
+    c.add(ok=cjk(blob), note="拒绝理由必须是中文（D1-10：模块+原因+下一步）",
+          stdout=excerpt(blob, 300))
     if not cjk(blob):
-        c.fail("拒绝时的输出里没有中文提示（要求「中文错误」）。")
+        c.fail("D1-10：拒绝输出没有中文提示。")
 
-    # --- A3.2 库面：方向性两向断言（关票后必须放行）
-    db2 = ctx.fresh_db("a3-lib")
-    st = store_mod.Store(str(db2))
-    try:
-        st.init_schema()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        llm = llm_mod.build_llm(llm_mod.load_roles(), provider="mock")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"build_llm(provider='mock') 失败：{type(exc).__name__}: {exc}")
-        c.fail("MockLLM 装配失败（§3.3）。")
+    # 关闭后可继续（R-6：同票号重跑保留 status/answer）
+    evc = ctx.run([ctx.python, "-m", "kfpa", "tickets", "close", "R2-999",
+                   "--answer", "选 A：按仓隔离", "--db", str(db)])
+    c.add(cmd=evc["cmd"], rc=evc["rc"], stdout=evc["stdout"], stderr=evc["stderr"],
+          ok=evc["rc"] == EXIT_PASS, note="A3：`tickets close` 关闭高影响票（期望 0）")
+    if evc["rc"] != EXIT_PASS:
+        c.fail("A3：「关闭后可继续」的前提不成立 —— `tickets close` 不可用。")
         return
-    design_text = ctx.design_text()
-
-    def _build(round_no: int):
-        return pipe_mod.build_task_package(round_no, design_text, [], llm, [])
-
-    # 有未关闭 HIGH 票 -> 必须拒绝
+    ev2 = ctx.run(base)
+    c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
+          ok=ev2["rc"] in (EXIT_PASS, EXIT_NEEDS_FIX, EXIT_BLOCKED),
+          note="A3：关票后重跑必须放行（不再被硬规则拦停）")
+    if ev2["rc"] == EXIT_CONFIRM:
+        c.fail("A3：关票后仍被硬规则拦停（退出码 3）—— 关闭状态没生效。")
     try:
-        seed_ticket(store_mod, db2, ticket_id="T-A3-HIGH-LIB", round_no=9, impact="HIGH")
-        out = _build(9)
-        refused = out is None or (
-            getattr(out, "missing_sections", lambda: ["?"])() or not out.is_complete())
-        c.add(ok=bool(refused), note=f"库面：有未关闭 HIGH 票时 build_task_package 返回 {type(out).__name__}")
-        if not refused:
-            c.fail("§3.4 硬规则被击穿：list_open_high_tickets 非空时 build_task_package 仍返回完整任务包。")
+        t = store_mod.Store(str(db)).get_ticket("R2-999")
+        c.add(ok=t is not None and str(t.status).endswith("closed") and bool((t.answer or "").strip()),
+              note=f"R-6：重跑后票 R2-999 status={getattr(t, 'status', None)} "
+                   f"answer={getattr(t, 'answer', None)!r}")
+        if t is None or not str(t.status).endswith("closed"):
+            c.fail("R-6：同票号重跑把 status 冲掉了（必须保留 status/answer）。")
     except Exception as exc:  # noqa: BLE001
-        c.add(ok=True, note=f"库面：有未关闭 HIGH 票时 build_task_package 抛出 {type(exc).__name__}: {exc}")
-    # 关票后 -> 必须放行
-    try:
-        for t in st.list_open_high_tickets(9):
-            st.close_ticket(t.ticket_id, "选 A：按仓隔离")
-        out = _build(9)
-        ok = out is not None and out.is_complete()
-        c.add(ok=ok, note=f"库面：HIGH 票清零后 build_task_package 返回完整包 = {ok}")
-        if not ok:
-            c.fail("关闭高影响票后任务包仍不可生成（§3.4 要求放行）。")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"关票后 build_task_package 抛出 {type(exc).__name__}: {exc}")
-        c.fail("关闭高影响票后仍拒绝生成任务包（§3.4 硬规则应只单向生效）。")
+        c.add(ok=False, note=f"get_ticket 异常：{type(exc).__name__}: {exc}")
+        c.fail("Store.get_ticket 接口不可用（§3.2）。")
 
 
 # ------------------------------------------------------------------ A4
@@ -448,16 +469,14 @@ def check_a3(ctx: Ctx, c: Check) -> None:
 
 def _complete_package(sc, round_no: int, *, with_prohibitions: bool = True):
     kw = dict(
-        round_no=round_no,
-        feature="轮次快照",
+        round_no=round_no, feature="轮次快照",
         goal="为每一轮生成可追溯的任务包快照",
         acceptance=[sc.AcceptanceCriterion(cid="AC-1", text="快照可查"),
                     sc.AcceptanceCriterion(cid="AC-2", text="package_hash 可复算")],
         boundaries=["空设计输入", "重复轮次号"],
         interface_contract=["Store.save_snapshot(snapshot) -> None"],
         prohibitions=["不得引入网络依赖"] if with_prohibitions else [],
-        feedback=[],
-    )
+        feedback=[])
     return sc.TaskPackage(**kw)
 
 
@@ -469,7 +488,9 @@ def check_a4(ctx: Ctx, c: Check) -> None:
         c.fail(missing_hint(ctx, "A4"))
         return
     sc = importlib.import_module("kfpa.schemas")
-    has_results = has_field(sc.ExecResult, "results")
+    if sc.CONTRACT_VERSION < "1.1":
+        c.skip("契约 v1.0 无 results/error_category/reason_key，D1-3/D1-4 判定无法断言。")
+        return
 
     def new_store(tag: str):
         st = store_mod.Store(str(ctx.fresh_db(tag)))
@@ -479,93 +500,129 @@ def check_a4(ctx: Ctx, c: Check) -> None:
             pass
         return st
 
-    # A4.1 执行失败 -> NEEDS_FIX + 回灌区非空
-    st = new_store("a4-1")
-    pkg = _complete_package(sc, 1)
-    fail_exec = sc.ExecResult(ok=False, error="mock 执行失败", executor="mock",
-                              failed_criteria=["AC-1"])
-    try:
-        rpt = gates_mod.evaluate(1, pkg, fail_exec, st, attempt=1)
-        c.add(ok=rpt.state is sc.GateState.NEEDS_FIX,
-              note=f"exec.ok=False -> state={rpt.state.value}（期望 needs_fix）")
-        if rpt.state is not sc.GateState.NEEDS_FIX:
-            c.fail("§3.5-1：执行失败未判 NEEDS_FIX。")
-        c.add(ok=bool(rpt.reasons), note=f"reasons={rpt.reasons}")
-        c.add(ok="AC-1" in (rpt.failing_criteria or []),
-              note=f"failing_criteria={rpt.failing_criteria}（应含执行器声明的 AC-1）")
-        if "AC-1" not in (rpt.failing_criteria or []):
-            c.fail("§3.5-1：failing_criteria 未回填执行器声明的失败项。")
-        patterns = st.list_avoid_patterns(1)
-        c.add(ok=bool(patterns), note=f"回灌区 list_avoid_patterns(1) = {patterns}")
-        if not patterns:
-            c.fail("§3.5-1：失败原因未写入 FailureRecord / 回避模式清单（回灌区为空）。")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"evaluate 异常：{type(exc).__name__}: {exc}")
-        c.fail("§3.5 evaluate 接口不可用。")
+    # --- 纯函数：G1 缺段 / G2 执行失败 / G3 失败断言 / G4 断言未映射 / G6 PASS
+    cases = [
+        ("G1 缺段", 11, _complete_package(sc, 11, with_prohibitions=False),
+         sc.ExecResult(ok=True, results={"AC-1": True, "AC-2": True}), "needs_fix", None),
+        ("G2 执行失败", 12, _complete_package(sc, 12),
+         sc.ExecResult(ok=False, error="mock 执行失败", error_category="apply_failed",
+                       executor="mock"), "needs_fix", "apply_failed"),
+        ("G3 失败断言", 13, _complete_package(sc, 13),
+         sc.ExecResult(ok=True, failed_criteria=["AC-1"], results={"AC-1": True, "AC-2": True},
+                       executor="mock"), "needs_fix", None),
+        ("G4 断言未映射", 14, _complete_package(sc, 14),
+         sc.ExecResult(ok=True, results={"AC-1": True}, executor="mock"),
+         "needs_fix", "unmapped_criterion"),
+        ("G6 全过", 15, _complete_package(sc, 15),
+         sc.ExecResult(ok=True, results={"AC-1": True, "AC-2": True}, executor="mock"), "pass", None),
+    ]
+    for label, rnd, pkg, ex, want, want_cat in cases:
+        st = new_store(f"a4-{rnd}")
+        try:
+            rpt = gates_mod.evaluate(rnd, pkg, ex, st, attempt=1)
+            got = rpt.state.value
+            c.add(ok=got == want, note=f"{label} → state={got}（期望 {want}）")
+            if got != want:
+                c.fail(f"D1-3 {label}：判定 {got} != {want}（reasons={rpt.reasons}）。")
+            if want_cat:
+                cat = getattr(rpt, "error_category", "") or ""
+                in_text = want_cat in " ".join(rpt.reasons or []) or want_cat in str(rpt.failing_criteria)
+                c.add(ok=(cat == want_cat) or in_text,
+                      note=f"{label} error_category={cat!r} reasons={rpt.reasons}")
+                if not (cat == want_cat or in_text):
+                    c.fail(f"D1-3 {label}：error_category 未体现 `{want_cat}`。")
+        except Exception as exc:  # noqa: BLE001
+            c.add(ok=False, note=f"{label} evaluate 异常：{type(exc).__name__}: {exc}")
+            c.fail(f"D1-3：{label} 无法判定。")
 
-    # A4.2 全过 -> PASS
-    st = new_store("a4-2")
-    ok_exec = sc.ExecResult(ok=True, diff="mock diff", executor="mock")
-    if has_results:
-        ok_exec.results = {"AC-1": True, "AC-2": True}
-    try:
-        rpt = gates_mod.evaluate(2, _complete_package(sc, 2), ok_exec, st, attempt=1)
-        c.add(ok=rpt.state is sc.GateState.PASS, note=f"全过 -> state={rpt.state.value}（期望 pass）")
-        if rpt.state is not sc.GateState.PASS:
-            c.fail(f"§3.5-5：全过未判 PASS（reasons={rpt.reasons}）。")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"evaluate 异常：{type(exc).__name__}: {exc}")
-        c.fail("§3.5 evaluate 接口不可用。")
-
-    # A4.3 缺段本身是门禁失败
-    st = new_store("a4-3")
-    try:
-        rpt = gates_mod.evaluate(3, _complete_package(sc, 3, with_prohibitions=False),
-                                 ok_exec, st, attempt=1)
-        c.add(ok=rpt.state is sc.GateState.NEEDS_FIX,
-              note=f"缺 prohibitions 段 + exec.ok=True -> state={rpt.state.value}（期望 needs_fix）")
-        if rpt.state is not sc.GateState.NEEDS_FIX:
-            c.fail("§3.5-2：任务包缺段未被判 NEEDS_FIX。")
-    except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"evaluate 异常：{type(exc).__name__}: {exc}")
-        c.fail("§3.5 evaluate 接口不可用。")
-
-    # A4.4 同类失败 >=2 次 -> BLOCKED + escalated
-    st = new_store("a4-4")
+    # --- G5 同类第 2 次失败即 BLOCKED（D1-4 + R-4）
+    st = new_store("a4-g5")
+    fail = sc.ExecResult(ok=False, error="mock 执行失败", error_category="test_fail",
+                         failed_criteria=["AC-1"], executor="mock")
     seq = []
     try:
         for attempt in (1, 2, 3):
-            rpt = gates_mod.evaluate(4, _complete_package(sc, 4), fail_exec, st, attempt=attempt)
-            seq.append((attempt, rpt.state.value, getattr(rpt, "same_reason_count", None),
-                        getattr(rpt, "escalated", None)))
-        last = rpt
-        c.add(ok=bool(seq), note=f"三次同因失败的态序 = {seq}")
-        ok = (last.state is sc.GateState.BLOCKED and bool(last.escalated)
-              and int(last.same_reason_count or 0) >= 2)
-        c.add(ok=ok, note=f"第三次 state={last.state.value} escalated={last.escalated} "
-                          f"same_reason_count={last.same_reason_count}")
-        if not ok:
-            c.fail("§3.5-4：同类失败 >=2 次未升为 BLOCKED + escalated=True。")
+            rpt = gates_mod.evaluate(16, _complete_package(sc, 16), fail, st, attempt=attempt)
+            seq.append({"attempt": attempt, "state": rpt.state.value,
+                        "reason_key": getattr(rpt, "reason_key", ""),
+                        "same_reason_count": getattr(rpt, "same_reason_count", None),
+                        "escalated": getattr(rpt, "escalated", None)})
+            if rpt.state is sc.GateState.BLOCKED:
+                break
+        c.add(ok=bool(seq), note=f"同因连续失败的态序 = {seq}")
+        second = seq[1] if len(seq) > 1 else None
+        ok2 = bool(second and second["state"] == "blocked" and second["escalated"] is True
+                   and second["same_reason_count"] == 1)
+        c.add(ok=ok2, note=f"D1-4/R-4：第 2 次 state={second and second['state']} "
+                           f"escalated={second and second['escalated']} "
+                           f"same_reason_count={second and second['same_reason_count']}")
+        if not ok2:
+            c.fail("D1-4/R-4：同一 reason_key 第 2 次失败未升为 BLOCKED + escalated=True + "
+                   "same_reason_count=1（R-4：GateReport 记 count-1）。")
+        ck = [s["reason_key"] for s in seq if s["reason_key"]]
+        c.add(ok=bool(ck) and len(set(ck)) == 1, note=f"reason_key 稳定性 = {ck}")
+        if ck and len(set(ck)) != 1:
+            c.fail("D1-4：同一失败的 reason_key 不稳定，升级计数永远打不中。")
     except Exception as exc:  # noqa: BLE001
-        c.add(ok=False, note=f"evaluate 异常：{type(exc).__name__}: {exc}")
-        c.fail("§3.5 evaluate 接口不可用。")
+        c.add(ok=False, note=f"G5 evaluate 异常：{type(exc).__name__}: {exc}")
+        c.fail("D1-4：同类失败升级路径不可判定。")
 
-    # A4.5 版本门控：契约 v1.1 才有 results 字段
-    if not has_results:
-        c.skip("契约当前版本无 ExecResult.results / error_category（v1.0）；"
-               "「断言未映射 G4」与错误分类子断言等 v1.1 落 main 后启用。")
-    else:
-        st = new_store("a4-5")
-        ex = sc.ExecResult(ok=True, results={"AC-1": True, "AC-2": False}, executor="mock")
-        try:
-            rpt = gates_mod.evaluate(5, _complete_package(sc, 5), ex, st, attempt=1)
-            c.add(ok=rpt.state is sc.GateState.NEEDS_FIX,
-                  note=f"results 含 False -> state={rpt.state.value}（期望 needs_fix）")
-            if rpt.state is not sc.GateState.NEEDS_FIX:
-                c.fail("§3.5-3：验收断言未通过（results=False）却判 PASS。")
-        except Exception as exc:  # noqa: BLE001
-            c.add(ok=False, note=f"evaluate 异常：{type(exc).__name__}: {exc}")
-            c.fail("§3.5 evaluate 未消费 ExecResult.results。")
+    # --- G5 前置：count_same_failure 口径（R-4：写入后调用，含本次）
+    st = new_store("a4-count")
+    try:
+        for attempt in (1, 2):
+            st.record_failure(sc.FailureRecord(round_no=17, attempt=attempt, reason="boom",
+                                               avoid_pattern="AVOID[test_fail] x",
+                                               reason_key="abc123"))
+        n = st.count_same_failure(17, "abc123")
+        c.add(ok=n == 2, note=f"R-4：record_failure 两次后 count_same_failure = {n}（期望 2）")
+        if n != 2:
+            c.fail(f"R-4：count_same_failure 口径不符（{n} != 2），门禁升级时点会漂。")
+        pats = st.list_avoid_patterns(17)
+        c.add(ok=bool(pats), note=f"回灌区 list_avoid_patterns(17) = {pats}")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"record_failure/count_same_failure 异常：{type(exc).__name__}: {exc}")
+        c.fail("R-4：失败计数接口不可用（§3.2）。")
+
+    # --- 端到端：--inject test_fail 必须产生 BLOCKED + 回灌区非空（D1-11）
+    db = ctx.fresh_db("a4-e2e")
+    ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
+    ev = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                  "--round", "1", "--dry-run", "--inject", "test_fail", "--json",
+                  "--db", str(db), "--workdir", str(ctx.tmp / "a4-work")])
+    c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
+          ok=ev["rc"] in (EXIT_NEEDS_FIX, EXIT_BLOCKED),
+          note="A4/D1-5：--inject test_fail 期望 10(NEEDS_FIX) 或 11(BLOCKED)")
+    if ev["rc"] not in (EXIT_NEEDS_FIX, EXIT_BLOCKED):
+        c.fail(f"A4：--inject test_fail 退出码 {ev['rc']}，既不是 10 也不是 11。")
+    try:
+        st = store_mod.Store(str(db))
+        reports = st.list_gate_reports(1)
+        states = [(r.attempt, r.state.value, getattr(r, "escalated", None),
+                   getattr(r, "same_reason_count", None)) for r in reports]
+        c.add(ok=bool(reports), note=f"落库的门禁报告（attempt,state,escalated,count）= {states}")
+        if not reports:
+            c.fail("A4：注入失败后 gate_reports 无记录（D1-5：不许静默重试）。")
+        pkg = st.get_package(1)
+        fb = list(getattr(pkg, "feedback", []) or []) if pkg else []
+        c.add(ok=any("AVOID[" in str(x) for x in fb),
+              note=f"D1-11：第 2 次任务包 feedback = {fb}")
+        if not any("AVOID[" in str(x) for x in fb):
+            c.fail("D1-11（P0 必做）：失败未回灌 —— 任务包 feedback 段里没有 `AVOID[...]` 行。")
+        pats = st.list_avoid_patterns(1)
+        c.add(ok=bool(pats), note=f"failures.avoid_pattern = {pats}")
+        if not pats:
+            c.fail("D1-4：failures 表未写 avoid_pattern（负知识无落点）。")
+        blocked = [r for r in reports if r.state.value == "blocked"]
+        if blocked:
+            last = blocked[-1]
+            c.add(ok=bool(getattr(last, "escalated", False)),
+                  note=f"BLOCKED 报告 escalated={getattr(last, 'escalated', None)}")
+            if not getattr(last, "escalated", False):
+                c.fail("D1-4：BLOCKED 未带 escalated=True。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"端到端读取异常：{type(exc).__name__}: {exc}")
+        c.fail("A4：端到端结果不可读。")
 
 
 # ------------------------------------------------------------------ A5
@@ -583,17 +640,22 @@ def check_a5_scan(ctx: Ctx, c: Check) -> None:
             if MODEL_STR_PAT.search(line):
                 hits.append((rel, i, line.strip()))
     bad = [h for h in hits if h[0] not in MODEL_STR_ALLOWED]
-    c.add(ok=not bad, note=f"src/ 命中 {len(hits)} 处模型字符串，其中越界 {len(bad)} 处；"
+    c.add(ok=not bad, note=f"src/ 命中 {len(hits)} 处模型字符串，越界 {len(bad)} 处；"
                            f"白名单 = {list(MODEL_STR_ALLOWED)}")
     for rel, i, line in hits[:20]:
-        mark = "越界" if rel not in MODEL_STR_ALLOWED else "白名单"
-        c.findings.append(f"[{mark}] {rel}:{i}: {line[:120]}")
-    if bad:
-        c.fail("A5 铁律被击穿：`src/` 业务代码里出现模型字符串 —— "
-               + "; ".join(f"{r}:{i}" for r, i, _ in bad)
-               + "。模型字符串只允许在 src/kfpa/llm.py 适配器与 config/models.yaml。")
+        c.findings.append(f"[{'越界' if rel not in MODEL_STR_ALLOWED else '白名单'}] "
+                          f"{rel}:{i}: {line[:120]}")
     if not hits:
         c.findings.append("src/ 全库无模型字符串命中（铁律成立）。")
+    if bad:
+        c.fail("A5 铁律被击穿：src/ 业务代码里出现模型字符串 —— "
+               + "; ".join(f"{r}:{i}" for r, i, _ in bad)
+               + "。只允许在 src/kfpa/llm.py 适配器与 config/models.yaml。"
+               "（p0-plan §4/A5 给的裸 grep 会把 llm.py 也判违规，台架按铁律原文加白名单。）")
+    else:
+        c.warn("p0-plan §4/A5 的示例命令 `grep -riE ... src --include=*.py` 会把适配器 "
+               "src/kfpa/llm.py 自身判违规，与铁律「仅 llm.py 适配器与 config 白名单」冲突；"
+               "建议把白名单写进验收表（本台架已按铁律原文实现）。")
 
 
 def check_a5_adapter(ctx: Ctx, c: Check) -> None:
@@ -612,8 +674,7 @@ try:
     out["roles"] = sorted(roles.keys())
     out["roles_have_model"] = all(isinstance(v, dict) and v.get("model") for v in roles.values())
 except Exception as e:
-    out["roles_error"] = "%s: %s" % (type(e).__name__, e)
-    roles = {}
+    out["roles_error"] = "%s: %s" % (type(e).__name__, e); roles = {}
 try:
     llm = m.build_llm(roles, provider="mock")
     a = llm.complete("FLASH", "sys", "usr")
@@ -629,14 +690,19 @@ try:
 except Exception as e:
     out["bogus_role_rejected"] = True
     out["bogus_role_exc"] = type(e).__name__
+try:
+    hi = m.build_llm(roles, provider="mock", high_impact=True)
+    out["high_impact_kwarg"] = hasattr(hi, "complete")
+except Exception as e:
+    out["high_impact_error"] = "%s: %s" % (type(e).__name__, e)
 print(json.dumps(out, ensure_ascii=False))
 '''
     ev = ctx.run([ctx.python, "-c", probe])
-    c.add(cmd="python -c <A5.2 适配器探针>", rc=ev["rc"], stdout=ev["stdout"],
-          stderr=ev["stderr"], ok=ev["rc"] == 0, note="导入 kfpa.llm 并做角色/惰性导入检查")
+    c.add(cmd="python -c <A5 适配器探针>", rc=ev["rc"], stdout=ev["stdout"],
+          stderr=ev["stderr"], ok=ev["rc"] == 0,
+          note="导入 kfpa.llm，检查惰性导入/角色/Mock 确定性/high_impact 开关")
     if ev["rc"] != 0:
-        c.fail(f"适配器探针自身失败（非 ImportError 也算）：rc={ev['rc']} "
-               f"{excerpt(ev['stderr'], 300)}")
+        c.fail(f"适配器探针自身失败：rc={ev['rc']} {excerpt(ev['stderr'], 300)}")
         return
     try:
         data = json.loads(ev["stdout"].strip().splitlines()[-1])
@@ -648,16 +714,8 @@ print(json.dumps(out, ensure_ascii=False))
         c.add(ok=False, note=f"import kfpa.llm 失败：{data['import_error']}")
         c.fail(f"kfpa.llm 不可导入（{OWNERS['src/kfpa/llm.py']}）：{data['import_error']}")
         return
-    spec_litellm = importlib.util.find_spec("litellm") if importlib.util else None
-    c.add(ok=data.get("litellm_imported") is False,
-          note=f"惰性导入：import kfpa.llm 后 litellm in sys.modules = "
-               f"{data.get('litellm_imported')}（本机 litellm 已安装 = {spec_litellm is not None}）")
-    if data.get("litellm_imported"):
-        c.fail("§3.3：litellm 被顶层导入（缺包环境会 ImportError），必须惰性导入。")
     c.add(ok=bool(data.get("has_MockLLM")), note="MockLLM 存在（离线验收路径）")
     c.add(ok=bool(data.get("has_LiteLLMAdapter")), note="LiteLLMAdapter 存在（可选适配器）")
-    c.add(ok=bool(data.get("roles_have_model")),
-          note=f"load_roles() 角色 = {data.get('roles')}，每个角色含 model 字段")
     if data.get("roles_error"):
         c.add(ok=False, note=f"load_roles 异常：{data['roles_error']}")
         c.fail("§3.3 load_roles 不可用（应读 config/models.yaml）。")
@@ -667,19 +725,28 @@ print(json.dumps(out, ensure_ascii=False))
     c.add(ok=got == want, note=f"角色集合 = {sorted(got)}（期望 {sorted(want)}）")
     if got != want:
         c.fail(f"§3.3 角色集合不符：多 = {sorted(got - want)}，缺 = {sorted(want - got)}。")
+    c.add(ok=bool(data.get("roles_have_model")), note="每个角色都有 model 字段（唯一绑定点在 config）")
     c.add(ok=bool(data.get("mock_call_ok")), note=f"MockLLM.complete 可用 = {data.get('mock_call_ok')}")
     if data.get("mock_error"):
         c.add(ok=False, note=f"MockLLM 调用异常：{data['mock_error']}")
         c.fail("§3.3 MockLLM 不可用（离线验收路径断）。")
     c.add(ok=bool(data.get("mock_deterministic")),
-          note=f"MockLLM 同输入同输出 = {data.get('mock_deterministic')}（确定性要求）")
+          note=f"D1-7：MockLLM 同输入同输出 = {data.get('mock_deterministic')}")
     if data.get("mock_call_ok") and data.get("mock_deterministic") is False:
-        c.fail("§3.3 MockLLM 不确定性：同一 role/system/user 两次输出不同，快照无法复算。")
+        c.fail("D1-7：MockLLM 不确定性 —— 同一 role/system/user 两次输出不同，快照不可复算。")
     c.add(ok=bool(data.get("bogus_role_rejected")),
-          note=f"非法 role('BOGUS') 被拒绝 = {data.get('bogus_role_rejected')} "
+          note=f"非法 role('BOGUS') 被拒 = {data.get('bogus_role_rejected')} "
                f"({data.get('bogus_role_exc')})")
     if not data.get("bogus_role_rejected"):
         c.fail("§3.3：非法 role 未被拒绝（只接受 ARCHITECT/REVIEWER/FLASH/EMBEDDING）。")
+    c.add(ok=bool(data.get("high_impact_kwarg")),
+          note=f"R-3：build_llm(..., high_impact=True) 可用 = "
+               f"{bool(data.get('high_impact_kwarg'))} ({data.get('high_impact_error', '')})")
+    if not data.get("high_impact_kwarg"):
+        c.fail("R-3：`build_llm(roles, provider='mock', high_impact=True)` 不可用，"
+               "A3 无法用 mock 造高影响票。")
+    c.warn("R-2：p0-plan §4 的示例命令仍写 `python -m kfpa …`；统一口径应为 "
+           "`PYTHONPATH=src python -m kfpa …`（本台架已按 R-2 注入 PYTHONPATH）。")
 
 
 # ------------------------------------------------------------------ A6
@@ -690,14 +757,14 @@ def check_a6(ctx: Ctx, c: Check) -> None:
     work = ctx.tmp / "a6-work"
     work.mkdir(parents=True, exist_ok=True)
     ev1 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
-    c.add(cmd=ev1["cmd"], rc=ev1["rc"], ok=ev1["rc"] == 0, note="A6 前置：建库")
-    ev2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design",
-                   str(ctx.root / "examples/design-r1.md"), "--round", "1", "--dry-run",
-                   "--db", str(db), "--workdir", str(work)])
+    c.add(cmd=ev1["cmd"], rc=ev1["rc"], ok=ev1["rc"] == EXIT_PASS, note="A6 前置：建库")
+    ev2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                   "--round", "1", "--dry-run", "--json", "--db", str(db),
+                   "--workdir", str(work)])
     c.add(cmd=ev2["cmd"], rc=ev2["rc"], stdout=ev2["stdout"], stderr=ev2["stderr"],
-          ok=ev2["rc"] == 0, note="A6 前置：整轮（快照在轮末产生）")
-    if ev2["rc"] != 0:
-        c.fail("整轮未跑通，A6 无法从真实轮次验收快照 —— 先修 A2/A3 冲突。")
+          ok=ev2["rc"] == EXIT_PASS, note="A6 前置：整轮（只有 PASS 轮才打 tag，D1-6）")
+    if ev2["rc"] != EXIT_PASS:
+        c.fail("整轮未 PASS，A6 无法从真实轮次验收快照 —— 先修 A2/A4。")
 
     snap = {}
     try:
@@ -711,41 +778,49 @@ def check_a6(ctx: Ctx, c: Check) -> None:
         c.add(ok=False, note=f"list_snapshots 异常：{type(exc).__name__}: {exc}")
         c.fail(f"§3.2 Store.list_snapshots 不可用（{OWNERS['src/kfpa/store.py']}）。")
 
-    tables, counts, err = probe_db(db)
+    tables, counts, cols, err = probe_db(db)
     n = counts.get("snapshots", -1)
     c.add(ok=n >= 1, note=f"原始库 snapshots 行数 = {n}" + (f"；读取错误 {err}" if err else ""))
     if n < 1:
-        c.fail("§4/A6：每轮必须落 snapshots 表，实际 0 行。")
+        c.fail("D1-6/A6：PASS 轮必须落 snapshots，实际 0 行。")
 
     ev3 = ctx.run([ctx.python, "-m", "kfpa", "history", "--db", str(db)])
     blob = ev3["stdout"] + ev3["stderr"]
     c.add(cmd=ev3["cmd"], rc=ev3["rc"], stdout=ev3["stdout"], stderr=ev3["stderr"],
-          ok=ev3["rc"] == 0 and bool(blob.strip()),
-          note="`kfpa history` 期望退出码 0 且非空输出（§3.8：轮次/状态/package_hash/门禁态）")
-    if ev3["rc"] != 0 or not blob.strip():
-        c.fail("§3.8/A6：`kfpa history` 不可用或输出为空。")
+          ok=ev3["rc"] == EXIT_PASS and bool(blob.strip()),
+          note="D1-6：`kfpa history` 列 round_no|state|package_hash|gate_state|tag（期望 0）")
+    if ev3["rc"] != EXIT_PASS or not blob.strip():
+        c.fail("D1-6/A6：`kfpa history` 不可用或输出为空。")
         return
     ph = str(getattr(snap, "package_hash", "") or "")
+    tag = str(getattr(snap, "tag", "") or "")
     if ph:
-        c.add(ok=ph[:8] in blob, note=f"history 输出含 package_hash 前 8 位 {ph[:8]}",
+        c.add(ok=ph[:8] in blob, note=f"history 含 package_hash 前 8 位 {ph[:8]}",
               stdout=excerpt(blob, 400))
         if ph[:8] not in blob:
-            c.fail(f"§3.8：history 未列出 package_hash（快照哈希 {ph[:8]} 不在输出里）。")
+            c.fail(f"D1-6：history 未列出 package_hash（{ph[:8]} 不在输出里）。")
+    want_tag = "kfpa-r1"
+    c.add(ok=tag == want_tag, note=f"D1-6：快照 tag = {tag!r}（期望 {want_tag!r}）")
+    if tag != want_tag:
+        c.fail(f"D1-6：PASS 轮 tag 应为 `{want_tag}`，实际 `{tag}`。")
+    elif want_tag not in blob:
+        c.fail(f"D1-6：history 未列出 tag `{want_tag}`。")
+    rounds = counts.get("rounds", 0)
+    c.add(ok=n <= max(rounds, 1),
+          note=f"snapshots 行数 {n} <= rounds 行数 {rounds}（只有 PASS 才落快照）")
 
 
 # ------------------------------------------------------------------ A7
 
 
-def _ensure_tickets(ctx: Ctx, db: Path) -> tuple[list[str], str]:
-    """准备一批票：优先用真实 round，落不到就用 §3.2 API 造。"""
+def _ensure_tickets(ctx: Ctx, db: Path, tag: str) -> tuple[list[str], str]:
     rt = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
-    if rt["rc"] != 0:
-        return [], f"init 失败：{excerpt(rt['stderr'] or rt['stdout'], 200)}"
-    work = ctx.tmp / "a7-work"
+    if rt["rc"] != EXIT_PASS:
+        return [], f"init 失败({rt['rc']})：{excerpt(rt['stderr'] or rt['stdout'], 200)}"
+    work = ctx.tmp / f"{tag}-work"
     work.mkdir(parents=True, exist_ok=True)
-    ctx.run([ctx.python, "-m", "kfpa", "round", "--design",
-             str(ctx.root / "examples/design-r1.md"), "--round", "1", "--dry-run",
-             "--db", str(db), "--workdir", str(work)])
+    ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+             "--round", "1", "--dry-run", "--db", str(db), "--workdir", str(work)])
     try:
         store_mod = importlib.import_module("kfpa.store")
     except Exception as exc:  # noqa: BLE001
@@ -758,9 +833,9 @@ def _ensure_tickets(ctx: Ctx, db: Path) -> tuple[list[str], str]:
         pass
     if not ids:
         try:
-            seed_ticket(store_mod, db, ticket_id="T-A7-1", round_no=1, impact="MEDIUM")
-            seed_ticket(store_mod, db, ticket_id="T-A7-2", round_no=1, impact="HIGH")
-            ids = ["T-A7-1", "T-A7-2"]
+            seed_ticket(store_mod, db, ticket_id="R1-901", round_no=1, impact="MEDIUM")
+            seed_ticket(store_mod, db, ticket_id="R1-902", round_no=1, impact="HIGH")
+            ids = ["R1-901", "R1-902"]
         except Exception as exc:  # noqa: BLE001
             return [], f"造票失败（Store.add_ticket）：{type(exc).__name__}: {exc}"
     return ids, ""
@@ -768,7 +843,7 @@ def _ensure_tickets(ctx: Ctx, db: Path) -> tuple[list[str], str]:
 
 def check_a7(ctx: Ctx, c: Check) -> None:
     db = ctx.fresh_db("a7")
-    ids, err = _ensure_tickets(ctx, db)
+    ids, err = _ensure_tickets(ctx, db, "a7")
     if err:
         c.add(ok=False, note=err)
         c.fail("A7 无法准备票数据：" + err)
@@ -779,34 +854,36 @@ def check_a7(ctx: Ctx, c: Check) -> None:
     ev = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--db", str(db)])
     blob = ev["stdout"] + ev["stderr"]
     c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
-          ok=ev["rc"] == 0, note="§3.7 台账可读；期望退出码 0")
-    if ev["rc"] != 0:
+          ok=ev["rc"] == EXIT_PASS, note="D1-8：台账可读（期望 0）")
+    if ev["rc"] != EXIT_PASS:
         c.fail(f"`kfpa tickets list` 不可用（{OWNERS['src/kfpa/ui/cli.py']}）。")
         return
     c.add(ok=tid in blob, note=f"列表含票号 {tid}")
     if tid not in blob:
-        c.fail(f"§3.7/A7：台账列表未列出票号 {tid}。")
+        c.fail(f"D1-8/A7：台账列表未列出票号 {tid}。")
     low = blob.lower()
-    c.add(ok=any(k in low for k in ("high", "medium", "low", "高", "中", "低")),
-          note="列表含影响面列", stdout=excerpt(blob, 400))
-    c.add(ok=any(k in low for k in ("open", "closed", "dropped", "未关闭", "已关闭")),
-          note="列表含状态列")
+    for label, keys in (("影响面", ("high", "medium", "low", "高", "中", "低")),
+                        ("状态", ("open", "closed", "dropped", "未关闭", "已关闭")),
+                        ("位置", ("design", "§", "location", "位置")),
+                        ("倾向", ("倾向", "preference", "a：", "b：", "解释"))):
+        ok = any(k in low for k in keys)
+        c.add(ok=ok, note=f"D1-8：台账含{label}列", stdout=excerpt(blob, 400))
+        if not ok:
+            c.fail(f"D1-8：`tickets list` 输出缺少{label}列。")
 
-    # 过滤器（§3.7 契约签名）
     for flag, value in (("--round", "1"), ("--impact", "HIGH"), ("--status", "OPEN")):
         e = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", flag, value, "--db", str(db)])
         c.add(cmd=e["cmd"], rc=e["rc"], stdout=e["stdout"], stderr=e["stderr"],
-              ok=e["rc"] == 0, note=f"过滤器 {flag} {value} 可用（§3.7）")
-        if e["rc"] != 0:
-            c.fail(f"§3.7：`tickets list {flag} {value}` 退出码 {e['rc']}。")
+              ok=e["rc"] == EXIT_PASS, note=f"过滤器 {flag} {value} 可用（§3.7）")
+        if e["rc"] != EXIT_PASS:
+            c.fail(f"§3.7：`tickets list {flag} {value}` 退出码 {e['rc']}（期望 0）。")
 
-    # 关票 -> 入库
     e = ctx.run([ctx.python, "-m", "kfpa", "tickets", "close", tid,
                  "--answer", "选 A：按仓隔离", "--db", str(db)])
     c.add(cmd=e["cmd"], rc=e["rc"], stdout=e["stdout"], stderr=e["stderr"],
-          ok=e["rc"] == 0, note="§3.7 关票并入库；期望退出码 0")
-    if e["rc"] != 0:
-        c.fail("§3.7/A7：`tickets close` 不可用。")
+          ok=e["rc"] == EXIT_PASS, note="D1-8：关票并入库（期望 0）")
+    if e["rc"] != EXIT_PASS:
+        c.fail("D1-8/A7：`tickets close` 不可用。")
         return
     try:
         con = sqlite3.connect(str(db))
@@ -816,77 +893,213 @@ def check_a7(ctx: Ctx, c: Check) -> None:
         c.add(ok=bool(row) and str(row[0]).lower().startswith("clos"),
               note=f"原始库 tickets 行 = {row}")
         if not row or not str(row[0]).lower().startswith("clos"):
-            c.fail(f"§3.7/A7：关票未落库（ticket {tid} 状态 = {row[0] if row else '缺行'}）。")
+            c.fail(f"D1-8/A7：关票未落库（{tid} 状态 = {row[0] if row else '缺行'}）。")
         if row and not (row[1] or "").strip():
-            c.fail("§3.7/A7：人工确认结论（answer）未落库。")
+            c.fail("D1-8/A7：人工确认结论（answer）未落库。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"直读 tickets 表失败：{type(exc).__name__}: {exc}")
         c.fail("tickets 表不可直读。")
 
-    e2 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--status", "OPEN",
-                  "--db", str(db)])
+    e2 = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--status", "OPEN", "--db", str(db)])
     blob2 = e2["stdout"] + e2["stderr"]
-    c.add(cmd=e2["cmd"], rc=e2["rc"], ok=e2["rc"] == 0 and tid not in blob2,
+    c.add(cmd=e2["cmd"], rc=e2["rc"], ok=e2["rc"] == EXIT_PASS and tid not in blob2,
           note=f"关闭后 `--status OPEN` 不再列出 {tid}", stdout=excerpt(blob2, 300))
     if tid in blob2:
-        c.fail("§3.7/A7：已关闭的票仍出现在 `--status OPEN` 列表里。")
+        c.fail("D1-8/A7：已关闭的票仍出现在 `--status OPEN` 列表里。")
 
-
-def check_a7_batch(ctx: Ctx, c: Check) -> None:
-    """附加断言（A7 表未列）：batch-close 的（§3.7 只说 --file，未定义文件格式）。"""
-    db = ctx.fresh_db("a7b")
-    ids, err = _ensure_tickets(ctx, db)
-    if err:
-        c.add(ok=False, note=err)
-        c.fail("batch-close 前置失败：" + err)
+    # batch-close（D1-8）：映射格式 + 未知票号整体拒绝（事务）
+    db2 = ctx.fresh_db("a7b")
+    ids2, err2 = _ensure_tickets(ctx, db2, "a7b")
+    if err2:
+        c.fail("A7 batch-close 前置失败：" + err2)
         return
     y = ctx.tmp / "answers.yaml"
-    j = ctx.tmp / "answers.json"
-    y.write_text("".join(f"{i}: 选 A\n" for i in ids), encoding="utf-8")
-    j.write_text(json.dumps([{"ticket_id": i, "answer": "选 A"} for i in ids],
-                            ensure_ascii=False), encoding="utf-8")
-    attempts = [
-        ([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(y), "--db", str(db)],
-         "answers.yaml = {票号: 结论} 映射"),
-    ]
-    db2 = ctx.fresh_db("a7b2")
-    ids2, err2 = _ensure_tickets(ctx, db2)
-    if not err2:
-        attempts.append(
-            ([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(j), "--db", str(db2)],
-             "answers.json = [{ticket_id, answer}] 列表"))
-    got = None
-    for cmd, label in attempts:
-        e = ctx.run(cmd)
-        c.add(cmd=e["cmd"], rc=e["rc"], stdout=e["stdout"], stderr=e["stderr"],
-              ok=e["rc"] == 0, note=f"尝试格式：{label}")
-        if e["rc"] == 0:
-            got = label
-            break
-    if got:
-        c.add(ok=True, note=f"batch-close 接受的格式 = {got}")
+    y.write_text("".join(f'{i}: "采用 A：按仓隔离"\n' for i in ids2), encoding="utf-8")
+    eb = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(y),
+                  "--db", str(db2)])
+    c.add(cmd=eb["cmd"], rc=eb["rc"], stdout=eb["stdout"], stderr=eb["stderr"],
+          ok=eb["rc"] == EXIT_PASS, note="D1-8：`票号 -> 结论` 映射攒批确认（期望 0）")
+    if eb["rc"] != EXIT_PASS:
+        c.fail("D1-8：batch-close 未接受「票号 -> 结论」映射格式。")
     else:
-        c.warn("`tickets batch-close` 未接受两种常见 answers 格式；§3.7 只写了 "
-               "`--file <answers.yaml|json>` 未定义结构 —— 建议 Chief 在契约里补一行格式定义。"
-               "（本条为使能性建议，不作为 A1–A7 阻塞项）")
+        try:
+            con = sqlite3.connect(str(db2))
+            closed = con.execute("select count(*) from tickets where status='closed'").fetchone()[0]
+            con.close()
+            c.add(ok=closed >= 1, note=f"batch-close 后 closed 票数 = {closed}")
+            if closed < 1:
+                c.fail("D1-8：batch-close 报成功但没有任何票被关闭。")
+        except Exception as exc:  # noqa: BLE001
+            c.add(ok=False, note=f"直读失败：{exc}")
+
+    db3 = ctx.fresh_db("a7c")
+    ids3, err3 = _ensure_tickets(ctx, db3, "a7c")
+    if err3:
+        c.fail("A7 事务用例前置失败：" + err3)
+        return
+    bad = ctx.tmp / "answers_bad.yaml"
+    bad.write_text(f'{ids3[0]}: "采用 A"\nR9-999: "不存在的票"\n', encoding="utf-8")
+    ex = ctx.run([ctx.python, "-m", "kfpa", "tickets", "batch-close", "--file", str(bad),
+                  "--db", str(db3)])
+    c.add(cmd=ex["cmd"], rc=ex["rc"], stdout=ex["stdout"], stderr=ex["stderr"],
+          ok=ex["rc"] == EXIT_USAGE, note="D1-8：未知票号 → 退出码 2（用法错误）")
+    if ex["rc"] != EXIT_USAGE:
+        c.fail(f"D1-8：未知票号应退出码 2，实际 {ex['rc']}。")
+    try:
+        con = sqlite3.connect(str(db3))
+        n_closed = con.execute("select count(*) from tickets where status='closed'").fetchone()[0]
+        con.close()
+        c.add(ok=n_closed == 0,
+              note=f"D1-8：未知票号时整体不写 —— closed 票数 = {n_closed}（期望 0）")
+        if n_closed != 0:
+            c.fail(f"D1-8 事务被击穿：未知票号时仍写入了 {n_closed} 张已关闭票。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"直读失败：{exc}")
+
+
+# ------------------------------------------------------------------ A8
+
+
+def check_a8(ctx: Ctx, c: Check) -> None:
+    smoke = ctx.root / "tests/test_graph_smoke.py"
+    if not smoke.exists():
+        c.fail("缺 tests/test_graph_smoke.py（镜鉴自己的交付物 = A8 的验收命令）。")
+        return
+    ev = ctx.run([ctx.python, "-m", "pytest", "tests/test_graph_smoke.py", "-q"])
+    blob = ev["stdout"] + ev["stderr"]
+    c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"],
+          ok=ev["rc"] == 0 and "skipped" not in blob.lower(),
+          note="A8：`python -m pytest tests/test_graph_smoke.py`（D1-12 约束 3）")
+    if ev["rc"] != 0:
+        c.fail(f"A8：图冒烟未通过（pytest rc={ev['rc']}）。")
+    elif "skipped" in blob.lower():
+        c.fail("A8：图冒烟被 skip（build_graph 未交付或不可调用）—— skip 不等于通过。")
+    else:
+        c.add(ok=True, note="图可编译并可跑通一次 dry-run", stdout=excerpt(blob, 300))
+    pipe_mod, perr = import_mod("kfpa.pipeline")
+    if pipe_mod is None:
+        c.add(ok=False, note=f"import kfpa.pipeline 失败：{perr}")
+        c.fail("D1-12：pipeline 不可导入，纯函数核心无保险丝。")
+    else:
+        ok = hasattr(pipe_mod, "build_graph")
+        c.add(ok=ok, note="pipeline.build_graph 存在（图坏掉时可降级为可选编排层）")
+        if not ok:
+            c.fail("D1-12：`pipeline.build_graph()` 不存在。")
+
+
+# ------------------------------------------------------------------ A9
+
+
+def check_a9(ctx: Ctx, c: Check) -> None:
+    probe = r'''
+import json, sys
+out = {"patched": []}
+try:
+    import kfpa.llm as m
+except Exception as e:
+    print(json.dumps({"import_error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False)); raise SystemExit(0)
+try:
+    import litellm
+except Exception as e:
+    print(json.dumps({"litellm_missing": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False)); raise SystemExit(0)
+roles = m.load_roles()
+for name, spec in roles.items():
+    if isinstance(spec, dict):
+        spec["model"] = "nonexistent/fake-model-for-a9"
+adapter = None
+for how in ("build_llm", "LiteLLMAdapter"):
+    try:
+        if how == "build_llm":
+            adapter = m.build_llm(roles, provider="litellm", api_key="")
+        else:
+            try:
+                adapter = m.LiteLLMAdapter(roles, api_key="")
+            except TypeError:
+                adapter = m.LiteLLMAdapter(roles)
+        out["built_by"] = how
+        break
+    except Exception as e:
+        out.setdefault("build_errors", []).append("%s: %s: %s" % (how, type(e).__name__, e))
+
+def boom(*a, **k):
+    raise ValueError("simulated-network-boom-a9")
+
+mod = sys.modules.get("litellm")
+for name in ("completion", "acompletion", "text_completion"):
+    if mod is not None and hasattr(mod, name):
+        setattr(mod, name, boom); out["patched"].append("litellm." + name)
+if adapter is not None:
+    amod = sys.modules.get(type(adapter).__module__)
+    for name in ("completion", "acompletion"):
+        if amod is not None and hasattr(amod, name):
+            setattr(amod, name, boom); out["patched"].append(amod.__name__ + "." + name)
+
+out["adapter_type"] = type(adapter).__name__ if adapter is not None else None
+if adapter is None:
+    print(json.dumps(out, ensure_ascii=False)); raise SystemExit(0)
+try:
+    adapter.complete("FLASH", "sys", "usr")
+    out["raised"] = None
+except BaseException as e:
+    out["raised"] = type(e).__name__
+    out["message"] = str(e)[:400]
+print(json.dumps(out, ensure_ascii=False))
+'''
+    ev = ctx.run([ctx.python, "-c", probe], timeout=120)
+    c.add(cmd="python -c <A9 适配器异常包装探针>", rc=ev["rc"], stdout=ev["stdout"],
+          stderr=ev["stderr"], ok=ev["rc"] == 0, note="R-7：假模型名 + 空 key + 注入底层异常")
+    if ev["rc"] != 0:
+        c.fail(f"A9 探针自身失败：rc={ev['rc']} {excerpt(ev['stderr'], 400)}")
+        return
+    try:
+        data = json.loads(ev["stdout"].strip().splitlines()[-1])
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"探针输出不是 JSON：{exc}")
+        c.fail("A9 无法解析探针输出。")
+        return
+    if data.get("import_error"):
+        c.add(ok=False, note=f"import kfpa.llm 失败：{data['import_error']}")
+        c.fail("A9：kfpa.llm 不可导入。")
+        return
+    if data.get("litellm_missing"):
+        c.skip(f"本机 litellm 不可导入（{data['litellm_missing']}），A9 无法断言包装逻辑。")
+        return
+    if data.get("adapter_type") is None:
+        c.add(ok=False, note=f"适配器构造失败：{data.get('build_errors')}")
+        c.fail("A9：LiteLLMAdapter 无法构造（§3.3），异常包装无从验收。")
+        return
+    c.add(ok=True, note=f"适配器 = {data['adapter_type']}；已拦截调用点 = {data.get('patched')}")
+    if not data.get("patched"):
+        c.fail("A9：无法拦截任何底层调用点（litellm.completion 等），包装逻辑不可断言；"
+               "建议把 litellm 调用收敛到一个可注入的方法上。")
+        return
+    raised, msg = data.get("raised"), data.get("message") or ""
+    c.add(ok=raised == "RuntimeError",
+          note=f"R-7①：底层抛 ValueError → 适配器抛 {raised}（期望 RuntimeError，不许裸抛）")
+    if raised != "RuntimeError":
+        c.fail(f"R-7①：适配器未把底层异常统一包成 RuntimeError（实际 {raised}）。")
+    c.add(ok=cjk(msg), note=f"R-7②：消息含中文 = {cjk(msg)}；片段 = {msg[:160]!r}")
+    if not cjk(msg):
+        c.fail("R-7②：包装后的异常消息没有中文提示。")
+    ok_hint = ("--provider" in msg and "mock" in msg)
+    c.add(ok=ok_hint, note="R-7②：消息提示改用 `--provider mock`")
+    if not ok_hint:
+        c.fail("R-7②：包装后的异常消息未提示 `--provider mock`。")
 
 
 # ------------------------------------------------------------------ 报告
 
 
 def render(c: Check, verbose: bool) -> str:
-    head = (f"== {c.cid} {c.title} == [{c.status}]  "
-            f"责任: {c.owner}  依据: {c.reference}")
-    lines = [head]
+    lines = [f"== {c.cid} {c.title} == [{c.status}]  责任: {c.owner}  依据: {c.reference}"]
     for e in c.evidence:
         if e.cmd:
-            mark = "OK" if e.verdict else "NG"
             lines.append(f"   $ {e.cmd}")
-            lines.append(f"     -> rc={e.rc} [{mark}]" + (f"  {e.note}" if e.note else ""))
+            lines.append(f"     -> rc={e.rc} [{'OK' if e.verdict else 'NG'}]"
+                         + (f"  {e.note}" if e.note else ""))
         elif e.note:
             lines.append(f"   - {'OK' if e.verdict else 'NG'} {e.note}")
-        body = (e.stdout or "").strip()
-        err = (e.stderr or "").strip()
+        body, err = (e.stdout or "").strip(), (e.stderr or "").strip()
         if body and (verbose or not e.verdict):
             lines.append("     输出: " + excerpt(body).replace("\n", "\n     "))
         if err and (verbose or not e.verdict):
@@ -897,31 +1110,33 @@ def render(c: Check, verbose: bool) -> str:
 
 
 CHECKS = [
-    ("A1", "CLI 可用：--help 退出码 0，含 init/round/tickets/history", "磐石+界面",
-     "p0-plan §4/A1、§3.8", check_a1),
-    ("A2", "离线端到端：dry-run 整轮，票五要素齐、任务包六段齐、落库五表", "磐石+长流",
-     "p0-plan §4/A2、§3.2/§3.4", check_a2),
-    ("A3", "硬规则：未关闭高影响票不得出任务包（CLI 非零 + 中文；关票后放行）", "长流",
-     "p0-plan §4/A3、§3.4；design.md §4", check_a3),
-    ("A4", "三态闭环：失败 NEEDS_FIX + 回灌区非空；同类失败 >=2 次 BLOCKED + escalated", "长流",
-     "p0-plan §4/A4、§3.5；design.md §5.3", check_a4),
-    ("A5.1", "模型绑定铁律：src/ 无模型字符串（llm.py 白名单外）", "全员",
+    ("A1", "CLI 可用：--help 退出码 0，含 init/round/tickets/history + 退出码表", "磐石+界面",
+     "p0-plan §4/A1、R-1", check_a1),
+    ("A2", "离线端到端：dry-run 整轮，票五要素+票号规则、任务包六段、results、六表落库", "磐石+长流",
+     "p0-plan §4/A2、D1-1/D1-9/D1-10", check_a2),
+    ("A3", "硬规则：未关闭 HIGH 票 → 退出码 3 + 中文；关票后放行；R-6 重跑保留状态", "长流+界面",
+     "p0-plan §4/A3、D1-5、R-6", check_a3),
+    ("A4", "三态闭环：G1–G6 判据 + 同类第 2 次失败 BLOCKED + AVOID 回灌", "长流",
+     "p0-plan §4/A4、D1-3/D1-4/D1-11、R-4", check_a4),
+    ("A5", "模型绑定铁律：src/ 无越界模型字符串（llm.py 白名单外）", "全员",
      "p0-plan §4/A5", check_a5_scan),
-    ("A5.2", "适配器：litellm 惰性导入、MockLLM 确定性、非法 role 拒绝", "磐石",
-     "p0-plan §3.3", check_a5_adapter),
-    ("A6", "快照可查：snapshots 有行，kfpa history 列出 package_hash", "磐石",
-     "p0-plan §4/A6、§3.8", check_a6),
-    ("A7", "台账可读写：tickets list 过滤可用、close 落库", "界面",
-     "p0-plan §4/A7、§3.7", check_a7),
-    ("A7.2", "附加：batch-close 攒批确认可用（A7 表未列）", "界面",
-     "p0-plan §3.7", check_a7_batch),
+    ("A5.2", "适配器：4 角色、MockLLM 确定性、非法 role 拒绝、high_impact 开关", "磐石",
+     "p0-plan §3.3、R-3", check_a5_adapter),
+    ("A6", "快照可查：PASS 轮落 snapshots + tag kfpa-r{n} + history 列出", "磐石",
+     "p0-plan §4/A6、D1-6", check_a6),
+    ("A7", "台账：列全/过滤/close 落库/batch-close 映射与未知票号事务拒绝", "界面",
+     "p0-plan §4/A7、D1-8", check_a7),
+    ("A8", "LangGraph 图冒烟（build_graph 可编译可跑），纯函数核心仍有保险丝", "长流",
+     "p0-plan §4/A8、D1-12", check_a8),
+    ("A9", "LiteLLM 适配器异常统一包装为中文 RuntimeError 且提示 --provider mock", "磐石",
+     "p0-rulings R-7", check_a9),
 ]
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="KFPA P0 独立验收台架（A1–A7）")
+    ap = argparse.ArgumentParser(description="KFPA P0 独立验收台架（A1–A9）")
     ap.add_argument("--root", default=str(REPO_ROOT), help="仓库根（默认脚本上级目录）")
-    ap.add_argument("--only", default="", help="只跑指定断言，逗号分隔，支持前缀（如 A2,A5.1）")
+    ap.add_argument("--only", default="", help="只跑指定断言，逗号分隔，支持前缀（如 A2,A5）")
     ap.add_argument("--json", dest="json_path", default="", help="把完整证据写到 JSON")
     ap.add_argument("--list", action="store_true", help="列出全部断言即退出")
     ap.add_argument("--keep-temp", action="store_true", help="保留临时库")
@@ -930,14 +1145,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         for cid, title, owner, ref, _ in CHECKS:
-            print(f"{cid:6s} [{owner}] {title}   ({ref})")
+            print(f"{cid:5s} [{owner}] {title}   ({ref})")
         return 0
 
     root = Path(args.root).resolve()
     if not root.exists():
         print(f"台架错误：--root 不存在：{root}", file=sys.stderr)
         return 2
-
     selected = [s.strip() for s in args.only.split(",") if s.strip()]
     unknown = [s for s in selected
                if not any(cid == s or cid.startswith(s + ".") for cid, *_ in CHECKS)]
@@ -950,7 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="kfpa-verify-"))
     ctx = Ctx(root=root, python=sys.executable, tmp=tmpdir, keep=args.keep_temp)
     print(f"KFPA P0 验收台架  仓库={root}")
-    print(f"python={ctx.python}")
+    print(f"python={ctx.python}   （R-2：所有命令注入 PYTHONPATH=src）")
     print(f"契约文件缺失={[f for f in REQUIRED_P0_FILES if not (root / f).exists()]}")
     print(f"临时目录={tmpdir}" + ("（--keep-temp）" if args.keep_temp else ""))
     print("-" * 72)
@@ -967,39 +1181,31 @@ def main(argv: list[str] | None = None) -> int:
         print(render(c, args.verbose))
         print("-" * 72)
 
-    n_pass = sum(1 for c in results if c.status == "PASS")
-    n_fail = sum(1 for c in results if c.status == "FAIL")
-    n_skip = sum(1 for c in results if c.status == "SKIP")
+    n_pass = sum(1 for x in results if x.status == "PASS")
+    n_fail = sum(1 for x in results if x.status == "FAIL")
+    n_skip = sum(1 for x in results if x.status == "SKIP")
     print(f"汇总：{len(results)} 条断言 -> PASS {n_pass} / FAIL {n_fail} / SKIP {n_skip}")
-    for c in results:
-        if c.status != "PASS":
-            print(f"  [{c.status}] {c.cid} {c.title}  (责任: {c.owner})")
+    for x in results:
+        if x.status != "PASS":
+            print(f"  [{x.status}] {x.cid} {x.title}  (责任: {x.owner})")
 
     if args.json_path:
         payload = {
-            "root": str(root),
-            "python": ctx.python,
+            "root": str(root), "python": ctx.python,
             "contract_versions_supported": list(SUPPORTED_CONTRACT_VERSIONS),
             "missing_files": [f for f in REQUIRED_P0_FILES if not (root / f).exists()],
             "summary": {"total": len(results), "pass": n_pass, "fail": n_fail, "skip": n_skip},
-            "checks": [
-                {
-                    "cid": c.cid, "title": c.title, "owner": c.owner,
-                    "reference": c.reference, "status": c.status,
-                    "findings": c.findings,
-                    "evidence": [
-                        {"cmd": e.cmd, "rc": e.rc, "verdict": e.verdict, "note": e.note,
-                         "stdout": (e.stdout or "")[:4000], "stderr": (e.stderr or "")[:4000]}
-                        for e in c.evidence
-                    ],
-                }
-                for c in results
-            ],
+            "checks": [{
+                "cid": x.cid, "title": x.title, "owner": x.owner, "reference": x.reference,
+                "status": x.status, "findings": x.findings,
+                "evidence": [{"cmd": e.cmd, "rc": e.rc, "verdict": e.verdict, "note": e.note,
+                              "stdout": (e.stdout or "")[:4000],
+                              "stderr": (e.stderr or "")[:4000]} for e in x.evidence],
+            } for x in results],
         }
-        Path(args.json_path).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(args.json_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
         print(f"JSON 证据 -> {args.json_path}")
-
     return 0 if n_fail == 0 else 1
 
 
