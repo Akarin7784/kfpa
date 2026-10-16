@@ -332,65 +332,118 @@ def reject(
     )
 
 
-def _extract_ids(payload: Any) -> list[str]:
-    """从 JSON/YAML 载入的结构里捞 `request_id`（保序去重）；形状不符给空清单。"""
+_LIST_KEYS = ("acks", "requests", "request_ids", "ids")
+_MISSING = object()
+#: R-34 冻结形状（坏形状 → rc=2 的提示统一带这段，避免只给「解析失败」）
+_SHAPE_HINT = ("形状：`acks: [{request_id, note?}]`（R-34 冻结）——"
+               "`acks:` 必须是列表、元素必须含 `request_id`；"
+               "也接受 `acks:` 下的标量列表、`acks: [fl-1-1]` 内联列表、或逐行 request_id 清单")
+
+
+def _ids_from_list(items: list) -> tuple[list[str], bool]:
+    """列表元素 → ids（保序去重）；返回 `(ids, ok)`，`ok=False` 表示有元素缺 `request_id`。"""
     out: list[str] = []
+    ok = True
+    for item in items:
+        if isinstance(item, dict):
+            rid = item.get("request_id") or item.get("id")
+            value = str(rid).strip() if rid else ""
+        else:
+            value = str(item).strip() if item is not None else ""
+        if not value:
+            ok = False          # R-34：元素缺 request_id 不是「跳过」，是坏形状
+            continue
+        if value not in out:
+            out.append(value)
+    return out, ok
 
-    def add(value: Any) -> None:
-        text = str(value or "").strip()
-        if text and text not in out:
-            out.append(text)
 
-    if isinstance(payload, dict):
-        for key in ("acks", "requests", "request_ids", "ids"):
-            if key in payload:
-                return _extract_ids(payload[key])
-        add(payload.get("request_id") or payload.get("id"))
-        return out
-    if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                add(item.get("request_id") or item.get("id"))
-            else:
-                add(item)
-        return out
-    if payload is not None:
-        add(payload)
+def _bracket_ids(value: str) -> list[str]:
+    """内联列表 `[fl-1-1, fl-1-2]` → ids（保序去重）。"""
+    inner = value.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    out: list[str] = []
+    for part in inner.split(","):
+        item = part.strip().strip("'\"")
+        if item and item not in out:
+            out.append(item)
     return out
 
 
-def parse_ack_file(text: str) -> list[str]:
-    """解析 `batch-ack --file`：**冻结形状** `acks: [{request_id, note?}]`（D5 §3.2，界面生成）。
+def _parse_acks(text: str, *, strict: bool) -> list[str]:
+    """承认清单解析（R-34/R-36）：`strict=True` 时任何形状违规都抛 `FastlaneError`（CLI → rc=2）。
 
-    兼容形状（同一个函数，无需调用方改）：
-
-    - YAML（装了 pyyaml 时）`acks:` / `requests:` / `request_ids:` 列表，元素是 dict 或标量；
-    - JSON `["fl-1-1"]` · `{"acks": [{"request_id": "fl-1-1"}]}`；
-    - 逐行清单 `- fl-1-1` / `fl-1-1` / `request_id: fl-1-1`（无 pyyaml 时的兜底）。
-
-    空行与 `#` 注释忽略；重复项去重但**保序**；`note` 等其它键不参与解析。
+    例外是**列表键存在但不是 list**（`acks: fl-1-1`）这一种：它**任何模式都抛**——静默返回
+    空清单正是这个坏形状溜进写库的原因（Chief 在 main 上复现过 rc=0 真承认一条）。宽松模式
+    只对「缺键 / 空清单 / 无可识别条目」保留不抛的旧兼容行为。
     """
-    out: list[str] = []
     raw = str(text or "").strip()
-    if not raw:
+    out: list[str] = []
+
+    def fail(message: str) -> list[str]:
+        if strict:
+            raise FastlaneError(f"{message} → {_SHAPE_HINT}；rc=2")
         return out
+
+    def hard(message: str) -> list[str]:
+        """列表键不是 list：宽松模式也抛，绝不静默吞（R-36 第三种坏形状）。"""
+        raise FastlaneError(f"{message} → {_SHAPE_HINT}；rc=2")
+
+    def from_sequence(items: Any, where: str) -> list[str]:
+        ids, ok = _ids_from_list(list(items))
+        if not ok:
+            return fail(f"[fastlane] {where} 里有元素缺 `request_id`")
+        if not ids:
+            return fail(f"[fastlane] {where} 是空列表")
+        return ids
+
+    if not raw:
+        return fail("[fastlane] 承认清单是空文件")
+    # 1) JSON
     if raw[0] in "[{":
         try:
-            ids = _extract_ids(json.loads(raw))
+            payload: Any = json.loads(raw)
         except json.JSONDecodeError:
-            ids = []
-        if ids:
-            return ids
-    try:  # 冻结形状是 YAML；没装 pyyaml 就退回逐行解析（不新增依赖）
+            payload = _MISSING
+        if payload is not _MISSING:
+            if isinstance(payload, list):
+                return from_sequence(payload, "JSON 数组")
+            if isinstance(payload, dict):
+                for key in _LIST_KEYS:
+                    if key in payload:
+                        if not isinstance(payload[key], list):
+                            return hard(
+                                f"[fastlane] `{key}` 必须是列表（收到 "
+                                f"{type(payload[key]).__name__}：`{payload[key]}`）"
+                            )
+                        return from_sequence(payload[key], f"`{key}`")
+                rid = payload.get("request_id") or payload.get("id")
+                return [str(rid).strip()] if rid else fail(
+                    "[fastlane] JSON 对象里没有 `request_id`"
+                )
+            return fail("[fastlane] JSON 顶层必须是数组或对象")
+    # 2) YAML（冻结形状的载体；没装 pyyaml 走逐行兜底）
+    try:
         import yaml  # type: ignore[import-untyped]
 
-        loaded = yaml.safe_load(raw)
-        if isinstance(loaded, dict) or (isinstance(loaded, list) and loaded):
-            ids = _extract_ids(loaded)
-            if ids:
-                return ids
+        loaded: Any = yaml.safe_load(raw)
     except Exception:  # noqa: BLE001 - ImportError / YAMLError 都退回逐行解析
-        pass
+        loaded = _MISSING
+    if loaded is not _MISSING and (isinstance(loaded, dict) or (isinstance(loaded, list) and loaded)):
+        if isinstance(loaded, list):
+            return from_sequence(loaded, "YAML 数组")
+        for key in _LIST_KEYS:
+            if key in loaded:
+                if not isinstance(loaded[key], list):
+                    return hard(
+                        f"[fastlane] `{key}` 必须是列表（收到 "
+                        f"{type(loaded[key]).__name__}：`{loaded[key]}`）"
+                    )
+                return from_sequence(loaded[key], f"`{key}`")
+        rid = loaded.get("request_id") or loaded.get("id")
+        return [str(rid).strip()] if rid else fail("[fastlane] YAML 对象里没有 `request_id`")
+    # 3) 逐行兜底（`- fl-1-1` / `fl-1-1` / `request_id: fl-1-1`）
     for line in raw.splitlines():
         text_line = line.split("#", 1)[0].strip()
         if not text_line:
@@ -405,13 +458,38 @@ def parse_ack_file(text: str) -> list[str]:
             value = value.strip()
             if key in ("request_id", "id"):
                 text_line = value
-            elif key in ("acks", "requests", "request_ids", "ids"):
-                text_line = value
+            elif key in _LIST_KEYS:
+                if not value.startswith("["):  # `acks: fl-1-1` 是坏形状，不是一条 id
+                    return hard(f"[fastlane] `{key}:` 后面必须是列表（收到 `{value}`）")
+                for item in _bracket_ids(value):
+                    if item not in out:
+                        out.append(item)
+                continue
             else:
                 continue  # `note:` 等其它键忽略
         if text_line and text_line not in out:
             out.append(text_line)
+    if not out:
+        return fail("[fastlane] 承认清单里没有可识别的 `request_id`")
     return out
+
+
+def parse_ack_file(text: str) -> list[str]:
+    """宽松解析（兼容旧调用）：形状非法时给空清单，不抛异常。
+
+    唯一例外是 **`acks`（等列表键）存在但不是 list** —— 那种形状一律抛 `FastlaneError`
+    （见 `_parse_acks`：静默返回空清单正是 `acks: fl-1-1` 溜进写库的路径）。CLI 走 `load_ack_ids()`。
+    """
+    return _parse_acks(text, strict=False)
+
+
+def load_ack_ids(text: str) -> list[str]:
+    """严格解析 `batch-ack --file`（R-34）：坏形状 → `FastlaneError`（CLI 判 **rc=2**）。
+
+    覆盖三种坏形状 + 空文件 / 空列表 / 无可识别条目：缺 `acks` 键 · 元素缺 `request_id` ·
+    `acks` 不是列表（含界面报的 `acks: fl-1-1` 扁平标量）。**不许静默跳过、不许补行。**
+    """
+    return _parse_acks(text, strict=True)
 
 
 class BatchAckResult(list):
@@ -618,10 +696,19 @@ def _cmd_batch_ack(args: Any) -> int:
               file=sys.stderr)
         return EXIT_USAGE
     try:
-        ids = parse_ack_file(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         print(f"[fastlane] 读取承认清单失败：{path}（{exc}）", file=sys.stderr)
         return EXIT_IO
+    except UnicodeDecodeError as exc:
+        print(f"[fastlane] 承认清单不是 UTF-8 文本：{path}（{exc}）→ {_SHAPE_HINT}",
+              file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        ids = load_ack_ids(raw)
+    except FastlaneError as exc:  # R-34：坏形状 → rc=2 + 中文（不许静默跳过/补行）
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
     try:
         result = batch_ack(store, ids, args.by, batch_id=getattr(args, "batch", "") or "")
     except FastlaneError as exc:
@@ -733,7 +820,13 @@ def register(subparsers: Any) -> None:  # pragma: no cover - 由 cli.py 挂载
     group = _fastlane_group(subparsers)
     names = getattr(group, "_name_parser_map", {})
 
-    if "check" not in names:  # R-34：check 由本模块注册；过渡期 impact 已建组时跳过
+    if "check" not in names:
+        # R-34：`check` 也由本模块注册（内部转 `impact.analyze`，A16 行为一致）。
+        #
+        # 磐石在 `impact.register_check(group)` 里提供了同一份 argparse + 处理器，可以省掉下面这段；
+        # 但它内部自建 store（`make_store(args.db)`），而 `tests/test_p3_knowledge.py` 两个已合入
+        # main 的 `check` 用例是用 `fastlane._store_for` 注入库的 —— 现在切过去会把 main 打红两处。
+        # 待镜鉴把那两处改成 patch `kfpa.store.make_store` 后再切（本模块保留等价实现，A16 已过）。
         check = group.add_parser("check", help="对某轮任务包做三判据影响分析（R-23.2 / D3-3.6）")
         check.add_argument("--round", dest="round_no", type=int, required=True)
         check.add_argument("--db", default="kfpa.db")
@@ -810,6 +903,7 @@ __all__ = [
     "ack",
     "reject",
     "parse_ack_file",
+    "load_ack_ids",
     "batch_ack",
     "register",
 ]
