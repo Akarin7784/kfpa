@@ -1,30 +1,47 @@
-"""知識沉淀闸门（P1，D3-3.5 / design.md §5.5 防知识库中毒）。
+"""知識沉淀闸门（P1 D3-3.5 + **P3 D5 §3.3 全量** / design.md §5.5 防知识库中毒）。
 
-规则表（照抄 D3-3.5）：
+规则表（D5 §3.3 冻结；括号内是 P1 旧值，已被 P3 取代）：
 
 | 阶段 | 规则 |
 |---|---|
-| 入隔离区 | `confidence >= 0.80` 且内容非空；低于阈值或空内容 → 直接 `dropped` |
-| 转正 | 被 ≥1 个**成功轮次**（门禁 PASS）复用 → `promoted` |
-| 负知识 | `kind=avoid` 直接进任务包回灌区（feedback），**不进知识库正区**（永不转正） |
-| 抽检 | 抽样率 `max(0.05, 0.20 - 0.05 * 成功复用次数)`（封顶 0.20、下限 0.05） |
+| 入隔离区 | `confidence >= CONFIDENCE_THRESHOLD`（**P3 = 0.6**，P1 旧值 0.80）且内容非空；低于门槛或空内容 → 直接 `dropped`，**不进隔离区** |
+| 隔离区 | 过门槛的落 `quarantine`；负知识（`kind=avoid`）只走回灌链路，永不转正 |
+| 转正 | `can_promote()`：被 **≥1 个后续轮次**（`reused_by` 里的轮次 `> candidate.round_no`）成功复用；**同轮复用不算**（防自证） |
+| 抽检 | 抽样率 `max(0.05, 0.20 - 0.05 * 成功复用次数)`；抽中者写 `KnowledgeSample` 留痕；`passed=False` → `DROPPED` **且**内容写进回避模式清单（负知识） |
+| 报告 | `report()`：各状态计数 · 抽检率 · 被丢弃清单 · 转正清单（稳定键，A25 断） |
 
 本模块是纯逻辑 + Store 读写，**不调用模型**；抽样用内容哈希做确定性判定（同输入同输出，
-台架可复现），不使用 `random`，否则 A15 会变成概率性断言。
+台架可复现），不使用 `random`，否则抽检会变成概率性断言。
+
+P3 与 P1 的口径差异（**断言跟口径走**，别跟旧实现走）：
+
+1. `CONFIDENCE_THRESHOLD` 0.80 → **0.6**（D5 §3.3.1，可被 `KFPA_CONFIDENCE_THRESHOLD` 覆盖）；
+2. 转正加「后续轮次」约束：同轮复用不再转正（D5 §3.3.2）；
+3. 新增抽检留痕与 `report()`（D5 §3.3.3/4）。
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from .schemas import CandidateStatus, KnowledgeCandidate, TaskPackage
+from .schemas import (
+    CONTRACT_VERSION,
+    CandidateStatus,
+    FailureRecord,
+    KnowledgeCandidate,
+    KnowledgeSample,
+    TaskPackage,
+    dumps,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注
     from .store import Store
 
-#: 入隔离区置信度门槛（D3-3.5）
-CONFIDENCE_THRESHOLD = 0.80
+#: 入隔离区置信度门槛（**D5 §3.3.1 冻结 0.6**；P1 旧值 0.80）
+CONFIDENCE_THRESHOLD = 0.6
 #: 抽检率区间
 SAMPLE_RATE_MAX = 0.20
 SAMPLE_RATE_MIN = 0.05
@@ -33,9 +50,30 @@ SAMPLE_RATE_STEP = 0.05
 #: 允许的 kind（success 正知识 / avoid 负知识）
 KINDS = ("success", "avoid")
 
+#: 门槛覆盖用的环境变量（D5 §3.3.1「可被 config 覆盖」）
+THRESHOLD_ENV = "KFPA_CONFIDENCE_THRESHOLD"
+
+#: 抽检未通过写入回避模式时的 `reason_key`（负知识闭环）
+SAMPLE_FAILED_REASON_KEY = "knowledge_sample_failed"
+
 
 class KnowledgeError(RuntimeError):
     """沉淀闸门可判定错误（中文、三段式）。"""
+
+
+def confidence_threshold() -> float:
+    """当前门槛：默认 `CONFIDENCE_THRESHOLD`，可用 `KFPA_CONFIDENCE_THRESHOLD` 覆盖。
+
+    非法值（非数字 / 越界）→ 回落到常量，**不猜**（配置坏了不能把闸门调成 0）。
+    """
+    raw = str(os.environ.get(THRESHOLD_ENV) or "").strip()
+    if not raw:
+        return CONFIDENCE_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        return CONFIDENCE_THRESHOLD
+    return value if 0.0 <= value <= 1.0 else CONFIDENCE_THRESHOLD
 
 
 def sampling_rate(successful_reuse_count: int) -> float:
@@ -81,13 +119,18 @@ def make_candidate(
 
 
 def admit(store: "Store", candidate: KnowledgeCandidate) -> KnowledgeCandidate:
-    """入隔离区判定（D3-3.5）：不达标直接 dropped，达标进 quarantine 并落库。"""
+    """入隔离区判定（D5 §3.3.1）：不达标直接 dropped，达标进 quarantine 并落库。
+
+    - 空内容 → `dropped`；
+    - `kind=avoid`（负知识）→ `quarantine` 但**永不转正**（只走回灌链路），
+      不受正知识门槛约束——负知识的价值在于「记住别再做」，不是「可信度」；
+    - 其余：`confidence < confidence_threshold()` → **直接 dropped，不进隔离区**。
+    """
     if not candidate.content:
         candidate.status = CandidateStatus.DROPPED
     elif candidate.kind == "avoid":
-        # 负知识也要留痕（回避模式清单），但不进正区；状态照常 quarantine，永不 promote
         candidate.status = CandidateStatus.QUARANTINE
-    elif candidate.confidence < CONFIDENCE_THRESHOLD:
+    elif candidate.confidence < confidence_threshold():
         candidate.status = CandidateStatus.DROPPED
     else:
         candidate.status = CandidateStatus.QUARANTINE
@@ -95,25 +138,51 @@ def admit(store: "Store", candidate: KnowledgeCandidate) -> KnowledgeCandidate:
     return candidate
 
 
+def can_promote(candidate: KnowledgeCandidate) -> bool:
+    """转正判定（D5 §3.3.2）：隔离区 + 被 **≥1 个后续轮次**成功复用；负知识永不转正。
+
+    与 `KnowledgeCandidate.can_promote()`（契约层，只看「有没有被复用」）不同：这里加
+    「**后续轮次**」约束——同一轮里自己复用自己的内容不算证据（防自证）。
+    """
+    if candidate.kind == "avoid":
+        return False
+    if candidate.status is not CandidateStatus.QUARANTINE:
+        return False
+    return any(int(r) > int(candidate.round_no) for r in (candidate.reused_by or []))
+
+
 def promotable(candidate: KnowledgeCandidate) -> bool:
-    """可转正：隔离区 + 至少 1 个成功轮复用；`kind=avoid` 永不转正（D3-3.5）。"""
-    return candidate.kind != "avoid" and candidate.can_promote()
+    """`can_promote()` 的兼容别名（P1 起就叫这个名字）。"""
+    return can_promote(candidate)
+
+
+def later_rounds(candidate: KnowledgeCandidate) -> list[int]:
+    """被哪些**后续**轮次复用（排序去重；同轮/更早的轮次剔除）。"""
+    rounds = {int(r) for r in (candidate.reused_by or []) if int(r) > int(candidate.round_no)}
+    return sorted(rounds)
 
 
 def mark_reused(
     store: "Store", cid: str, round_no: int, *, passed: bool
 ) -> KnowledgeCandidate:
-    """标记候选在某轮被复用；**只有 PASS 轮**才计入 `reused_by` 并触发转正。"""
+    """标记候选在某轮被复用；**只有 PASS 轮**才计入 `reused_by` 并触发转正。
+
+    D5 §3.3.2：`round_no <= candidate.round_no`（同轮或更早）**不计入**——同轮复用是
+    自我引用，不能当转正证据。返回值始终是库里最新的那条候选。
+    """
     candidate = store.get_candidate(cid)
     if candidate is None:
         raise KnowledgeError(
             f"[knowledge] 候选不存在：{cid} → 先用 `kfpa knowledge list` 查 cid"
         )
-    if passed and int(round_no) not in candidate.reused_by:
-        candidate.reused_by.append(int(round_no))
+    reuse_round = int(round_no)
+    if reuse_round <= int(candidate.round_no):
+        return candidate  # 同轮自证不算（D5 §3.3.2）
+    if passed and reuse_round not in candidate.reused_by:
+        candidate.reused_by.append(reuse_round)
         store.add_candidate(candidate)  # 覆盖式写回
         if promotable(candidate):
-            return store.promote_candidate(cid, int(round_no))
+            return store.promote_candidate(cid, reuse_round)
     return candidate
 
 
@@ -127,6 +196,7 @@ def reuse_from_package(
     """把「本轮任务包真的用到的候选」标记为复用（P1 最小闭环，可实证）。
 
     认定口径：候选 `content` 出现在任务包的 `feedback` 或 `prohibitions` 条目里。
+    转正需要**后续轮次**的复用（D5 §3.3.2），所以当轮使用只留痕、不当场转正。
     """
     promoted: list[str] = []
     if not passed:
@@ -173,6 +243,115 @@ def review_sample(store: "Store", candidates: Optional[list[KnowledgeCandidate]]
     return out
 
 
+# ---------------------------------------------------------------- P3：抽检留痕与结论
+
+
+def list_samples(store: "Store", cid: Optional[str] = None) -> list[KnowledgeSample]:
+    """读抽检留痕（store 缺方法 → 空清单，不崩）。"""
+    fn = getattr(store, "list_knowledge_samples", None)
+    if not callable(fn):
+        return []
+    items = fn(cid) or []
+    return sorted(
+        [x for x in items if isinstance(x, KnowledgeSample)],
+        key=lambda s: (str(s.cid), float(s.sampled_at), str(s.sampled_by)),
+    )
+
+
+def pending_sample(store: "Store") -> list[dict]:
+    """待抽检队列：按抽样率被抽中、且**尚无留痕**的候选（D5 §3.3.3）。"""
+    sampled = {s.cid for s in list_samples(store)}
+    return [row for row in review_sample(store) if str(row["cid"]) not in sampled]
+
+
+def sample_candidate(
+    store: "Store",
+    cid: str,
+    *,
+    by: str = "",
+    passed: bool = True,
+    now: Optional[float] = None,
+) -> KnowledgeSample:
+    """对一条候选留痕并给结论（D5 §3.3.3）。
+
+    - 写 `KnowledgeSample`（含抽中时的动态抽样率，便于回看口径）；
+    - `passed=False` → 该候选 `DROPPED` **且**内容写进回避模式清单（负知识闭环）。
+
+    抽检是**人工动作**，所以不要求 `is_sampled()` 命中（显式 `--cid` 即强制抽样）；
+    未给 `--cid` 的「按率列队列」走 `pending_sample()`。
+    """
+    candidate = store.get_candidate(cid)
+    if candidate is None:
+        raise KnowledgeError(
+            f"[knowledge] 候选不存在：{cid} → 先用 `kfpa knowledge list` 查 cid"
+        )
+    rate = sampling_rate(len(candidate.reused_by))
+    sample = KnowledgeSample(
+        cid=str(cid),
+        sampled_at=float(now if now is not None else time.time()),
+        sampled_by=str(by or "").strip() or "unknown",
+        rate=rate,
+        passed=bool(passed),
+    )
+    add = getattr(store, "add_knowledge_sample", None)
+    if callable(add):
+        add(sample)
+    if not passed:
+        store.drop_candidate(cid, f"抽检未通过（by={sample.sampled_by}）")
+        record = getattr(store, "record_failure", None)
+        if callable(record):
+            record(
+                FailureRecord(
+                    round_no=int(candidate.round_no),
+                    attempt=1,
+                    reason=f"沉淀抽检未通过：{cid}（by={sample.sampled_by}）",
+                    avoid_pattern=str(candidate.content),
+                    reason_key=SAMPLE_FAILED_REASON_KEY,
+                    created_at=sample.sampled_at,
+                )
+            )
+    return sample
+
+
+def report(store: "Store") -> dict[str, Any]:
+    """闸门报告（D5 §3.3.4，稳定键）：计数 · 抽检 · 丢弃清单 · 转正清单 · 回避模式。"""
+    items = list(store.list_candidates())
+    counts = {
+        CandidateStatus.QUARANTINE.value: 0,
+        CandidateStatus.PROMOTED.value: 0,
+        CandidateStatus.DROPPED.value: 0,
+    }
+    rates: dict[str, float] = {}
+    for candidate in items:
+        counts[candidate.status.value] = counts.get(candidate.status.value, 0) + 1
+        rates[candidate.cid] = sampling_rate(len(candidate.reused_by))
+    samples = list_samples(store)
+    patterns: list[str] = []
+    fn = getattr(store, "list_avoid_patterns", None)
+    if callable(fn):
+        try:
+            patterns = [str(p) for p in (fn(None) or []) if str(p).strip()]
+        except Exception:  # pragma: no cover - 老库/桩缺该方法
+            patterns = []
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "threshold": confidence_threshold(),
+        "counts": counts,
+        "total": len(items),
+        "sampling_rates": rates,
+        "sampled": len(samples),
+        "samples": [
+            {"cid": s.cid, "sampled_at": s.sampled_at, "sampled_by": s.sampled_by,
+             "rate": s.rate, "passed": bool(s.passed)}
+            for s in samples
+        ],
+        "pending_sample": [str(row["cid"]) for row in pending_sample(store)],
+        "dropped_cids": sorted(c.cid for c in items if c.status is CandidateStatus.DROPPED),
+        "promoted_cids": sorted(c.cid for c in items if c.status is CandidateStatus.PROMOTED),
+        "avoid_patterns": patterns,
+    }
+
+
 def format_report(candidates: list[KnowledgeCandidate]) -> str:
     """CLI 台账文本（中文，含状态与复用轮次）。"""
     if not candidates:
@@ -190,8 +369,8 @@ def format_report(candidates: list[KnowledgeCandidate]) -> str:
 
 
 def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
-    """注册 `kfpa knowledge list|promote`（D3-3.5）。"""
-    parser = subparsers.add_parser("knowledge", help="知識沉淀闸门（D3-3.5）")
+    """注册 `kfpa knowledge list|promote|ingest|sample|verdict|report`（D3-3.5 + D5 §3.3）。"""
+    parser = subparsers.add_parser("knowledge", help="知識沉淀闸门（D3-3.5 / D5 §3.3）")
     sub = parser.add_subparsers(dest="knowledge_cmd", required=True)
 
     listing = sub.add_parser("list", help="列沉淀候选（可按状态过滤）")
@@ -203,6 +382,36 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
     promote.add_argument("cid")
     promote.add_argument("--round", dest="round_no", type=int, required=True)
     promote.add_argument("--db", default="kfpa.db")
+    promote.add_argument("--json", action="store_true")
+
+    ingest = sub.add_parser("ingest", help="离线入闸一条候选（P3 闸门全量的验收入口）")
+    ingest.add_argument("--cid", required=True)
+    ingest.add_argument("--round", dest="round_no", type=int, required=True)
+    ingest.add_argument("--content", required=True)
+    ingest.add_argument("--confidence", default="0")
+    ingest.add_argument("--kind", choices=list(KINDS), default="success")
+    ingest.add_argument("--db", default="kfpa.db")
+    ingest.add_argument("--json", action="store_true")
+
+    sample = sub.add_parser("sample", help="抽检：给 --cid 即留痕；不给则列待抽检队列")
+    sample.add_argument("--cid", default=None)
+    sample.add_argument("--by", default="")
+    sample.add_argument("--failed", action="store_true", help="抽检结论：不通过 → dropped + 回避模式")
+    sample.add_argument("--db", default="kfpa.db")
+    sample.add_argument("--json", action="store_true")
+
+    verdict = sub.add_parser("verdict", help="对某候选下抽检结论（passed/failed，落留痕）")
+    verdict.add_argument("cid")
+    verdict.add_argument("--passed", dest="passed", action="store_true", default=None)
+    verdict.add_argument("--failed", dest="failed", action="store_true")
+    verdict.add_argument("--by", default="")
+    verdict.add_argument("--db", default="kfpa.db")
+    verdict.add_argument("--json", action="store_true")
+
+    report_p = sub.add_parser("report", help="闸门报告（稳定键 JSON）")
+    report_p.add_argument("--out", default="", help="落盘路径（缺省打到 stdout）")
+    report_p.add_argument("--db", default="kfpa.db")
+    report_p.add_argument("--json", action="store_true")
 
     def _store(db: str):
         try:
@@ -215,13 +424,12 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
             return Store(db)
 
     def _list(args) -> int:
-        from .schemas import dumps
-
         store = _store(args.db)
         status = CandidateStatus(args.status) if args.status else None
         items = store.list_candidates(status)
         if args.json:
-            print(dumps({"candidates": items, "sample": review_sample(store, items)}))
+            print(dumps({"candidates": items, "sample": review_sample(store, items),
+                         "pending_sample": pending_sample(store)}))
         else:
             print(format_report(items))
             sample = review_sample(store, items)
@@ -231,13 +439,104 @@ def register(subparsers) -> None:  # pragma: no cover - 由 cli.py 挂载
     def _promote(args) -> int:
         store = _store(args.db)
         candidate = mark_reused(store, args.cid, args.round_no, passed=True)
+        if args.json:
+            print(dumps(candidate))
+            return 0
         print(f"{candidate.cid}：状态 {candidate.status.value}，成功复用轮次 {candidate.reused_by or '-'}")
         if candidate.kind == "avoid":
             print("  （kind=avoid：负知识只进回灌区，永不转正）")
+        elif candidate.status is not CandidateStatus.PROMOTED:
+            print(f"  （转正需**后续轮次**复用：本候选第 {candidate.round_no} 轮入库，"
+                  f"后续复用轮次 {later_rounds(candidate) or '-'}）")
         return 0
 
-    listing.set_defaults(handler=_list, func=_list)
-    promote.set_defaults(handler=_promote, func=_promote)
+    def _ingest(args) -> int:
+        store = _store(args.db)
+        candidate = make_candidate(
+            args.cid,
+            args.round_no,
+            args.content,
+            kind=args.kind,
+            confidence=args.confidence,
+        )
+        admit(store, candidate)
+        if args.json:
+            print(dumps(candidate))
+            return 0
+        print(f"{candidate.cid}：置信度 {candidate.confidence:.2f}（门槛 {confidence_threshold():.2f}）"
+              f"→ {candidate.status.value}")
+        return 0
+
+    def _sample(args) -> int:
+        store = _store(args.db)
+        if not args.cid:
+            queue = pending_sample(store)
+            if args.json:
+                print(dumps({"pending_sample": queue, "count": len(queue)}))
+            else:
+                print(f"待抽检 {len(queue)} 条（按 D3-3.5 动态抽样率）")
+                for row in queue:
+                    print(f"  {row['cid']}（状态 {row['status']}，抽样率 {row['sample_rate']}）")
+            return 0
+        sample = sample_candidate(
+            store, args.cid, by=args.by or _default_user(), passed=not args.failed
+        )
+        if args.json:
+            print(dumps(sample))
+            return 0
+        print(f"{sample.cid}：抽检 {'通过' if sample.passed else '未通过'}"
+              f"（by={sample.sampled_by}，抽样率 {sample.rate}）")
+        if not sample.passed:
+            print("  → 已 dropped，且内容已写入回避模式清单（负知识闭环）")
+        return 0
+
+    def _verdict(args) -> int:
+        store = _store(args.db)
+        passed = True
+        if args.failed:
+            passed = False
+        elif args.passed is not None:
+            passed = bool(args.passed)
+        sample = sample_candidate(store, args.cid, by=args.by or _default_user(), passed=passed)
+        if args.json:
+            print(dumps(sample))
+            return 0
+        print(f"{sample.cid}：抽检结论 {'passed' if sample.passed else 'failed'}"
+              f"（by={sample.sampled_by}，抽样率 {sample.rate}）")
+        return 0
+
+    def _report(args) -> int:
+        store = _store(args.db)
+        payload = report(store)
+        text = dumps(payload)
+        if args.out:
+            from pathlib import Path
+
+            target = Path(args.out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text + "\n", encoding="utf-8")
+            print(f"闸门报告已落盘：{target}")
+        else:
+            print(text)
+        return 0
+
+    for parser, handler in (
+        (listing, _list),
+        (promote, _promote),
+        (ingest, _ingest),
+        (sample, _sample),
+        (verdict, _verdict),
+        (report_p, _report),
+    ):
+        parser.set_defaults(handler=handler, func=handler)
+
+
+def _default_user() -> str:
+    for key in ("KFPA_USER", "USER", "USERNAME", "LOGNAME"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return "unknown"
 
 
 __all__ = [
@@ -246,15 +545,24 @@ __all__ = [
     "SAMPLE_RATE_MIN",
     "SAMPLE_RATE_STEP",
     "KINDS",
+    "THRESHOLD_ENV",
+    "SAMPLE_FAILED_REASON_KEY",
     "KnowledgeError",
+    "confidence_threshold",
     "sampling_rate",
     "make_candidate",
     "admit",
+    "can_promote",
     "promotable",
+    "later_rounds",
     "mark_reused",
     "reuse_from_package",
     "is_sampled",
     "review_sample",
+    "list_samples",
+    "pending_sample",
+    "sample_candidate",
+    "report",
     "format_report",
     "register",
 ]

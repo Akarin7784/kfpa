@@ -613,6 +613,9 @@ def _stage_package(
     )
     _log(f"[4/6] 任务包生成：六段式，回灌区注入 {len(avoid)} 条本轮/上一轮失败模式")
     package = build_task_package(round_no, design_text, tickets, llm, avoid)
+    package.knowledge_hits = _knowledge_hits(store, package)
+    if package.knowledge_hits:
+        _log(f"[rag] 检索命中 {len(package.knowledge_hits)} 条（provider=local，命中进任务包）")
     store.save_package(package)
     return package
 
@@ -711,6 +714,22 @@ def _reuse_knowledge(store: "Store", package: TaskPackage, round_no: int) -> lis
         return knowledge.reuse_from_package(store, package, round_no, passed=True)
     except Exception as exc:  # pragma: no cover - 沉淀失败不该影响快照
         _log(f"[knowledge] 复用标记失败（{exc}）→ 只警告，不影响本轮快照")
+        return []
+
+
+def _knowledge_hits(store: "Store", package: TaskPackage) -> list[str]:
+    """P3 D5 §3.5：本地回退检索命中摘要进任务包（`knowledge_hits`）。
+
+    确定性：查询由任务包自造（feature + goal），语料 = `knowledge` 表 + `docs/**`，
+    无时间/随机项——两库同轮次的 `package_hash` 才不会漂移（A12/A26）。
+    检索失败只降级留空，**不让检索拖垮一轮**（与 `_reuse_knowledge` 同口径）。
+    """
+    try:
+        from . import rag
+
+        return list(rag.hits_for_package(package, store=store))
+    except Exception as exc:  # pragma: no cover - 检索降级不影响门禁
+        _log(f"[rag] 检索降级（{exc}）→ 本轮 knowledge_hits 留空")
         return []
 
 

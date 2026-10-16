@@ -48,3 +48,10 @@
 {% else %}
 - 无（首轮）
 {% endfor %}
+{% if package.knowledge_hits %}
+## 7. 知识库命中（检索：provider=local 本地回退）
+
+{% for item in package.knowledge_hits %}
+- {{ item }}
+{% endfor %}
+{% endif %}
