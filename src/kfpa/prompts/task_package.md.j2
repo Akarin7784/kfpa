@@ -1,0 +1,50 @@
+{# 六段式任务包 Markdown 交付物。变量：package, package_hash #}
+# 编码任务包 · 第 {{ package.round_no }} 轮 · {{ package.feature }}
+
+> 内容指纹 package_hash = `{{ package_hash }}`
+> 契约版本 CONTRACT_VERSION = 1.0（src/kfpa/schemas.py，冻结）
+> 已关闭質問票：{% if package.closed_tickets %}{{ package.closed_tickets | join('、') }}{% else %}（无）{% endif %}
+
+## 1. 目标描述
+
+{{ package.goal or '（缺段）' }}
+
+## 2. 验收标准（可测试断言）
+
+{% for item in package.acceptance %}
+- **{{ item.cid }}** {{ item.text }}
+{% else %}
+- （缺段）
+{% endfor %}
+
+## 3. 边界条件清单
+
+{% for item in package.boundaries %}
+- {{ item }}
+{% else %}
+- （缺段）
+{% endfor %}
+
+## 4. 接口契约
+
+{% for item in package.interface_contract %}
+- {{ item }}
+{% else %}
+- （缺段）
+{% endfor %}
+
+## 5. 禁止事项
+
+{% for item in package.prohibitions %}
+- {{ item }}
+{% else %}
+- （缺段）
+{% endfor %}
+
+## 6. 回灌区（上一轮失败原因与规避要求）
+
+{% for item in package.feedback %}
+- {{ item }}
+{% else %}
+- 无（首轮）
+{% endfor %}
