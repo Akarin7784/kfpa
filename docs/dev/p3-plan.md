@@ -127,6 +127,8 @@ knowledge_hits: list[str] = field(default_factory=list)   # 形如 "K1#reused=2"
   ```
 
   缺 `acks` 键或元素缺 `request_id` → **rc=2 + 中文**（用法错误），不许静默跳过、不许凭空补行。
+  **第三种坏形状（R-36 补）**：`acks` 键存在但**不是列表**（如 `acks: fl-1-1`）→ 同样是 **rc=2 + 中文**，
+  绝不接受、绝不真承认（实测过：旧实现 rc=0 且真写了一行承认）。
 - **幂等与留痕**：同一 `request_id` 二次承认不重复写行、不覆盖首次 `decided_by/decided_at`，返回原记录；
   攒批承认同批共享 `batch_id`；`ESCALATED`/`REJECTED` 的请求**不许**被 `ack` 翻成 `APPROVED`（要翻必须新开请求）。
 - **存什么**：`fastlane_requests` 表（SQLite 与 PG 同签名），`kfpa fastlane list --json` 输出稳定列。
@@ -173,8 +175,14 @@ A26 直接断 SQLite/PG 两侧 `package_hash` 一致。
 
 - **本地回退（验收路径，离线确定）**：对 `knowledge` 表（`PROMOTED` 优先）+ `docs/**` 做朴素关键词召回，
   返回**稳定排序**的命中列表（同输入同输出），命中摘要进 `TaskPackage.knowledge_hits`。
-- **Dify 适配器（接线即交付）**：`DIFY_API_URL` / `DIFY_API_KEY` 环境变量；未配置或未装依赖 →
-  **rc=4 + 中文**（不是 5，也不是裸崩）；真实 HTTP 调用只在配了凭据时发生。
+- **Dify 适配器（接线即交付）**：`DIFY_API_URL` / `DIFY_API_KEY` 环境变量。**`--provider` 三态语义（R-36 冻结，
+  调和本件「本地回退是验收路径」与验收行「未配凭据 rc=4」的张力）**：
+  | `--provider` | 凭据齐 | 凭据缺 | 行为 |
+  |---|---|---|---|
+  | `auto`（默认） | 走 Dify | **本地回退** | rc=0；结果标 `provider="local"`（不伪装） |
+  | `local` | 强制本地回退（不发 HTTP） | 同左 | rc=0 |
+  | `dify` | 走 Dify | **rc=4 + 中文（打码）** | 显式要求 Dify 却没凭据 = 依赖/凭据缺失 |
+  配了凭据但调用失败（HTTP 错 / 不可达 / 非 JSON）→ **rc=5**（I/O 与 DB，R-31）。
 - **不许漏密钥**：任何日志、异常消息、DB 落库内容里禁止出现 key 明文（沿用 DSN 打码口径，A27 断）。
 - **降级可见**：本地回退命中时，任务包/报告要能看出「这是回退结果」（`provider="local"`），
   不许把回退结果伪装成 Dify 结果。
@@ -198,11 +206,16 @@ A26 直接断 SQLite/PG 两侧 `package_hash` 一致。
 | A24 | **快车道判据与升级**：三判据全真才 `PENDING→APPROVED`；任一为假 → `ESCALATED` 且 reasons 指名是哪条；`no_diff_source`（R-23 第三来源）显式可见 | `python -m kfpa fastlane plan --round N` |
 | A25 | **沉淀闸门全量**：低于置信度门槛（**0.80**）直接 `DROPPED`（不进隔离区）；`QUARANTINE` 只被**后续轮次**复用才转正（同轮不算）；抽检 `passed=False` → `DROPPED` + 写回避模式；抽检留痕可查。**入口名按 §3.3 冻结**（`admit` / `record_sample`），探不到 = FAIL | `python -m kfpa knowledge list/promote/sample/verdict/report` |
 | A26 | **负知识回灌 + 双库一致**：失败记录进下一轮任务包 `feedback`；回灌只取本轮+上一轮；同轮次在 SQLite 与 PG 上 `package_hash` 一致。**PG 夹具复用 A12**：`KFPA_PG_PORT`（默认 55440）连不上 → 可见 SKIP；`KFPA_VERIFY_PG_DSN` 为显式覆盖；**不自建容器**（R-24） | `verify_p1.py --only A12` 扩到新表 + `round` 两轮对拍 |
-| A27 | **RAG 检索**：本地回退可离线命中且**稳定排序**；未配 Dify 凭据 → rc=**4** + 中文；异常/日志/库里**无 key 明文**；回退结果标 `provider="local"` | `python -m kfpa rag search "…" --json` |
+| A27 | **RAG 检索**：默认 `auto` 离线命中且**稳定排序**（`provider="local"`，rc=0）；**显式 `--provider dify` 且未配凭据 → rc=4 + 中文**；配了凭据但不可达 → rc=5；异常/日志/库里**无 key 明文** | `python -m kfpa rag search "…" --json` / `--provider dify` |
 | A0 | **不回归**：`verify_p0` 13/13、`verify_p1` 8/8、`verify_p2` 6/6、`pytest` 全绿 | 三条台架 + `pytest -q` |
 
 **A0 与 A23–A27 的地位不同（R-33）**：A0 **必须始终绿**；A23–A27 在实现落地前允许红，
 但每条红必须指名到人与接口——**红的是派工单，不是 main 回归**。P3 收口 = A23–A27 全绿。
+
+**A0 的合入窗口（R-36 说明）**：`knowledge.py` / `fastlane.py` 一进树，A20 的 P3 增量就生效，
+而它们的桩还在 `benchmarks/**`（pytest 不收集）→ **会有一段 A0 只因「桩没搬」而红的窗口**。
+这窗口**允许存在但必须在本轮内关掉**：实现方桩搬进 `tests/**`（R-30）即回绿；窗口期内不许对外说「A0 绿」，
+更不许拿它当 P3 收口依据（**收口前 A0 必须真绿**）。
 
 **A20 的 P3 增量（R-33 配套，收口时生效）**：新模块不能「门槛绿而自己没测」。
 - `knowledge.py`、`fastlane.py` 两块**纯逻辑**加入 A20 门槛白名单（各 ≥80%），由 `verify_p3` 的覆盖率段断；
