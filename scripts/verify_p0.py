@@ -454,6 +454,17 @@ def check_a3(ctx: Ctx, c: Check) -> None:
     if not cjk(blob):
         c.fail("D1-10：拒绝输出没有中文提示。")
 
+    # R-13：拦停时 rounds.state 必须是 tickets_open（这个时点可观测）
+    try:
+        rd0 = store_mod.Store(str(db)).get_round(2)
+        s0 = status_value(rd0.state) if rd0 is not None else ""
+    except Exception as exc:  # noqa: BLE001
+        s0 = f"<{type(exc).__name__}: {exc}>"
+    c.add(ok=s0 == "tickets_open",
+          note=f"R-13：拦停时 rounds.state(round 2) = {s0!r}（期望 'tickets_open'）")
+    if s0 != "tickets_open":
+        c.fail(f"R-13：有未关闭 HIGH 票被拦停时 rounds.state 应为 tickets_open，实际 {s0!r}。")
+
     # R-10：`tickets list` 要能看到那张 HIGH 票
     el = ctx.run([ctx.python, "-m", "kfpa", "tickets", "list", "--impact", "HIGH",
                   "--db", str(db)])
@@ -495,10 +506,11 @@ def check_a3(ctx: Ctx, c: Check) -> None:
             r2 = status_value(rd.state) if rd is not None else ""
         except Exception:  # noqa: BLE001
             r2 = ""
-        c.add(ok=r2 == "released",
-              note=f"R-13：放行后 rounds.state(round 2) = {r2!r}（期望 'released'）")
-        if r2 != "released":
-            c.fail(f"R-13：高影响票清零并出包后，rounds.state 应为 released，实际 {r2!r}。")
+        c.add(ok=r2 in ("released", "executing", "gated", "snapshotted"),
+              note=f"R-13：放行后 rounds.state(round 2) = {r2!r}"
+                   f"（允许 released/executing/gated/snapshotted；RELEASED 是放行时点的瞬态）")
+        if r2 not in ("released", "executing", "gated", "snapshotted"):
+            c.fail(f"R-13：关票后重跑仍停在 {r2!r}（不应是 tickets_open/blocked）。")
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"get_ticket 异常：{type(exc).__name__}: {exc}")
         c.fail("Store.get_ticket 接口不可用（§3.2）。")

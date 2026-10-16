@@ -12,10 +12,10 @@
 | 项 | 值 |
 |---|---|
 | 验收台架 | `scripts/verify_p0.py`（本分支交付，A1–A9 共 12 条断言） |
-| 契约版本 | main 已升 `CONTRACT_VERSION 1.1`（PR #2）＋跨模块裁决 D2（PR #5） |
-| 最近一次全量运行 | 2026-10-16，基于 `main@201e517` 的台架自检：**10 条断言 → PASS 1 / FAIL 9 / SKIP 0** |
-| 那一条 PASS | `A5` 模型字符串铁律（main 基线本来就干净） |
-| 判定 | **P0 未通过**：`p0/core`、`p0/pipeline`、`p0/ui` 尚未交付，FAIL 全部指名缺失文件与责任模块 |
+| 契约版本 | main `CONTRACT_VERSION 1.1`；裁决 D2 已到 **v1.4**（R-1 ~ R-17） |
+| 最近一次全量运行 | 2026-10-16 全链集成预演（本地临时分支 `verify/all`，R-16 合规）：`main@d46b41d` + `p0/core@0a5d25b` + `p0/ui@7892ac3` + `p0/pipeline@d2a3833` + `p0/verify` → **12 条断言 PASS 12 / FAIL 0 / SKIP 0**，`pytest 32 passed` |
+| 判定 | **集成态通过**；按 R-16 的合入顺序（#3 core → pipeline → #4 ui → #6 verify）逐段落 main 后，每个节点由镜鉴在 main 上复跑 A1–A9 |
+| 上一轮（分支单测） | `main@201e517` 台架自检：PASS 1 / FAIL 9（模块未交付；见 §4.1） |
 
 台架**不给未交付模块发通过**：契约文件缺失一律报 FAIL 并列出「缺哪个文件、归谁写」；
 `A8` 即使 pytest 返回 0，只要冒烟被 skip 也判 **FAIL**（skip 不等于通过）。
@@ -112,16 +112,37 @@ main 已是 1.1，全部门禁字段（`results`/`error_category`/`reason_key`/`
 2. **原契约版本漂移 → R-12**：main 已 1.1，报告 0.1 里「仍 1.0 / D1 不存在」的结论已过时，0.2 起作废。
 3. **原 batch-close 格式缺口 → D1-8/R-9**：映射格式已定义，台架 A7 按映射断言。
 
-### 4.3 仍然开放
+### 4.3 全链集成预演（R-16：只在本地临时分支，未推 main）
 
-1. **【重要 · A8 缺图输入契约】** D1-12 定义了「用 LangGraph 编排」，但没定义 `build_graph()` 的
-   签名与 `invoke` 的 state 结构；而 `tests/**` 归镜鉴，A8 的验收命令只能靠约定猜。本分支已交付
-   `tests/test_graph_smoke.py`（对 `build_graph(*deps)` + `invoke({round_no, design_text, design_ref})`
-   自适应尝试）；**建议 D1 补一行 state 契约**，否则图一改签名 A8 就要返工。
-2. **【建议 · 验收表命令未同步 R-2】** `p0-plan §4` 的示例命令仍写 `python -m kfpa …`，
-   而 R-2 要求统一 `PYTHONPATH=src`；A5 行也仍是那条会误杀 `llm.py` 的裸 grep（R-11 已给出两条新命令，表未同步）。
-3. **【自查纠正】** 台架 A5.2 首轮把「无 marker 调用 `MockLLM().complete()` 抛 `MockScriptError`」误判为缺陷；
-   复核 D1-7「未知 marker 必须抛错、禁止静默返回空串」后确认是**探针口径错**，已改为带 marker 调用并拆成 R-11.1/R-11.2/A5.3。
+```
+git checkout -B verify/all origin/main            # d46b41d
+git merge origin/p0/core      # 0a5d25b
+git merge origin/p0/ui        # 7892ac3
+git merge origin/p0/pipeline  # d2a3833
+git merge p0/verify           # 台架
+PYTHONPATH=src python scripts/verify_p0.py       # 12 条断言 PASS 12 / FAIL 0 / SKIP 0
+PYTHONPATH=src python -m pytest tests -q         # 32 passed
+```
+
+上一轮点名的问题在各自新 head 上均已消除：R-8 `Store.list_tickets(round_no, status, impact)` 已就位
+（`tickets list` 从 `rc=5` 恢复 `rc=0`）；R-10 `--inject` 值域含 `high_ticket` 且 `build_llm(high_impact=True)` 可用；
+R-1「设计文件不存在 → 4」已对齐；R-17 两条 marker（规范 `KFPA_TASK=` 与永久别名 `[KFPA:GEN_TICKETS]`）都可跑且输出一致。
+A8 的图冒烟按 R-14 冻结契约（关键字参数签名 / `GRAPH_NODES` / `invoke` 三键 / `gate.state=="pass"`）实跑通过。
+
+### 4.4 台架自身的误判（自查纠正，均已修）
+
+| 误判 | 真相 | 修法 |
+|---|---|---|
+| A5.2 把「无 marker 调用 MockLLM 抛 `MockScriptError`」判缺陷 | D1-7 要求必须抛错、禁止静默返回空串 | 探针改为带 marker 调用；拆成 A5.1/A5.2/A5.3 |
+| A4 查 `GateReport.error_category` | 该字段在契约 1.1 里根本不存在；D1-4 的 category 体现在 `reason_key` | 改为按 D1-4 公式 `sha1(category\|target)[:12]` 复算 |
+| A3 用 `str(t.status).endswith("closed")` 判票状态 | `str(TicketStatus.CLOSED)` == `"TicketStatus.CLOSED"`，永远判否 | 统一走 `.value`（`status_value()` helper） |
+| A3 断言放行后 `rounds.state == released` | `RELEASED` 是放行时点的瞬态，整轮跑完是 `snapshotted` | 改为断言拦停时 `tickets_open`、放行后不在 `tickets_open/blocked` |
+
+### 4.5 仍然开放
+
+1. **【建议 · 验收表命令未同步 R-2/R-11】** `p0-plan §4` 的示例命令仍写 `python -m kfpa …`
+   （R-2 要求 `PYTHONPATH=src`），A5 行仍是那条会误杀 `llm.py` 的裸 grep（R-11 已给出两条新命令）。
+2. **【建议 · D1-12 已由 R-14 补上图契约】** 先前的「A8 缺输入契约」已裁定，台架与其对齐，本条关闭。
 
 ---
 
@@ -131,4 +152,6 @@ main 已是 1.1，全部门禁字段（`results`/`error_category`/`reason_key`/`
 |---|---|---|---|
 | 0.1 | 2026-10-16 | 首版：A1–A7 台架 + 契约测试 + 台架自检（PASS 1 / FAIL 8） | 镜鉴 |
 | 0.2 | 2026-10-16 | 对齐 D1/D2：升 A1–A9，A4 走 `--inject`、退出码表、D1-9 六表列抽查、D1-6 tag、D1-8 事务、A8 图冒烟、A9 异常包装（PASS 1 / FAIL 9） | 镜鉴 |
+| 0.3 | 2026-10-16 | 对齐 R-8/R-9/R-10/R-11：A5 三拆、A3 改纯 CLI `--inject high_ticket`、新增 A7.2；PR #3/#4 集成实测 2 阻塞 / 1 重要 / 1 建议 | 镜鉴 |
+| 0.4 | 2026-10-16 | 对齐 R-13/R-14/R-15/R-17；修台架四处误判；全链集成预演 **12/12 通过**（core 0a5d25b / ui 7892ac3 / pipeline d2a3833 / main d46b41d） | 镜鉴 |
 | 0.3 | 2026-10-16 | 对齐 R-8/R-9/R-10/R-11：A5 三拆为 A5.1/A5.2/A5.3、A3 改纯 CLI `--inject high_ticket`、新增 A7.2；补 PR #3/#4 集成实测结论（2 阻塞 / 1 重要 / 1 建议） | 镜鉴 |
