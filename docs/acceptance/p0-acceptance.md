@@ -11,11 +11,11 @@
 
 | 项 | 值 |
 |---|---|
-| 验收台架 | `scripts/verify_p0.py`（本分支交付，A1–A10 共 13 条断言） |
-| 契约版本 | main `CONTRACT_VERSION 1.1`；裁决 D2 已到 **v1.5**（R-1 ~ R-18） |
-| 最近一次全量运行 | 2026-10-16 全链集成预演（本地临时分支 `verify/all`，R-16 合规）：`main@0195ed7` + `p0/core@b6c6fb0` + `p0/ui@7892ac3` + `p0/pipeline@cad3ea2` + `p0/verify` → **13 条断言 PASS 10 / FAIL 3**，3 条红全部由同一个缺陷引起（R-18 编码兜底未落地，见 §4.5） |
-| 判定 | **不通过（1 阻塞）**：`cli.main()` 缺 R-18 的 `reconfigure(encoding="utf-8")`，重定向且不设 `PYTHONIOENCODING` 时 `--help` / `tickets list` / `round --json` 全部 `rc=1` + `UnicodeEncodeError` |
-| 上一轮（同一集成树，早两小时） | `main@d46b41d` + `core@0a5d25b` + `ui@7892ac3` + `pipeline@d2a3833` → PASS 12 / FAIL 0；**该轮 A1/A7 是假绿**（台架当时设了 `PYTHONIOENCODING`，见 §4.5） |
+| 验收台架 | `scripts/verify_p0.py`（A1–A10 共 13 条断言）＋ `scripts/selfcheck_core.py`（磐石自检面，96 项，第二意见） |
+| 契约版本 | main `CONTRACT_VERSION 1.1`；裁决 D2 已到 **v1.6**（R-1 ~ R-19） |
+| 最近一次全量运行 | 2026-10-16 **clean env**（不设 `PYTHONIOENCODING`/`PYTHONUTF8`、stdout 重定向）@ `main@51b15b3` + 本分支：`verify_p0.py` → **13 条断言 PASS 13 / FAIL 0**、`rc=0`；`selfcheck_core.py` → **96 PASS / 0 FAIL**、`rc=0`；`pytest tests -q` → **35 passed**、`rc=0` |
+| 判定 | **P0 收口通过**（A1–A10 全绿，含 R-18/R-19 的编码健壮性） |
+| 上一轮（同一批分支，合并前） | `main@0195ed7` + `core@b6c6fb0` + `ui@7892ac3` + `pipeline@cad3ea2` → PASS 10 / FAIL 3；三条红同一根因 R-18，已由 `p0/core@b390596`（Chief 代补）闭合 |
 
 台架**不给未交付模块发通过**：契约文件缺失一律报 FAIL 并列出「缺哪个文件、归谁写」；
 `A8` 即使 pytest 返回 0，只要冒烟被 skip 也判 **FAIL**（skip 不等于通过）。
@@ -177,3 +177,4 @@ main@0195ed7 + core@b6c6fb0 + ui@7892ac3 + pipeline@cad3ea2（clean-env，captur
 | 0.4 | 2026-10-16 | 对齐 R-13/R-14/R-15/R-17；修台架四处误判；全链集成预演 **12/12 通过**（core 0a5d25b / ui 7892ac3 / pipeline d2a3833 / main d46b41d） | 镜鉴 |
 | 0.3 | 2026-10-16 | 对齐 R-8/R-9/R-10/R-11：A5 三拆为 A5.1/A5.2/A5.3、A3 改纯 CLI `--inject high_ticket`、新增 A7.2；补 PR #3/#4 集成实测结论（2 阻塞 / 1 重要 / 1 建议） | 镜鉴 |
 | 0.5 | 2026-10-16 | 新增 A10（R-18）与 `clean_env` 复跑 A1/A7；六表改七表（D1-9 含 meta）；A9 落到 `tests/test_llm_adapter.py`；集成预演 13 条 PASS 10 / **FAIL 3（R-18 编码兜底未落地，已到 PR #3）** | 镜鉴 |
+| 0.6 | 2026-10-16 | 按 R-19 给 `verify_p0.py` / `selfcheck_core.py`补 stdio 兜底（独立脚本不过 `cli.main()`）；**clean env 全量收口：13/13 + selfcheck 96/0 + pytest 35 passed，rc 全 0** | 镜鉴 |
