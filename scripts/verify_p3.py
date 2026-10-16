@@ -652,8 +652,17 @@ def check_a23(ctx: Ctx, c: Check) -> None:
         return
     first = by_status["pending"]
 
-    # R-34：acks.yaml 冻结形状先断（坏输入不许被静默吞掉），再走正常承认流程
-    _r34_acks_schema(ctx, c, db)
+    # R-34：acks.yaml 冻结形状先断（坏输入不许被静默吞掉）——**用独立库**，
+    # 免得「坏形状被静默接受」时顺手改掉主库状态、把后面的幂等/留痕断言带红。
+    schema_db = _fastlane_db(ctx, c, "a23-acks")
+    if schema_db is not None:
+        ctx.cli("fastlane", "plan", "--round", "1", "--files", "src/kfpa/gates.py", db=schema_db)
+        _r34_acks_schema(ctx, c, schema_db)
+        # 坏形状若被静默接受，主库状态会漂；这里独立记一条「有没有被改」
+        rows_before = len(_fastlane_rows(schema_db))
+        c.add(ok=rows_before >= 1,
+              note=f"A23：acks 坏形状探针用独立库（{schema_db.name}），行数 = {rows_before}，"
+                   "不污染主断言")
 
     ack = ctx.cli("fastlane", "ack", first["request_id"], "--by", "reviewer", db=db)
     c.add(cmd=ack["cmd"], rc=ack["rc"], stdout=ack["stdout"], stderr=ack["stderr"],
