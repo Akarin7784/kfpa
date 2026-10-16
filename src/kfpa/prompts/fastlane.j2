@@ -1,0 +1,32 @@
+{# 快车道微型规格模板（D5 §2 / §3.2）。变量：request, package, reasons #}
+# 快车道微型规格 · {{ request.request_id }}
+
+> 轮次：第 {{ request.round_no }} 轮｜状态：{{ request.status.value }}
+> 判据：new_interface={{ request.new_interface }}｜new_data_model={{ request.new_data_model }}｜
+> touched_modules={{ request.touched_modules | join('、') if request.touched_modules else '（无）' }}
+
+## 变更一句话
+
+{{ request.summary or '（缺摘要）' }}
+
+## 改动文件（R-23 三来源：执行器产出 → --files → no_diff_source）
+
+{% for item in request.diff_files %}
+- {{ item }}
+{% else %}
+- ⚠ no_diff_source：拿不到本轮改动清单，**不判快车道**，升级回完整设计回合（R-23.2）
+{% endfor %}
+
+## 不满足的三判据（任一非空 → ESCALATED）
+
+{% for item in reasons %}
+- {{ item }}
+{% else %}
+- 无（三判据全真，可攒批承认后直跑）
+{% endfor %}
+
+{% if package is not none %}
+## 目标（取自本轮任务包）
+
+{{ package.goal or '（缺段）' }}
+{% endif %}
