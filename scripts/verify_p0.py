@@ -536,6 +536,25 @@ def check_a3(ctx: Ctx, c: Check) -> None:
         c.add(ok=False, note=f"get_ticket 异常：{type(exc).__name__}: {exc}")
         c.fail("Store.get_ticket 接口不可用（§3.2）。")
 
+    # A3 兜底路径（磐石称拦停有「进编排前」与「跑完再兜」两条）：设计文本自带 HIGH 票、不注入
+    hi_design = ctx.root / "examples/design-r1-high-ticket.md"
+    if hi_design.exists():
+        dbh = ctx.fresh_db("a3-fallback")
+        ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(dbh)])
+        evh = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(hi_design),
+                       "--round", "3", "--dry-run", "--db", str(dbh),
+                       "--workdir", str(ctx.tmp / "a3-fallback-work")])
+        blobh = evh["stdout"] + evh["stderr"]
+        c.add(cmd=evh["cmd"], rc=evh["rc"], stdout=evh["stdout"], stderr=evh["stderr"],
+              ok=evh["rc"] == EXIT_CONFIRM,
+              note="A3 兜底路径：设计文本自带未关闭 HIGH 票（不用 --inject）也必须拦停 → 退出码 3")
+        if evh["rc"] != EXIT_CONFIRM:
+            c.fail(f"A3：不带 --inject 的兜底拦停失效（rc={evh['rc']}，期望 3）—— "
+                   "拦停不能只挂在 `--inject high_ticket` 这条通路上。")
+        c.add(ok=cjk(blobh), note="A3 兜底路径：拒绝理由同样必须是中文")
+    else:
+        c.warn("树里没有 examples/design-r1-high-ticket.md，A3 的「不注入兜底」路径本轮未验。")
+
 
 # ------------------------------------------------------------------ A4
 
