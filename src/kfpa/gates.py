@@ -131,7 +131,7 @@ def _summary(text: str | None) -> str:
 
 # ---------------------------------------------------------------- G7 覆盖率（P1 D3-3.3）
 
-#: R-22.4 冻结的核心模块白名单：只有这些文件的行覆盖率算 G7 门槛。
+#: R-22.4 冻结的核心模块白名单（**R-32 修订**：拆出「纯逻辑」与「需外部服务」两类）。
 #: 不含 `ui/**`、`executor.py`（适配器）、`scripts/**`；全仓库行覆盖不作为门槛。
 CORE_COVERAGE_FILES: tuple[str, ...] = (
     "src/kfpa/schemas.py",
@@ -139,9 +139,17 @@ CORE_COVERAGE_FILES: tuple[str, ...] = (
     "src/kfpa/cli.py",
     "src/kfpa/gates.py",
     "src/kfpa/pipeline.py",
+    "src/kfpa/review.py",
+    "src/kfpa/eval.py",
 )
 #: 白名单目录前缀（`store/**`）
-CORE_COVERAGE_PREFIXES: tuple[str, ...] = ("src/kfpa/store/",)
+CORE_COVERAGE_PREFIXES: tuple[str, ...] = (
+    "src/kfpa/store/",
+    "src/kfpa/store",
+)
+#: R-32：需要外部服务（PG/Docker）的模块**不计入 clean env 的 G7 门槛**，
+#: 其覆盖由 A12 双库对拍保证；有 Docker 时由 A20b 单独报告。
+CORE_COVERAGE_EXCLUDES: tuple[str, ...] = ("src/kfpa/store/postgres.py",)
 
 
 def _norm_cov_path(value: str) -> str:
@@ -149,8 +157,10 @@ def _norm_cov_path(value: str) -> str:
 
 
 def in_core_coverage_scope(path: str) -> bool:
-    """该文件是否计入 G7 门槛（R-22.4 白名单）。"""
+    """该文件是否计入 G7 门槛（R-22.4 白名单 + R-32 排除需外部服务的模块）。"""
     normal = _norm_cov_path(path)
+    if any(normal == _norm_cov_path(item) for item in CORE_COVERAGE_EXCLUDES):
+        return False
     return normal in CORE_COVERAGE_FILES or any(
         normal.startswith(prefix) for prefix in CORE_COVERAGE_PREFIXES
     )
