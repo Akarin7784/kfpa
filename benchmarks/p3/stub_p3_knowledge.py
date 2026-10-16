@@ -78,15 +78,34 @@ class FakeStore:
     def get_fastlane_request(self, request_id: str):
         return self.requests.get(request_id)
 
-    def list_fastlane_requests(self, status=None):
+    def list_fastlane_requests(self, status=None, round_no=None):
         items = list(self.requests.values())
         if status:
             items = [r for r in items if r.status.value == status]
-        return items
+        if round_no is not None:
+            items = [r for r in items if int(r.round_no) == int(round_no)]
+        return sorted(items, key=lambda r: (int(r.round_no), str(r.request_id)))
 
     def update_fastlane_request(self, request: FastlaneRequest) -> FastlaneRequest:
         self.requests[request.request_id] = request
         return request
+
+    def ack_fastlane_request(self, request_id: str, *, by="", status=FastlaneStatus.APPROVED,
+                             batch_id="", note="", now=None) -> FastlaneRequest:
+        """磐石 `p3/store` 的冻结写入口：幂等 + 不可翻案都在存储层（D5 §3.2）。"""
+        row = self.requests.get(request_id)
+        if row is None:
+            raise KeyError(f"快车道请求不存在：{request_id}")
+        if row.decided_by:  # 已决行原样返回，不抹首次留痕
+            return row
+        row.status = status
+        row.decided_by = str(by or "") or "unknown"
+        row.decided_at = float(now if now is not None else 999.0)
+        if batch_id:
+            row.batch_id = str(batch_id)
+        if note:
+            row.note = str(note)
+        return row
 
     # ---- knowledge
     def add_candidate(self, candidate: KnowledgeCandidate) -> None:
@@ -138,13 +157,72 @@ class FakeStore:
         return "fake-hash"
 
 
+class FakeStoreLegacy(FakeStore):
+    """模拟没有 `ack_fastlane_request` 的老库/桩：本模块退回本地改写 + update。"""
+
+    ack_fastlane_request = None
+
+
+class FakeStoreStrictAck(FakeStore):
+    """模拟磐石真实签名：`ack_fastlane_request(id, *, by, status, batch_id, note)` **没有 now**。"""
+
+    def ack_fastlane_request(self, request_id, *, by="", status=FastlaneStatus.APPROVED,
+                             batch_id="", note=""):
+        row = self.requests.get(request_id)
+        if row is None:
+            raise KeyError(f"快车道请求不存在：{request_id}")
+        if row.decided_by:
+            return row
+        row.status = status
+        row.decided_by = by or "unknown"
+        row.decided_at = 1234.0        # 存储层自己的审计时点
+        if batch_id:
+            row.batch_id = batch_id
+        if note:
+            row.note = note
+        return row
+
+
+class GroupProxy:
+    """模拟磐石 `cli.py` 的 `_GroupProxy`：`add_parser("fastlane")` 并进已存在的组。"""
+
+    def __init__(self, real, existing_parser) -> None:
+        self._real = real
+        self._existing = existing_parser
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def add_parser(self, name, **kwargs):
+        if name == "fastlane":
+            return self._existing
+        return self._real.add_parser(name, **kwargs)
+
+
 def make_cli(order="impact_first"):
-    """按 cli.py 的挂载方式建解析器；两种顺序都要能用（见 `_fastlane_group`）。"""
+    """按 cli.py 的挂载方式建解析器；三种挂载形态都要能用（见 `_fastlane_group`）。
+
+    - `impact_first`：过渡期 `impact` 先建 `fastlane` 组（P1 语义）；
+    - `fastlane_first`：R-34 前的反序（`impact` 报冲突被 cli 吞掉）；
+    - `fastlane_only`：**R-34 终态**——只有 `kfpa.fastlane` 注册 `fastlane`；
+    - `proxy`：磐石的 `_GroupProxy` 把 `add_parser("fastlane")` 并进已有组。
+    """
     parser = argparse.ArgumentParser(prog="kfpa")
     sub = parser.add_subparsers(dest="command")
     modules = [impact, fastlane, knowledge, rag]
     if order == "fastlane_first":
         modules = [fastlane, impact, knowledge, rag]
+    if order == "fastlane_only":
+        modules = [fastlane, knowledge, rag]
+    if order == "proxy":
+        impact.register(sub)
+        existing = sub._name_parser_map["fastlane"]
+        modules = []
+        for module in (fastlane, knowledge, rag):
+            try:
+                module.register(GroupProxy(sub, existing) if module is fastlane else sub)
+            except Exception:  # noqa: BLE001
+                pass
     for module in modules:
         try:
             module.register(sub)
@@ -366,6 +444,16 @@ def run_fastlane() -> None:
     names_rev = fastlane_group_names(parser_rev)
     expect("顺序 B：fastlane 先注册 → 仍六子命令（impact 报冲突被 cli 吞掉）",
            names_rev == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_rev))
+    names_only = fastlane_group_names(make_cli("fastlane_only"))
+    expect("R-34 终态：只有 kfpa.fastlane 注册 → 六子命令齐全（含 check）",
+           names_only == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_only))
+    proxy_parser = make_cli("proxy")
+    names_proxy = fastlane_group_names(proxy_parser)
+    expect("磐石 _GroupProxy 并入既有组 → 六子命令、不重复建组",
+           names_proxy == ["ack", "batch-ack", "check", "list", "plan", "show"], str(names_proxy))
+    proxy_args = proxy_parser.parse_args(["fastlane", "plan", "--round", "1"])
+    expect("_GroupProxy 下 plan 能解析到 handler",
+           proxy_args.fastlane_cmd == "plan" and proxy_args.round_no == 1)
     check_args = parser_rev.parse_args(["fastlane", "check", "--round", "1"])
     expect("顺序 B 下 `check` 仍可解析（R-24.3 功能不丢）", check_args.fastlane_cmd == "check")
 
@@ -838,6 +926,49 @@ def run_fastlane_cli() -> None:
                rc_check_empty == 0 and "还没有任务包" in out_check_empty.getvalue())
     finally:
         fastlane._store_for = original
+
+    # R-34：check 唯一 owner 下 fast_lane=False 的行为必须与 P1 一致（提示升级、rc=0）
+    parser_check = make_cli("fastlane_only")
+    check_store = FakeStore()
+    check_store.packages[1] = TaskPackage(round_no=1, feature="f", goal="g",
+                                          acceptance=[], boundaries=["b"],
+                                          interface_contract=["i"], prohibitions=["p"])
+    original_store_for = fastlane._store_for
+    fastlane._store_for = lambda _db: check_store
+    try:
+        args_false = parser_check.parse_args(["fastlane", "check", "--round", "1",
+                                              "--files", "src/kfpa/schemas.py", "--db", "x"])
+        with redirect_stdout(io.StringIO()) as out_false:
+            rc_false = args_false.handler(args_false)
+        expect("R-34：check 唯一 owner 下 fast_lane=False → rc=0 + 「升级」提示",
+               rc_false == 0 and "升级回完整设计回合" in out_false.getvalue(),
+               out_false.getvalue()[:60])
+    finally:
+        fastlane._store_for = original_store_for
+
+    # 存储层写入口优先：带 now 的桩（台架可复现）
+    storage_store = FakeStore()
+    storage_store.add_fastlane_request(
+        FastlaneRequest(request_id="fl-16-1", round_no=16, summary="s"))
+    stored_ack = fastlane.ack(storage_store, "fl-16-1", "qa", now=16.0)
+    expect("ack 走存储层写入口 `ack_fastlane_request`（now 透传）",
+           stored_ack.status is FastlaneStatus.APPROVED and stored_ack.decided_at == 16.0
+           and storage_store.get_fastlane_request("fl-16-1").decided_by == "qa")
+
+    # 磐石真实签名没有 now → 自动去掉再试（审计时点由存储层给）
+    strict = FakeStoreStrictAck()
+    strict.add_fastlane_request(FastlaneRequest(request_id="fl-18-1", round_no=18, summary="s"))
+    strict_ack = fastlane.ack(strict, "fl-18-1", "qa", now=18.0)
+    expect("存储层签名无 now → 自动重试成功（审计时点归存储层）",
+           strict_ack.status is FastlaneStatus.APPROVED and strict_ack.decided_at == 1234.0
+           and strict_ack.decided_by == "qa")
+
+    # 老库/桩没有 ack_fastlane_request → 本地改写 + update 兜底
+    legacy = FakeStoreLegacy()
+    legacy.add_fastlane_request(FastlaneRequest(request_id="fl-17-1", round_no=17, summary="s"))
+    legacy_ack = fastlane.ack(legacy, "fl-17-1", "qa", now=17.0)
+    expect("没有 ack_fastlane_request 的库 → 兜底 update 路径仍可承认",
+           legacy_ack.status is FastlaneStatus.APPROVED and legacy_ack.decided_at == 17.0)
 
     # micro_spec 模板缺失时的纯文本兜底
     original_render = pipeline._render

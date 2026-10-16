@@ -227,13 +227,51 @@ def next_batch_id(store: Any, round_no: int, *, prefix: str = "flb") -> str:
 # ---------------------------------------------------------------- 攒批承认状态机
 
 
-def _decide(
-    store: Any, request: FastlaneRequest, *, by: str, batch_id: str, now: Optional[float] = None
+def _persist_decision(
+    store: Any,
+    request: FastlaneRequest,
+    *,
+    status: FastlaneStatus,
+    by: str,
+    batch_id: str = "",
+    note: str = "",
+    now: Optional[float] = None,
 ) -> FastlaneRequest:
-    request.status = FastlaneStatus.APPROVED
-    request.decided_by = str(by or "").strip() or "unknown"
-    request.decided_at = float(now if now is not None else time.time())
-    request.batch_id = str(batch_id or "").strip()
+    """把一次人工决定写进存储（磐石 `p3/store` 的冻结方法优先）。
+
+    - 优先 `store.ack_fastlane_request(id, by=…, status=…, batch_id=…, note=…)`：**幂等与
+      「不可翻案」在存储层实现**（二次承认原样返回首次记录，`ESCALATED/REJECTED` 翻不成
+      `APPROVED`），本模块的状态检查只是更早的中文反馈。
+    - 老库/桩没有该方法时退回「本地改写 + `update_fastlane_request`」（P2 期桩兼容）。
+    - `now` 只在显式传入（可复现的台架）时透传；真实 store 不接受就自动去掉。
+    """
+    decided_by = str(by or "").strip() or "unknown"
+    decided_at = float(now if now is not None else time.time())
+    writer = getattr(store, "ack_fastlane_request", None)
+    if callable(writer):
+        payload = {"by": decided_by, "status": status, "batch_id": batch_id, "note": note}
+        result: Any = None
+        for attempt in ([{**payload, "now": decided_at}, payload] if now is not None else [payload]):
+            try:
+                result = writer(request.request_id, **attempt)
+                break
+            except TypeError:  # 真实 store 的签名没有 now
+                continue
+            except Exception:  # noqa: BLE001 - 存储层自己的错误（KeyError 等）交给调用方
+                result = None
+                break
+        if isinstance(result, FastlaneRequest):
+            return result
+        stored = get_request(store, request.request_id)
+        if stored is not None:
+            return stored
+    request.status = status
+    request.decided_by = decided_by
+    request.decided_at = decided_at
+    if batch_id:
+        request.batch_id = str(batch_id).strip()
+    if note:
+        request.note = str(note).strip()
     return update_request(store, request)
 
 
@@ -265,9 +303,10 @@ def ack(
             f"（原因：{'、'.join(escalate_reasons(request)) or '人工拒绝'}）"
             " → 要再走快车道必须新开一条请求（R-23/D5 §3.2）"
         )
-    return _decide(
+    return _persist_decision(
         store,
         request,
+        status=FastlaneStatus.APPROVED,
         by=by,
         batch_id=batch_id or next_batch_id(store, request.round_no, prefix=f"flb-{request_id}"),
         now=now,
@@ -288,12 +327,9 @@ def reject(
         )
     if request.status is FastlaneStatus.REJECTED and request.decided_by:
         return request  # 幂等
-    request.status = FastlaneStatus.REJECTED
-    request.decided_by = str(by or "").strip() or "unknown"
-    request.decided_at = float(now if now is not None else time.time())
-    if note:
-        request.note = str(note).strip()
-    return update_request(store, request)
+    return _persist_decision(
+        store, request, status=FastlaneStatus.REJECTED, by=by, note=note, now=now
+    )
 
 
 def _extract_ids(payload: Any) -> list[str]:
@@ -631,7 +667,7 @@ def _cmd_show(args: Any) -> int:
     return EXIT_OK
 
 
-#: `impact.register()` 在 P1 已经建过 `fastlane` 组（`check` 在里面）；本模块复用它。
+#: R-34：`kfpa fastlane` 组唯一 owner 是本模块（`check` 也由这里注册，内部转 `impact.analyze`）。
 _FASTLANE_HELP = "快车道：三判据（`check`）+ 登记与攒批承认落库（D5 §3.2）"
 
 
@@ -642,20 +678,28 @@ def _subparsers_of(parser: Any) -> Optional[argparse._SubParsersAction]:
     return None
 
 
-def _fastlane_group(subparsers: Any) -> argparse._SubParsersAction:
-    """拿到 `fastlane` 子命令组：已存在（impact 先注册）就复用，否则新建。
+def _fastlane_group(subparsers: Any) -> Any:
+    """拿到 `fastlane` 子命令组，三种情形都收敛到同一个组：
 
-    argparse 不允许同名子命令组注册两次，所以两个模块必须共用同一个组；顺序无关，
-    哪种顺序都不会丢掉 `check`（缺失时本模块补一个等价实现，见 `_cmd_check`）。
+    1. **R-34：本模块是唯一 owner** → `subparsers.add_parser("fastlane")` 新建；
+    2. 磐石 `cli.py` 的 `_GroupProxy` 把 `add_parser("fastlane")` 并进已存在的组 → 返回的
+       parser 可能已经有 `_SubParsersAction`，**直接复用，不再 add_subparsers 第二次**
+       （同一个 parser 上建两个子解析器会让后建的那个独吞分派）；
+    3. 过渡期 `impact.register()` 仍先注册（P1 语义）→ 从 `_name_parser_map` 取现成组复用。
+
+    任一情形下 `check` 都必须在（正常由本模块注册 `_cmd_check`，见 `register()`）。
     """
-    name_map = getattr(subparsers, "_name_parser_map", {})
+    name_map = getattr(subparsers, "_name_parser_map", None)
     existing = name_map.get("fastlane") if isinstance(name_map, dict) else None
     if existing is not None:
         group = _subparsers_of(existing)
-        if group is not None:
-            return group
-        return existing.add_subparsers(dest="fastlane_cmd", required=True)
+        return group if group is not None else existing.add_subparsers(
+            dest="fastlane_cmd", required=True
+        )
     parser = subparsers.add_parser("fastlane", help=_FASTLANE_HELP)
+    group = _subparsers_of(parser)
+    if group is not None:  # `_GroupProxy` 并入既有组时，组已经建好
+        return group
     return parser.add_subparsers(dest="fastlane_cmd", required=True)
 
 
@@ -685,12 +729,12 @@ def _cmd_check(args: Any) -> int:
 
 
 def register(subparsers: Any) -> None:  # pragma: no cover - 由 cli.py 挂载
-    """注册 `kfpa fastlane plan|list|ack|batch-ack|show`（+ 复用 impact 的 `check`）。"""
+    """注册 `kfpa fastlane check|plan|list|ack|batch-ack|show`（**R-34：本模块唯一 owner**）。"""
     group = _fastlane_group(subparsers)
     names = getattr(group, "_name_parser_map", {})
 
-    if "check" not in names:  # 正常顺序下 impact 已建；顺序反过来时兜底，功能等价
-        check = group.add_parser("check", help="对某轮任务包做三判据影响分析（R-23.2）")
+    if "check" not in names:  # R-34：check 由本模块注册；过渡期 impact 已建组时跳过
+        check = group.add_parser("check", help="对某轮任务包做三判据影响分析（R-23.2 / D3-3.6）")
         check.add_argument("--round", dest="round_no", type=int, required=True)
         check.add_argument("--db", default="kfpa.db")
         check.add_argument("--files", default=None, help="逗号分隔的改动文件清单（来源②）")
