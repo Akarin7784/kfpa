@@ -573,6 +573,30 @@ def _stage_tickets(store: "Store", llm: "LLM", round_no: int, design_text: str) 
     return all_tickets
 
 
+def _scoped_avoid_patterns(store: "Store", round_no: int) -> list[str]:
+    """R-28：回灌区只取「本轮已发生的失败」+「上一轮（N-1）的失败」。
+
+    - 本轮：同轮重试必须回灌上一次失败原因（design.md §5.3「失败原因必须回灌新任务包」）；
+    - 上一轮：跨轮回灌（spec.md §5.2 原文「回灌区：**上一轮**失败原因与规避要求」）；
+    - **禁止全库历史**：那会让 `package_hash` 随库的历史增长而漂移——共享库（PG）与全新库（SQLite）
+      对同一轮给出不同 hash，A12 双库对拍必然假红（镜鉴实测过这条）。
+    """
+    patterns: list[str] = []
+    for scope in (round_no, round_no - 1):
+        if scope < 1:
+            continue
+        try:
+            patterns.extend(str(p) for p in store.list_avoid_patterns(scope))
+        except Exception:  # pragma: no cover - 老库/桩缺该方法时退回空清单
+            continue
+    seen: list[str] = []
+    for item in patterns:
+        text = item.strip()
+        if text and text not in seen:
+            seen.append(text)
+    return seen
+
+
 def _stage_package(
     store: "Store",
     llm: "LLM",
@@ -584,9 +608,9 @@ def _stage_package(
     avoid = (
         [str(p) for p in avoid_patterns]
         if avoid_patterns is not None
-        else [str(p) for p in store.list_avoid_patterns()]
+        else _scoped_avoid_patterns(store, round_no)
     )
-    _log(f"[4/6] 任务包生成：六段式，回灌区注入 {len(avoid)} 条历史失败模式")
+    _log(f"[4/6] 任务包生成：六段式，回灌区注入 {len(avoid)} 条本轮/上一轮失败模式")
     package = build_task_package(round_no, design_text, tickets, llm, avoid)
     store.save_package(package)
     return package
@@ -792,7 +816,7 @@ def build_graph(
         return "finalize" if state.get("open_high") else "build_package"
 
     def n_build_package(state: RoundGraphState) -> dict:
-        avoid = [str(p) for p in store.list_avoid_patterns()]
+        avoid = _scoped_avoid_patterns(store, int(state["round_no"]))
         package = _stage_package(
             store,
             llm,
@@ -830,7 +854,10 @@ def build_graph(
         report = _stage_gate(
             store, package, exec_result, int(state.get("attempt", 1)), coverage_report
         )
-        return {"gate": report, "avoid_patterns": [str(p) for p in store.list_avoid_patterns()]}
+        return {
+            "gate": report,
+            "avoid_patterns": _scoped_avoid_patterns(store, int(state["round_no"])),
+        }
 
     def route_gate(state: RoundGraphState) -> str:
         report = state.get("gate")
@@ -872,7 +899,7 @@ def build_graph(
         if report is not None and report.state is GateState.NEEDS_FIX:
             attempt = int(state.get("attempt", 1))
             if package is not None:  # 终止前补齐回灌区（失败必回灌，D1-11）
-                avoid = [str(p) for p in store.list_avoid_patterns()]
+                avoid = _scoped_avoid_patterns(store, round_no)
                 package.feedback = avoid or [
                     f"第 {attempt} 次尝试失败：{'；'.join(report.reasons)}"
                 ]
