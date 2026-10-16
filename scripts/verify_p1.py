@@ -64,6 +64,8 @@ DEFAULT_PG_PORT = "55440"
 FORBIDDEN_PG_PORTS = ("55432", "55433", "55434")
 #: R-22.2：checkpoint 落盘口径（冻结）
 CHECKPOINT_FILE = "checkpoints.sqlite"
+#: A12 对拍专用轮次：不碰别人已有的第 1..n 轮数据，只比这一轮
+PROBE_ROUND = 91
 
 #: P0 七表 + P1 两表（D3 §3.2）
 P1_TABLES = ("rounds", "tickets", "task_packages", "gate_reports", "failures",
@@ -166,6 +168,19 @@ def import_mod(name: str):
         return importlib.import_module(name), None
     except Exception as exc:  # noqa: BLE001
         return None, f"{type(exc).__name__}: {exc}"
+
+
+def make_store_for(store_mod, db) -> object:
+    """兼容两种 Store 工厂形态：P0 的 `Store(path)` 与 P1 的 `make_store(dsn)`（D3 §3.2）。"""
+    factory = getattr(store_mod, "make_store", None)
+    if callable(factory):
+        try:
+            st = factory(str(db))
+            if st is not None:
+                return st
+        except Exception:  # noqa: BLE001
+            pass
+    return store_mod.Store(str(db))
 
 
 def cjk(text: str) -> bool:
@@ -278,7 +293,7 @@ def pg_dsn(ctx: Ctx) -> tuple[str, str]:
 PG_PROBE = r'''
 import json, sys
 import psycopg
-dsn = sys.argv[1]
+dsn, rnd = sys.argv[1], int(sys.argv[2])       # 只取本次对拍用的那一轮，避免被别人的历史行干扰
 out = {}
 with psycopg.connect(dsn, connect_timeout=5) as conn:
     with conn.cursor() as cur:
@@ -289,13 +304,13 @@ with psycopg.connect(dsn, connect_timeout=5) as conn:
             cur.execute('select count(*) from "%s"' % t)
             counts[t] = cur.fetchone()[0]
         out["counts"] = counts
-        for key, sql in (("tickets", "select ticket_id from tickets order by ticket_id"),
-                         ("gates", "select state from gate_reports order by id"),
-                         ("snapshots", "select round_no, package_hash, gate_state, tag from snapshots order by round_no"),
-                         ("ledger_roles", "select role, count(*) from ledger group by role order by role")):
+        for key, sql in (("tickets", "select ticket_id from tickets where round_no = %s order by ticket_id"),
+                         ("gates", "select state from gate_reports where round_no = %s order by id"),
+                         ("snapshots", "select round_no, package_hash, gate_state, tag from snapshots where round_no = %s"),
+                         ("ledger_roles", "select role, count(*) from ledger where round_no = %s group by role order by role")):
             try:
-                cur.execute(sql)
-                out[key] = [list(r) if isinstance(r, tuple) else r for r in cur.fetchall()]
+                cur.execute(sql, (rnd,))
+                out[key] = [r[0] if len(r) == 1 else list(r) for r in cur.fetchall()]
             except Exception:
                 out[key] = None
 print(json.dumps(out, ensure_ascii=False))
@@ -376,8 +391,12 @@ def check_a11(ctx: Ctx, c: Check) -> None:
           note="A11：`kfpa ledger --round 1` 期望 rc=0 且列出每角色与合计")
     if ev2["rc"] != EXIT_PASS:
         c.fail("A11：`kfpa ledger` 不可用（§3.4 CLI）。")
-    for key in ("ARCHITECT", "FLASH"):
-        c.add(ok=key in blob, note=f"ledger 输出含角色 {key}")
+    # R-24.1：账本只记录**实际发生过的** LLM 调用。mock 路径只有 ARCHITECT 有账，FLASH 允许缺席。
+    c.add(ok="ARCHITECT" in blob, note="R-24.1：ledger 输出含 ARCHITECT（mock 路径必须有的角色）")
+    if "ARCHITECT" not in blob:
+        c.fail("A11：mock 跑完一轮后 `kfpa ledger` 里没有 ARCHITECT 的账 —— 账本没接上。")
+    c.add(ok=True, note=f"R-24.1：mock 路径下 FLASH {'有' if 'FLASH' in blob else '无'}账"
+                        "（MockExecutor 不调 LLM，允许缺席，不作失败）")
 
     ev3 = ctx.run([ctx.python, "-m", "kfpa", "ledger", "--round", "1", "--json", "--db", str(db)])
     data = last_json_line(ev3["stdout"])
@@ -386,6 +405,28 @@ def check_a11(ctx: Ctx, c: Check) -> None:
     if data is not None:
         joined = json.dumps(data, ensure_ascii=False)
         c.add(ok="total" in joined.lower(), note=f"ledger --json 含合计字段：{joined[:200]}")
+
+    # R-24.1：FLASH 的记账能力用**直接注入**验（不许为了让台架变绿而让 mock 凭空产生 LLM 调用）
+    try:
+        store_mod2, s2err = import_mod("kfpa.store")
+        if store_mod2 is None:
+            raise RuntimeError(f"kfpa.store 不可导入：{s2err}")
+        sc, sc_err = import_mod("kfpa.schemas")
+        if sc is None:
+            raise RuntimeError(f"kfpa.schemas 不可导入：{sc_err}")
+        stx = make_store_for(store_mod2, db)
+        stx.add_ledger_entry(sc.LedgerEntry(round_no=1, role="FLASH", model_ref="probe/flash",
+                                            tokens_in=7, tokens_out=5, cost=0.0, source="mock"))
+        evf = ctx.run([ctx.python, "-m", "kfpa", "ledger", "--round", "1", "--db", str(db)])
+        blobf = evf["stdout"] + evf["stderr"]
+        c.add(cmd=evf["cmd"], rc=evf["rc"], stdout=evf["stdout"], stderr=evf["stderr"],
+              ok=evf["rc"] == EXIT_PASS and "FLASH" in blobf,
+              note="R-24.1：直接注入一条 FLASH 账后，`kfpa ledger` 必须能看到 FLASH")
+        if "FLASH" not in blobf:
+            c.fail("R-24.1：注入 FLASH 账后 `kfpa ledger` 仍看不到 FLASH —— 角色聚合有漏。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"FLASH 注入用例异常：{type(exc).__name__}: {exc}")
+        c.fail("R-24.1：FLASH 注入路径不可用（`Store.add_ledger_entry` / `kfpa ledger`）。")
 
     # model_ref 必须来自 config（不写死）；estimate_tokens 确定性
     ledger_mod, lerr = import_mod("kfpa.ledger")
@@ -447,6 +488,16 @@ def check_a12(ctx: Ctx, c: Check) -> None:
     except Exception as exc:  # noqa: BLE001
         c.add(ok=False, note=f"读 compose 失败：{type(exc).__name__}: {exc}")
 
+    # R-24.2：compose 不许用固定 `container_name`（固定全局名会让多 clone/多人互相撞名）
+    try:
+        has_fixed_name = re.search(r"^\s*container_name\s*:", text, re.M) is not None
+        c.add(ok=not has_fixed_name,
+              note=f"R-24.2：compose 里有固定 container_name = {has_fixed_name}（必须 False）")
+        if has_fixed_name:
+            c.fail("R-24.2：compose 仍带 `container_name` —— 同机第二个工作树会直接撞名起不来（磐石）。")
+    except Exception as exc:  # noqa: BLE001
+        c.add(ok=False, note=f"R-24.2 检查异常：{type(exc).__name__}: {exc}")
+
     # R-22.1：端口口径（55440 默认；55432-55434 禁用）
     port, perr = pg_host_port()
     c.add(ok=not perr, note=f"A12：PG 宿主端口 = {port}（R-22.1：KFPA_PG_PORT 优先、默认 {DEFAULT_PG_PORT}）"
@@ -455,76 +506,49 @@ def check_a12(ctx: Ctx, c: Check) -> None:
         c.fail(f"A12：{perr} —— 台架不得在 55432/55433/55434 上起 KFPA 的 PG。")
         return
     compose_env = {"KFPA_PG_PORT": port}
+    project = "kfpa-verify-a12"      # R-24.2：台架必须用独立项目名，down 只清自己那一栈
 
-    # 同机多人协作保护：端口上已经有可用的 PG（别人的实例）时，不启动、不写入，显式 SKIP
-    warm = ctx.run([ctx.python, "-c",
-                    "import psycopg,sys;"
-                    "c=psycopg.connect(sys.argv[1],connect_timeout=3);cur=c.cursor();"
-                    "cur.execute(\"select count(*) from information_schema.tables "
-                    "where table_schema='public'\");print(cur.fetchone()[0]);c.close()",
-                    pg_dsn(ctx)[0]], timeout=60)
-    if warm["rc"] == 0:
-        c.skip(f"端口 {port} 上已有可用的 PG（public 表数 = {warm['stdout'].strip()}）——"
-               f"为避免与同机他人的实例互相写入，本次不启动 compose、不写入数据。"
-               f"请用 `KFPA_PG_PORT=<独占端口>` 重跑 A12。")
-        c.warn("R-22.1 只统一了默认端口；同机多人同时验 A12 时需要各自指定独占端口"
-               "（或让 compose 去掉固定 `container_name`，否则容器名也会撞）。")
-        return
+    # R-24.2：优先复用已在跑的 KFPA PG（KFPA_DB_URL 指的那套优先），有则不起栈
+    def _pg_tables(conn_dsn: str) -> int:
+        p = ctx.run([ctx.python, "-c",
+                     "import psycopg,sys;c=psycopg.connect(sys.argv[1],connect_timeout=3);"
+                     "cur=c.cursor();cur.execute(\"select count(*) from information_schema.tables "
+                     "where table_schema='public'\");print(cur.fetchone()[0]);c.close()",
+                     conn_dsn], timeout=60)
+        return int(p["stdout"].strip()) if p["rc"] == 0 and p["stdout"].strip().isdigit() else -1
 
-    # 先记录「本来是否已起」——已起则不负责关
-    pre = ctx.run(["docker", "compose", "-f", str(compose), "ps", "-q"], timeout=60,
-                  env_over=compose_env)
-    started_here = not (pre["stdout"] or "").strip()
+    env_dsn = (os.environ.get("KFPA_DB_URL") or "").strip()
+    base_dsn = pg_dsn(ctx)[0]
+    reused_dsn = ""
+    if env_dsn:
+        n = _pg_tables(env_dsn)
+        if n >= 0:
+            reused_dsn = env_dsn
+            c.add(ok=True, note=f"R-24.2：复用 `KFPA_DB_URL` 指向的 PG（public 表数 = {n}，不起栈）")
+    if not reused_dsn:
+        n = _pg_tables(base_dsn)
+        if n >= 0:
+            reused_dsn = base_dsn
+            c.add(ok=True, note=f"R-24.2：端口 {port} 上已有可用 KFPA PG（public 表数 = {n}，复用、不起栈）")
 
-    up = ctx.run(["docker", "compose", "-f", str(compose), "up", "-d", "--wait"],
-                 timeout=420, env_over=compose_env)
-    c.add(cmd=up["cmd"] + f"    [KFPA_PG_PORT={port}]", rc=up["rc"], stdout=up["stdout"],
-          stderr=up["stderr"], ok=up["rc"] == 0,
-          note=f"A12：起 PG（compose，宿主端口 {port}，R-22.1）")
-    throwaway = ""
-    if up["rc"] != 0:
-        up_msg = (up["stderr"] or "") + (up["stdout"] or "")
-        if "already in use" in up_msg or "Conflict" in up_msg:
-            c.fail("A12/R-22：compose 的 `container_name: kfpa-pg` 是**全局容器名**，与别人的实例"
-                   "（同机另一位的 `kfpa-pg`）撞名 —— 磐石请去掉 `container_name`（让 compose 用"
-                   "项目前缀命名），否则同一台机上只能有一个人起 KFPA 的 PG，与「一人一工作树」冲突。")
-            # 不动别人的容器：用一次性独立容器在同一个端口上继续做双库对拍
-            cfg = _compose_pg_env(ctx)
-            throwaway = f"kfpa-verify-pg-{os.getpid()}"
-            run = ctx.run(["docker", "run", "-d", "--rm", "--name", throwaway,
-                           "-p", f"{port}:5432",
-                           "-e", f"POSTGRES_USER={cfg['user']}",
-                           "-e", f"POSTGRES_PASSWORD={cfg['pwd']}",
-                           "-e", f"POSTGRES_DB={cfg['db']}",
-                           "postgres:16-alpine"], timeout=300)
-            c.add(cmd=run["cmd"], rc=run["rc"], stdout=run["stdout"], stderr=run["stderr"],
-                  ok=run["rc"] == 0,
-                  note=f"A12：降级用一次性容器 {throwaway} 在 {port} 上继续对拍（不碰他人容器）")
-            if run["rc"] != 0:
-                c.fail("A12：一次性 PG 容器也起不来，本轮无法对拍。")
-                return
-            # 等就绪
-            ready = False
-            for _ in range(30):
-                probe = ctx.run([ctx.python, "-c", "import psycopg,sys;"
-                                 "psycopg.connect(sys.argv[1], connect_timeout=2).close()",
-                                 pg_dsn(ctx)[0]], timeout=30)
-                if probe["rc"] == 0:
-                    ready = True
-                    break
-                import time as _t
-                _t.sleep(2)
-            c.add(ok=ready, note=f"A12：一次性 PG 就绪 = {ready}")
-            if not ready:
-                c.fail("A12：一次性 PG 未就绪（30 次重试）。")
-                return
-        else:
-            c.fail("A12：`docker compose up -d --wait` 失败 —— 见上方 stderr（镜像/端口/健康检查归磐石）。")
+
+    if reused_dsn:
+        started_here = False
+    else:
+        started_here = True
+        up = ctx.run(["docker", "compose", "-p", project, "-f", str(compose),
+                      "up", "-d", "--wait"], timeout=420, env_over=compose_env)
+        c.add(cmd=up["cmd"] + f"    [KFPA_PG_PORT={port}]", rc=up["rc"], stdout=up["stdout"],
+              stderr=up["stderr"], ok=up["rc"] == 0,
+              note=f"A12：起 PG（compose -p {project}，宿主端口 {port}，R-22.1/R-24.2）")
+        if up["rc"] != 0:
+            c.fail("A12：`docker compose -p " + project + " up -d --wait` 失败 —— 见上方 stderr"
+                   "（镜像/端口/健康检查归磐石）。")
             return
 
-    dsn, derr = pg_dsn(ctx)
-    if derr:
-        c.warn(f"A12：{derr}")
+    dsn = reused_dsn or pg_dsn(ctx)[0]
+    if dsn == env_dsn and env_dsn:
+        c.add(ok=True, note="A12：本次用 `KFPA_DB_URL` 指向的 PG 对拍（R-24.2 复用优先）")
     masked = re.sub(r"://[^@]+@", "://***@", dsn)
     c.add(ok=True, note=f"A12：DSN（打码）= {masked}")
 
@@ -540,24 +564,26 @@ def check_a12(ctx: Ctx, c: Check) -> None:
         for label, env_over, extra in forms:
             work_pg = ctx.tmp / f"a12-pg-work-{len(form_used)}"
             work_pg.mkdir(parents=True, exist_ok=True)
-            # cwd 指到临时目录：万一 CLI 把 DSN 当路径用了，散落的 SQLite 文件也不会脏仓库
-            ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", *extra], env_over=env_over,
-                          cwd=ctx.tmp)
+            # cwd 指到临时目录时 CLI 找不到 config/models.yaml；`--config` 只挂在 round 子命令上
+            cfg_arg = ["--config", str(ctx.root / "config/models.yaml")]
+            ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", *extra],
+                          env_over=env_over, cwd=ctx.tmp)
             c.add(cmd=ev0["cmd"] + ("    [KFPA_DB_URL=***]" if env_over else ""),
                   rc=ev0["rc"], stdout=ev0["stdout"], stderr=ev0["stderr"],
                   ok=ev0["rc"] == EXIT_PASS, note=f"A12：PG 侧建库（形态：{label}）")
             if ev0["rc"] != EXIT_PASS:
                 continue
             ev1 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                           "--round", "1", "--dry-run", "--json", *extra,
+                           "--round", str(PROBE_ROUND), "--dry-run", "--json", *extra, *cfg_arg,
                            "--workdir", str(work_pg)], env_over=env_over, cwd=ctx.tmp)
             c.add(cmd=ev1["cmd"] + ("    [KFPA_DB_URL=***]" if env_over else ""),
                   rc=ev1["rc"], stdout=ev1["stdout"], stderr=ev1["stderr"],
-                  ok=ev1["rc"] == EXIT_PASS, note=f"A12：PG 侧跑 A2 同一命令（形态：{label}）")
+                  ok=ev1["rc"] == EXIT_PASS,
+                  note=f"A12：PG 侧跑 A2 同一命令（形态：{label}，第 {PROBE_ROUND} 轮）")
             if ev1["rc"] != EXIT_PASS:
                 continue
 
-            probe = ctx.run([ctx.python, "-c", PG_PROBE, dsn], timeout=120)
+            probe = ctx.run([ctx.python, "-c", PG_PROBE, dsn, str(PROBE_ROUND)], timeout=120)
             c.add(cmd="python -c <PG 探针>", rc=probe["rc"], stdout=probe["stdout"],
                   stderr=probe["stderr"], ok=probe["rc"] == 0, note="A12：原始读 PG 表结构")
             cand = last_json_line(probe["stdout"]) if probe["rc"] == 0 else None
@@ -577,14 +603,10 @@ def check_a12(ctx: Ctx, c: Check) -> None:
                 c.fail(f"A12：PG 缺表 {missing}（D3 §3.2：P0 七表 + ledger + knowledge）。")
     finally:
         if started_here:
-            down = ctx.run(["docker", "compose", "-f", str(compose), "down", "-v"], timeout=180,
-                           env_over=compose_env)
+            down = ctx.run(["docker", "compose", "-p", project, "-f", str(compose), "down", "-v"],
+                           timeout=180, env_over=compose_env)
             c.add(cmd=down["cmd"], rc=down["rc"], ok=down["rc"] == 0,
-                  note="A12：收尾（本次由台架起的栈，用完 down -v）")
-        if throwaway:
-            rm = ctx.run(["docker", "rm", "-f", throwaway], timeout=120)
-            c.add(cmd=rm["cmd"], rc=rm["rc"], ok=rm["rc"] == 0,
-                  note=f"A12：收尾（移除一次性容器 {throwaway}）")
+                  note=f"A12：收尾（只清自己那一栈 `-p {project}`，R-24.2；不动他人容器）")
 
     # SQLite 侧同命令 + 对拍
     db = ctx.fresh_db("a12-sqlite")
@@ -592,29 +614,55 @@ def check_a12(ctx: Ctx, c: Check) -> None:
     sq_work.mkdir(parents=True, exist_ok=True)
     ev2 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", str(db)])
     ev3 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                   "--round", "1", "--dry-run", "--json", "--db", str(db),
+                   "--round", str(PROBE_ROUND), "--dry-run", "--json", "--db", str(db),
                    "--workdir", str(sq_work)])
     c.add(cmd=ev3["cmd"], rc=ev3["rc"], stdout=ev3["stdout"], stderr=ev3["stderr"],
-          ok=ev2["rc"] == EXIT_PASS and ev3["rc"] == EXIT_PASS, note="A12：SQLite 侧同命令")
+          ok=ev2["rc"] == EXIT_PASS and ev3["rc"] == EXIT_PASS,
+          note=f"A12：SQLite 侧同命令（第 {PROBE_ROUND} 轮）")
     tables, counts, err = probe_sqlite(db)
-    sg = last_json_line(ev3["stdout"]) or {}
     c.add(ok=not err, note=f"A12：SQLite 表 = {sorted(tables)}")
+    conn = sqlite3.connect(str(db))
+    try:
+        sq_tickets = sorted(r[0] for r in conn.execute(
+            "select ticket_id from tickets where round_no = ?", (PROBE_ROUND,)).fetchall())
+        sq_snaps = [tuple(x) for x in conn.execute(
+            "select round_no, package_hash, gate_state, tag from snapshots where round_no = ?",
+            (PROBE_ROUND,)).fetchall()]
+        sq_ledger = conn.execute("select count(*) from ledger where round_no = ?",
+                                 (PROBE_ROUND,)).fetchone()[0]
+        sq_gates = [r[0] for r in conn.execute(
+            "select state from gate_reports where round_no = ? order by id", (PROBE_ROUND,)).fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        sq_tickets, sq_snaps, sq_ledger, sq_gates = [], [], -1, []
+        c.add(ok=False, note=f"A12：SQLite 侧读取第 {PROBE_ROUND} 轮失败：{exc}")
+    finally:
+        conn.close()
+    c.add(ok=bool(sq_tickets), note=f"A12：SQLite 第 {PROBE_ROUND} 轮票号 = {sq_tickets}")
     if pg is not None:
-        sq_tickets = sorted(r[0] for r in sqlite3.connect(str(db)).execute(
-            "select ticket_id from tickets").fetchall()) if "tickets" in tables else []
         pg_tickets = sorted(pg.get("tickets") or [])
         c.add(ok=sq_tickets == pg_tickets,
-              note=f"A12：票号一致 SQLite={sq_tickets} PG={pg_tickets}")
+              note=f"A12：第 {PROBE_ROUND} 轮票号一致 = {sq_tickets == pg_tickets}"
+                   f"（SQLite={sq_tickets} PG={pg_tickets}）")
         if sq_tickets != pg_tickets:
-            c.fail("A12：两库票号不一致（双驱动行为必须一致，D3 §3.2）。")
-        sq_snaps = sqlite3.connect(str(db)).execute(
-            "select round_no, package_hash, gate_state, tag from snapshots order by round_no"
-        ).fetchall() if "snapshots" in tables else []
+            c.fail("A12：两库同名轮次的票号不一致（双驱动行为必须一致，D3 §3.2）。")
         pg_snaps = [tuple(x) for x in (pg.get("snapshots") or [])]
-        c.add(ok=[tuple(x) for x in sq_snaps] == pg_snaps,
-              note=f"A12：快照一致 SQLite={sq_snaps} PG={pg_snaps}")
-        if [tuple(x) for x in sq_snaps] != pg_snaps:
-            c.fail("A12：两库快照（package_hash/gate_state/tag）不一致。")
+        c.add(ok=sq_snaps == pg_snaps,
+              note=f"A12：第 {PROBE_ROUND} 轮快照一致 = {sq_snaps == pg_snaps}"
+                   f"（SQLite={sq_snaps} PG={pg_snaps}）")
+        if sq_snaps != pg_snaps:
+            c.fail("A12：两库同名轮次的快照（package_hash/gate_state/tag）不一致。"
+                   "先查 `task_packages.payload` 的 `feedback`：实测共享库那一轮的 feedback 里混进了"
+                   "别的轮次的 `AVOID[...]` 行（负知识回灌未按轮次收口，D1-11 只要求回灌上一轮），"
+                   "空库那边没有 → 任务包内容/hash 不同。")
+        pg_ledger = pg.get("ledger_roles")
+        c.add(ok=sq_ledger > 0 and bool(pg_ledger),
+              note=f"A12：第 {PROBE_ROUND} 轮账本 SQLite={sq_ledger} 条、PG 按角色={pg_ledger}")
+        if sq_ledger <= 0 or not pg_ledger:
+            c.fail("A12：两库的 `ledger` 在同一轮上不一致（应都有记录）。")
+        pg_gates = pg.get("gates") or []
+        c.add(ok=sq_gates == pg_gates,
+              note=f"A12：第 {PROBE_ROUND} 轮门禁态一致 = {sq_gates == pg_gates}"
+                   f"（SQLite={sq_gates} PG={pg_gates}）")
 
 
 # ------------------------------------------------------------------ A13
