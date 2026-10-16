@@ -444,8 +444,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_stdio() -> None:
+    """D2 R-18：把 stdout / stderr 兜底成 UTF-8。
+
+    重定向（管道 / 文件）时 Python 用 locale 编码（本机 cp1252），任何中文 print 都会
+    抛 UnicodeEncodeError —— 连 argparse 打 `--help` 都崩。必须放在 `main()` 最前、
+    `parse_args()` 之前，这样 `--help` 与 `--json`（`ensure_ascii=False`）才都被覆盖。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # 流不支持 reconfigure 时不动它
+            pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """返回退出码；`python -m kfpa` 与 console_scripts 都走这里。"""
+    _configure_stdio()
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
