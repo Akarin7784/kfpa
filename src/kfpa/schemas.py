@@ -1,7 +1,13 @@
-"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.0）。
+"""KFPA v2 冻结数据契约（CONTRACT_VERSION 1.1）。
 
 本文件由 Chief 冻结：**任何人不得直接修改**。需要变更时在群里提，
 由 Chief 升版后统一改，改完必须同步 docs/dev/p0-plan.md §3.1。
+
+变更记录：
+- 1.0 首版冻结（QATicket / TaskPackage / GateReport / ExecResult / ...）
+- 1.1 依 docs/dev/p0-design-addendum.md D1-3 / D1-4 补齐门禁所需字段：
+      ExecResult 增加 error_category / failed_criteria / results；
+      GateReport 增加 reason_key。
 
 设计约束：
 - 只用标准库（dataclasses / enum / json / hashlib），不吃第三方依赖，
@@ -18,7 +24,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 
 # ---------------------------------------------------------------- 枚举
 
@@ -173,12 +179,20 @@ def package_hash(package: TaskPackage) -> str:
 
 @dataclass
 class ExecResult:
-    """执行器（Flash / Aider / mock）一次应用的返回。"""
+    """执行器（Flash / Aider / mock）一次应用的返回。
+
+    error_category 取值见 docs/dev/p0-design-addendum.md D1-4：
+    apply_failed / compile / test_fail / missing_section / unmapped_criterion / other
+    results：验收断言 cid -> 是否通过（门禁 G4 据此判「断言未映射」）。
+    """
 
     ok: bool
     files_changed: list[str] = field(default_factory=list)
     diff: str = ""
     error: str = ""
+    error_category: str = ""
+    failed_criteria: list[str] = field(default_factory=list)
+    results: dict[str, bool] = field(default_factory=dict)
     executor: str = "mock"
 
 
@@ -190,6 +204,7 @@ class FailureRecord:
     attempt: int
     reason: str
     avoid_pattern: str
+    reason_key: str = ""
     created_at: float = field(default_factory=time.time)
 
 
@@ -203,7 +218,8 @@ class GateReport:
     failing_criteria: list[str] = field(default_factory=list)
     attempt: int = 1
     escalated: bool = False       # 同类失败 >=2 次自动升级主BOT
-    same_reason_count: int = 0
+    same_reason_count: int = 0    # 历史同类失败次数（不含本次）
+    reason_key: str = ""          # 本次失败归一化键（PASS 时为空串）
     created_at: float = field(default_factory=time.time)
 
 

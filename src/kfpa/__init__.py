@@ -7,6 +7,6 @@
 """
 
 __version__ = "0.1.0"
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 
 __all__ = ["__version__", "CONTRACT_VERSION"]
