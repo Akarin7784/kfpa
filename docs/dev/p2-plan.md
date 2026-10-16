@@ -136,6 +136,28 @@ def render_report(metrics: ReviewMetrics, fmt: str = "json") -> str: ...
   - `agreement` = 与 `human_verdict` 一致的样本数 / total；
   - `baseline_*` 为同源 provider 的对应值（对比列）。
 - CLI：`kfpa eval review [--seed PATH] [--provider mock_hetero] [--baseline mock] [--out reports/review-eval.json]`。
+- **报告 JSON 形状（冻结，回应界面的渲染需求）**：
+
+  ```json
+  {
+    "corpus": "benchmarks/review/seed.jsonl",
+    "generated_at": 1792150000.0,
+    "provider": "mock_hetero",
+    "baseline_provider": "mock",
+    "metrics": { "corpus": "...", "total": 24, "missed": 1, "false_alarms": 0,
+                 "agreement": 0.958, "baseline_missed": 3, "baseline_false_alarms": 1,
+                 "baseline_agreement": 0.833 },
+    "samples": [
+      { "id": "S001", "human_verdict": "fail", "review_verdict": "pass",
+        "missed": true, "false_alarm": false,
+        "findings": [ { "severity": "major", "location": "段4", "issue": "…", "criterion": "AC2" } ] }
+    ]
+  }
+  ```
+
+  - `metrics` 字段名与 `schemas.ReviewMetrics` 一一对应（`passed()` 由渲染层自行判定，报告不写死结论）；
+  - `samples` 逐条给出 `missed` / `false_alarm` 布尔，渲染层**不得**自行推断漏检/误报；
+  - 缺 `baseline_*` 时判「无法判定」，**不许按 0 假设**（界面已按此实现，确认有效）。
 - **通过判据（P2）**：异构组 `missed <= baseline.missed` 且 `agreement >= baseline.agreement`
   （种子集是确定的，两组结果可复算；若同源已 0 漏检，则要求异构也 0 漏检且误报不增加）。
 
