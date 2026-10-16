@@ -186,7 +186,9 @@ def test_exception_exit_code_mapping():
     assert cli._exception_exit_code(ImportError("no litellm")) == cli.EXIT_DEP_MISSING
     assert cli._exception_exit_code(RuntimeError("未安装 streamlit")) == cli.EXIT_DEP_MISSING
     assert cli._exception_exit_code(OSError("disk")) == cli.EXIT_IO
-    assert cli._exception_exit_code(RuntimeError("其它")) == cli.EXIT_IO
+    # R-31（#48 落地后的口径）：RuntimeError = 依赖/凭据类 → 4；真正其它异常 → 5。
+    assert cli._exception_exit_code(RuntimeError("其它")) == cli.EXIT_DEP_MISSING
+    assert cli._exception_exit_code(ValueError("其它")) == cli.EXIT_IO
 
 
 def _fresh_db(directory: Path) -> Path:
