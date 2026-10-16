@@ -272,6 +272,18 @@ def cover_stats(cov: dict, *, wanted: tuple[str, ...] = COVER_WHITELIST,
     return per_file, agg
 
 
+def cover_stats_all(cov: dict) -> dict:
+    """整份报告逐文件统计（不套白名单）：G7 口径核对与 A20b 需要看门槛外的文件。"""
+    per_file: dict[str, dict] = {}
+    for path, info in (cov.get("files") or {}).items():
+        norm = str(path).replace("\\", "/").lstrip("./")
+        summary = (info or {}).get("summary") or {}
+        n = int(summary.get("num_statements", 0) or 0)
+        c = int(summary.get("covered_lines", 0) or 0)
+        per_file[norm] = {"statements": n, "covered": c, "rate": (c / n) if n else 0.0}
+    return per_file
+
+
 def cover_rate(cov: dict) -> tuple[float, list[str], int]:
     """R-32 白名单加权行覆盖率（门槛口径）；保留三元组签名兼容原调用。"""
     _, agg = cover_stats(cov)
@@ -595,33 +607,38 @@ def check_a20(ctx: Ctx, c: Check) -> None:
         if not callable(in_scope):
             c.fail("A20：gates.in_core_coverage_scope 不存在，G7 白名单无法核对。")
         else:
+            all_per = cover_stats_all(cov)
             dropped = [f for f in COVER_WHITELIST if not in_scope(f)]
             extra = [f for f in COVER_EXTERNAL_FILES if in_scope(f)]
-            g7_sel = [f for f in COVER_WHITELIST if in_scope(f)]
-            g7_cov = sum(per_file[f]["covered"] for f in g7_sel)
-            g7_stmt = sum(per_file[f]["statements"] for f in g7_sel)
-            # 产品口径还要把「多算」的文件一起算进去（它们若在报告里就是真实拉分项）
-            for f in extra:
-                g7_cov += per_file.get(f, {}).get("covered", 0)
-                g7_stmt += per_file.get(f, {}).get("statements", 0)
-            g7_rate = (g7_cov / g7_stmt) if g7_stmt else 0.0
-            c.add(ok=True, note=f"A20：产品 G7 当前口径（R-22.4 冻死）= {len(g7_sel)}+{len(extra)} 文件"
-                                f"（含 postgres={bool(extra)}）→ 行覆盖 {g7_rate:.1%}"
-                                f"（G7 判 {'PASS' if g7_rate >= COVER_THRESHOLD else 'FAIL'}）")
+
+            def _weighted(paths: list[str]) -> tuple[float, int, int]:
+                cov_n = sum(all_per[p]["covered"] for p in paths)
+                stmt_n = sum(all_per[p]["statements"] for p in paths)
+                return ((cov_n / stmt_n) if stmt_n else 0.0), cov_n, stmt_n
+
+            g7_scope = sorted(p for p in all_per if in_scope(p))
+            g7_rate, _g7_cov, _g7_stmt = _weighted(g7_scope)
+            keep = [p for p in g7_scope if p not in COVER_EXTERNAL_FILES]
+            g7_rate_kept, _kc, _ks = _weighted(keep)
+            c.add(ok=True, note=f"A20：产品 G7 当前口径（R-22.4 冻死）在**原始报告**上 = "
+                                f"{len(g7_scope)} 文件（含 postgres={bool(extra)}、"
+                                f"少算 {dropped}）→ {g7_rate:.1%}"
+                                f"（G7 判 {'PASS' if g7_rate >= COVER_THRESHOLD else 'FAIL'}）；"
+                                f"剔除门槛外文件后 = {g7_rate_kept:.1%}")
 
             # (a) 硬判：门槛外文件（需外部服务、clean env 永远 0%）绝不许进 G7 口径，
-            #     否则 G7 永远挂着一个补不上的 0% 文件，且达标余量被吃掉 10 个点。
+            #     否则 G7 挂着一个补不上的 0% 文件，达标余量被吃掉约 10 个点。
             c.add(ok=not extra, note=f"A20：门槛外文件未被 G7 计入（多算={extra or '无'}）")
             if extra:
-                g7_no_extra = g7_cov / (g7_stmt - sum(per_file.get(f, {}).get("statements", 0)
-                                                     for f in extra)) if g7_stmt else 0.0
                 c.fail("A20：R-32 门槛外的文件仍被产品 G7 计入：" + "、".join(extra) +
-                       f"。后果：clean env（无 Docker）下 `store/postgres.py` 永远 0%，"
-                       f"G7 实测 {g7_rate:.1%}（剔除后应为 {g7_no_extra:.1%}）——"
-                       f"A20 的 {COVER_THRESHOLD:.0%} 门槛一旦到线，G7 仍可能判 FAIL，"
-                       "达标余量被吃掉约 10 个点。修法：`gates.py` 的 "
-                       "`CORE_COVERAGE_PREFIXES` 不再用 `store/` 整包前缀，改成显式"
-                       "`store/__init__.py`+`store/sqlite.py`（归 长流，Chief 裁）。")
+                       "。clean env（无 Docker）下它永远是 0%，于是同一条达标线："
+                       f"R-32 口径 {rate:.1%} vs G7 口径 {g7_rate:.1%}"
+                       f"（剔除后 {g7_rate_kept:.1%}）—— 余量被吃掉约 "
+                       f"{(g7_rate_kept - g7_rate) * 100:.1f} 个点，"
+                       "A20 一旦压线达标，`kfpa round --coverage-json <pytest 报告>` 仍会判红，"
+                       "而那条 0% 在 clean env 里补不上。修法：`gates.py` 不再用 "
+                       "`CORE_COVERAGE_PREFIXES=('src/kfpa/store/',)` 整包前缀，改成显式 "
+                       "`store/__init__.py` + `store/sqlite.py`（归 长流，Chief 裁）。")
 
             # (b) 记录项：G7 少算的纯逻辑文件（口径定义差，影响 G7 报出的数字，但不会挡住验收）
             if dropped:

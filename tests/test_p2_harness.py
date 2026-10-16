@@ -111,3 +111,16 @@ def test_cover_stats_reports_per_file_rates_for_owner_split():
     assert per_file["src/kfpa/gates.py"]["covered"] == 72
     assert per_file["src/kfpa/gates.py"]["statements"] == 201
     assert agg["covered"] == 291 and agg["statements"] == 524
+
+
+def test_cover_stats_all_sees_threshold_excluded_files():
+    """G7 口径核对要看得到门槛外的文件（否则算不出「余量被吃掉多少」）。"""
+    mod = _load_verify_p2()
+    cov = _cov({
+        "src/kfpa/store/postgres.py": {"covered_lines": 0, "num_statements": 196},
+        "src/kfpa/gates.py": {"covered_lines": 199, "num_statements": 201},
+    })
+    allp = mod.cover_stats_all(cov)
+    assert set(allp) == {"src/kfpa/store/postgres.py", "src/kfpa/gates.py"}
+    assert allp["src/kfpa/store/postgres.py"]["rate"] == 0.0
+    assert mod.cover_stats_all({"files": {}}) == {}
