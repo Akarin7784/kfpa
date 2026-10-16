@@ -321,16 +321,39 @@ def test_normalize_sample_from_dataclass_and_review_row():
     assert hit["rate"] == 0.1 and hit["passed"] is None
 
 
-def test_load_overview_parses_candidates_and_sample():
+def _knowledge_report(*, samples=None, avoid=None, threshold=0.8, counts=None) -> str:
+    """`knowledge report --json` 的稳定键假数据（R-36 / #63 的新读侧出口）。"""
+    return json.dumps({
+        "threshold": threshold,
+        "counts": counts if counts is not None else {"quarantine": 1, "promoted": 0, "dropped": 1},
+        "samples": samples if samples is not None else [
+            {"cid": "K1", "sample_rate": 0.2, "sampled_by": "alice", "passed": False,
+             "sampled_at": 1700000000.0}
+        ],
+        "avoid_patterns": avoid if avoid is not None else ["K1 的坑"],
+        "sampled": 1, "pending_sample": [], "dropped_cids": ["K3"], "promoted_cids": [],
+    }, ensure_ascii=False)
+
+
+def test_load_overview_parses_candidates_queue_and_traces():
+    """两个出口都喂：合序无关（旧读侧读 `list.sample`，新读侧读 `report.samples`）。
+
+    这里**不**断言「留痕从哪个出口来」——那是 #63 落地后才成立的接口细节，另有用例在
+    `test_load_overview_prefers_report_outlet_for_traces` 里钉（那条只在 #63 起绿）。
+    """
     payload = {
         "candidates": [{"cid": "K1", "round_no": 1, "kind": "success", "content": "c",
                         "confidence": 0.9, "status": "quarantine", "reused_by": []}],
+        # 旧形状（留痕）+ 新形状（待抽检队列）
         "sample": [{"cid": "K1", "sample_rate": 0.05}],
+        "pending_sample": [{"cid": "K1", "kind": "success", "status": "quarantine",
+                            "confidence": 0.9, "sample_rate": 0.05}],
     }
-    runner = make_runner([("list", Proc(0, json.dumps(payload)))])
+    runner = make_runner([("report", Proc(0, _knowledge_report())),
+                          ("list", Proc(0, json.dumps(payload)))])
     data = kp.load_overview(runner=runner)
-    assert data["hint"] == "" and len(data["candidates"]) == 1 and len(data["samples"]) == 1
-    assert data["samples"][0]["cid"] == "K1"
+    assert data["hint"] == "" and len(data["candidates"]) == 1
+    assert len(data["samples"]) == 1 and data["samples"][0]["cid"] == "K1"
 
 
 def test_load_overview_degrades_without_inventing_rows():
@@ -341,17 +364,23 @@ def test_load_overview_degrades_without_inventing_rows():
 
 
 def test_knowledge_reports_and_headless(tmp_path):
+    """两个出口都喂，且 `report.counts` 与候选行数**故意取同一组数**：合序无关。"""
     overview = kp.load_overview(
         runner=make_runner(
-            [("list", Proc(0, json.dumps({
-                "candidates": [
-                    {"cid": "K1", "round_no": 1, "kind": "success", "content": "c", "confidence": 0.9,
-                     "status": "quarantine", "reused_by": []},
-                    {"cid": "K3", "round_no": 2, "kind": "avoid", "content": "坑", "confidence": 0.2,
-                     "status": "dropped"},
-                ],
-                "sample": [{"cid": "K1", "sample_rate": 0.05, "sampled_by": "alice", "passed": False}],
-            })))]
+            [("report", Proc(0, _knowledge_report(
+                counts={"quarantine": 1, "promoted": 0, "dropped": 1},
+                samples=[{"cid": "K1", "sample_rate": 0.05, "sampled_by": "alice",
+                          "passed": False, "sampled_at": 1700000000.0}]))),
+             ("list", Proc(0, json.dumps({
+                 "candidates": [
+                     {"cid": "K1", "round_no": 1, "kind": "success", "content": "c", "confidence": 0.9,
+                      "status": "quarantine", "reused_by": []},
+                     {"cid": "K3", "round_no": 2, "kind": "avoid", "content": "坑", "confidence": 0.2,
+                      "status": "dropped"},
+                 ],
+                 "sample": [{"cid": "K1", "sample_rate": 0.05, "sampled_by": "alice", "passed": False}],
+                 "pending_sample": [],
+             })))]
         )
     )
     written = kp.write_reports(overview, out_dir=tmp_path)
@@ -366,7 +395,11 @@ def test_knowledge_reports_and_headless(tmp_path):
 
 
 def test_knowledge_main_with_fake_runner(tmp_path):
-    runner = make_runner([("list", Proc(0, json.dumps({"candidates": [], "sample": []})))])
+    runner = make_runner([("report", Proc(0, _knowledge_report(counts={"quarantine": 0,
+                                                                       "promoted": 0, "dropped": 0},
+                                                              samples=[]))),
+                          ("list", Proc(0, json.dumps({"candidates": [], "sample": [],
+                                                       "pending_sample": []})))])
     assert kp.main(["--db", "x.db", "--out-dir", str(tmp_path), "--json"], runner=runner) == 0
     assert (tmp_path / "knowledge-report.md").exists()
 
