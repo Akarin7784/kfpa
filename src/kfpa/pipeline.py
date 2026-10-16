@@ -1,31 +1,33 @@
-"""KFPA 轮次生命周期编排（P0，契约 §3.4 + 设计补充件 D1-5 / D1-10 / D1-12）。
+"""KFPA 轮次生命周期编排（P0，契约 §3.4 + D1-12 / D2 R-13 / R-14）。
 
 本模块只做**编排与渲染**，不持有模型字符串、不直接读写 SQLite：
 - `store` / `llm` / `executor` 全部由调用方（CLI，磐石）按契约注入；
 - 提示词模板放在 `src/kfpa/prompts/`，用 Jinja2 渲染（惰性 import，缺包给中文提示）。
 
-业务判定全部来自纯函数（D1-12 约束 1/2）：
-`gates.evaluate`（门禁）、`gates.make_reason_key`（归一化）、`package_hash`、六段自检、
-`apply_impact_floor`（D1-2 影响面兜底）、`cap_tickets`（D1-1 开票上限）。
-`run_round` 是纯函数 + 循环的参考实现；`build_graph` 是同语义的 LangGraph 编排层
-（节点只调用这些纯函数 + Store + LLM/Executor，节点内不写判据）。
+编排按 **D1-12 / R-14**：`build_graph()` 是 LangGraph `StateGraph`，节点只做
+「调用纯函数 + 落库 + 调执行器」；所有业务判据来自纯函数
+（`gates.evaluate` / `make_reason_key` / `package_hash` / 六段自检 /
+`apply_impact_floor`（D1-2）/ `cap_tickets`（D1-1））。
+`run_round()` 是 `build_graph(...).invoke(...)` 的**薄包装**，只负责把终止态组装成 `RoundResult`。
 
-对外接口：
-    generate_tickets(round_no, design_text, llm) -> list[QATicket]
-    build_task_package(round_no, design_text, tickets, llm, avoid_patterns) -> TaskPackage
-    run_round(round_no, design_text, design_ref, *, store, llm, executor, workdir,
-              max_attempts=3, dry_run=True, injection="none") -> RoundResult
-    build_graph(store, llm, executor, workdir, *, max_attempts=3, dry_run=True,
-                injection="none") -> 已编译的 LangGraph 图
-    run_round_via_graph(...) -> RoundResult
-    render_task_package(package) -> str     # 六段式任务包 Markdown 交付物
-    build_review_prompt(package, exec_result, gate) -> str
+冻结的图契约（D2 R-14）::
 
-退出码：**由 `src/kfpa/cli.py`（磐石）统一映射**（D2 R-1）。本模块只保证
-`RoundResult.state` 语义正确：PASS → `SNAPSHOTTED`；等待人工确认 → `TICKETS_OPEN`；
-已升级主BOT → `BLOCKED`。
+    class RoundGraphState(TypedDict, total=False):
+        round_no / design_text / design_ref            # invoke 时给全
+        state / tickets / open_high / task_package / exec_result / gate
+        snapshot / attempt / avoid_patterns / message  # 图内填充的终止态
 
-`injection` 口径（D2 R-10）：`high_ticket` 由 `build_llm(...)` 在 mock 剧本里消化，
+    GRAPH_NODES = ("gen_tickets", "guard_tickets", "build_package", "execute", "gate", "finalize")
+
+    build_graph(*, store, llm, executor, workdir=".", max_attempts=3,
+                dry_run=True, injection="none", checkpointer=None)
+
+放行判据按 **R-13**：只有未关闭的 HIGH 票阻塞出包（`rounds.state → TICKETS_OPEN`），
+MEDIUM / LOW 未关闭不阻塞（走攒批确认），放行时 `rounds.state → RELEASED`。
+
+退出码：**由 `src/kfpa/cli.py`（磐石）统一映射**（R-1）；本模块只保证 `RoundResult.state` 语义正确。
+
+`injection` 口径（R-10）：`high_ticket` 由 `build_llm(...)` 在 mock 剧本里消化，
 **不透传执行器**；只有 `apply_fail` / `test_fail` 才转给 `MockExecutor`。
 
 日志：每阶段一行 `[i/6] 阶段名 …` 输出到 **stderr**（保持 stdout 干净，供 `--json` 单行输出）。
@@ -44,6 +46,7 @@ from . import gates
 from .schemas import (
     AcceptanceCriterion,
     ExecResult,
+    GateReport,
     GateState,
     QATicket,
     Round,
@@ -64,11 +67,10 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，运行期不依赖磐�
 #: 提示词模板目录
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-# ---------------------------------------------------------------- 退出码（D2 R-1：由 cli.py 映射）
 #: 高影响票硬规则的机器可判定标记（CLI 与测试都可据此断言）
 BLOCKED_MARK = "[KFPA-BLOCKED]"
 
-#: 透传执行器的注入档位（D2 R-10：high_ticket 归 mock 剧本，不进执行器）
+#: 透传执行器的注入档位（R-10：high_ticket 归 mock 剧本，不进执行器）
 EXECUTOR_INJECTIONS = ("apply_fail", "test_fail")
 
 #: 单轮开票上限（D1-1：超过则 LOW 合并成一条汇总票）
@@ -87,6 +89,34 @@ IMPACT_FLOOR_HIGH = (
 )
 #: 「至少 MEDIUM」的关键词组
 IMPACT_FLOOR_MEDIUM = ("字段", "表", "接口", "权限", "金额", "数量")
+
+
+class RoundGraphState(TypedDict, total=False):
+    """LangGraph 状态契约（D2 R-14 冻结）。
+
+    入参三键由调用方给全；其余键由图内节点逐步填充；终止态必须含
+    `state / tickets / task_package / exec_result / gate / snapshot / message`。
+    """
+
+    # ---- 入参
+    round_no: int
+    design_text: str
+    design_ref: str
+    # ---- 图内填充
+    state: RoundState
+    tickets: list[QATicket]
+    open_high: list[str]
+    task_package: Optional[TaskPackage]
+    exec_result: Optional[ExecResult]
+    gate: Optional[GateReport]
+    snapshot: Optional[Snapshot]
+    attempt: int
+    avoid_patterns: list[str]
+    message: str
+
+
+#: 冻结点名（D2 R-14），顺序即执行顺序
+GRAPH_NODES = ("gen_tickets", "guard_tickets", "build_package", "execute", "gate", "finalize")
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 _QA_LINE_RE = re.compile(
@@ -108,7 +138,7 @@ _IMPACT_ALIASES = {
     "mid": TicketImpact.MEDIUM,
 }
 
-#: 票面字段别名（容忍 MockLLM / 真实模型的不同命名）
+#: 票面字段别名（容忍 MockLLM / 真实模型的不同命名；R-3：mock 带 ticket_id 也由本模块覆盖）
 _FIELD_ALIASES = {
     "location": ("location", "位置", "loc"),
     "option_a": ("option_a", "a", "解释A", "解释a", "optionA"),
@@ -133,7 +163,7 @@ class DependencyMissingError(PipelineError):
 
 
 class OpenHighTicketsError(PipelineError):
-    """硬规则（D1-1）：存在未关闭的高影响質問票时，不得生成任务包（CLI 退出码 3）。"""
+    """硬规则（D1-1 / R-13）：存在未关闭的高影响質問票时，不得生成任务包（CLI 退出码 3）。"""
 
     def __init__(self, ticket_ids: list[str]) -> None:
         self.ticket_ids = list(ticket_ids)
@@ -267,7 +297,7 @@ def _pick(item: dict, field: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------- 票面（D1-1 / D1-2）
+# ---------------------------------------------------------------- 票面（D1-1 / D1-2 / R-13）
 
 
 def apply_impact_floor(tickets: list[QATicket]) -> list[QATicket]:
@@ -310,7 +340,7 @@ def cap_tickets(round_no: int, tickets: list[QATicket]) -> list[QATicket]:
 
 
 def _ticket_from_item(round_no: int, item: Any) -> Optional[QATicket]:
-    """把 mock/模型返回的一条记录转成 QATicket（票号稍后统一分配）。"""
+    """把 mock/模型返回的一条记录转成 QATicket（票号稍后统一分配，忽略 mock 的 ticket_id）。"""
     if isinstance(item, str):
         match = _QA_LINE_RE.search(item)
         if not match:
@@ -326,21 +356,23 @@ def _ticket_from_item(round_no: int, item: Any) -> Optional[QATicket]:
         )
     if not isinstance(item, dict):
         return None
+    raw = dict(item)
+    raw.pop("ticket_id", None)  # R-3：票号由本模块分配，mock 的 T-001 一律忽略
     return QATicket(
         ticket_id="",
         round_no=round_no,
-        location=_pick(item, "location"),
-        option_a=_pick(item, "option_a"),
-        option_b=_pick(item, "option_b"),
-        architect_preference=_pick(item, "architect_preference"),
-        impact=_parse_impact(_pick(item, "impact")),
+        location=_pick(raw, "location"),
+        option_a=_pick(raw, "option_a"),
+        option_b=_pick(raw, "option_b"),
+        architect_preference=_pick(raw, "architect_preference"),
+        impact=_parse_impact(_pick(raw, "impact")),
     )
 
 
 def generate_tickets(round_no: int, design_text: str, llm: "LLM") -> list[QATicket]:
     """设计文本 → 質問票清单（ARCHITECT 位，转译即提问）。
 
-    票号由本模块分配（`R{round}-{seq:03d}`，D1-1），模型/mock 都不许自己编号；
+    票号由本模块分配（`R{round}-{seq:03d}`，D1-1 / R-3），模型/mock 都不许自己编号；
     之后依次过 D1-2 影响面兜底与 D1-1 开票上限。
     """
     system = _render("qa_tickets.j2", round_no=round_no)
@@ -403,7 +435,8 @@ def build_task_package(
 ) -> TaskPackage:
     """質問票 + 设计 → 六段式任务包。
 
-    硬规则（D1-1）：存在未关闭的高影响票时**必须拒绝**，抛 OpenHighTicketsError（CLI 退出码 3）。
+    硬规则（D1-1 / R-13）：存在未关闭的 **HIGH** 票时**必须拒绝**（CLI 退出码 3）；
+    MEDIUM / LOW 未关闭不阻塞出包。
     """
     blockers = [t.ticket_id for t in tickets if t.is_open_high()]
     if blockers:
@@ -425,9 +458,11 @@ def build_task_package(
     feature = str(data.get("feature") or "").strip() or f"round-{round_no}"
     prohibitions = _as_str_list(data.get("prohibitions"))
     # 回灌区（D1-11）：pipeline 兜底注入 AVOID[...] 行，保证「失败必回灌」不靠模型自觉
-    lines = [str(p).strip() for p in data.get("feedback") if str(p).strip()] if isinstance(
-        data.get("feedback"), list
-    ) else []
+    lines = (
+        [str(p).strip() for p in data.get("feedback") if str(p).strip()]
+        if isinstance(data.get("feedback"), list)
+        else []
+    )
     for pattern in avoid:
         if pattern not in lines:
             lines.append(pattern)
@@ -452,7 +487,7 @@ def render_task_package(package: TaskPackage) -> str:
 
 
 def build_review_prompt(package: TaskPackage, exec_result: ExecResult, gate: Any) -> str:
-    """评审位（REVIEWER）提示词：强制全新上下文的对抗性评审。"""
+    """评审位（REVIEWER）提示词：强制全新上下文的对抗性评审（不参与门禁判定，R-5）。"""
     return _render(
         "review.j2",
         package=package,
@@ -496,7 +531,7 @@ def _git_tag(workdir: Path, tag: str, message: str) -> bool:
 
 
 def _save_round_tickets(store: "Store", tickets: list[QATicket]) -> list[QATicket]:
-    """落库質問票：**已存在的票不覆盖**（人工确认结论不能被重跑冲掉，D1-8 幂等）。"""
+    """落库質問票：**已存在的票不覆盖**（人工确认结论不能被重跑冲掉，D1-8 / R-6 幂等）。"""
     saved: list[QATicket] = []
     for ticket in tickets:
         existing: Optional[QATicket] = None
@@ -506,15 +541,14 @@ def _save_round_tickets(store: "Store", tickets: list[QATicket]) -> list[QATicke
     return saved
 
 
-# ---------------------------------------------------------------- 阶段（图与循环共用）
+# ---------------------------------------------------------------- 阶段（图节点共用）
 
 
 def _stage_tickets(store: "Store", llm: "LLM", round_no: int, design_text: str) -> list[QATicket]:
-    _log(f"[2/6] 質問票转译：ARCHITECT 转译设计（marker [KFPA:GEN_TICKETS]）")
+    _log("[2/6] 質問票转译：ARCHITECT 转译设计（marker KFPA_TASK=qa_tickets）")
     fresh = generate_tickets(round_no, design_text, llm)
     _save_round_tickets(store, fresh)
     all_tickets = store.list_tickets(round_no=round_no)
-    store.set_round_state(round_no, RoundState.TICKETS_OPEN)
     _log(f"[2/6] 質問票转译完成：本轮共 {len(all_tickets)} 张（新开 {len(fresh)} 张）")
     return all_tickets
 
@@ -525,12 +559,16 @@ def _stage_package(
     round_no: int,
     design_text: str,
     tickets: list[QATicket],
+    avoid_patterns: Optional[list[str]] = None,
 ) -> TaskPackage:
-    avoid = store.list_avoid_patterns()
+    avoid = (
+        [str(p) for p in avoid_patterns]
+        if avoid_patterns is not None
+        else [str(p) for p in store.list_avoid_patterns()]
+    )
     _log(f"[4/6] 任务包生成：六段式，回灌区注入 {len(avoid)} 条历史失败模式")
     package = build_task_package(round_no, design_text, tickets, llm, avoid)
     store.save_package(package)
-    store.set_round_state(round_no, RoundState.RELEASED)
     return package
 
 
@@ -555,7 +593,7 @@ def _stage_gate(
     package: TaskPackage,
     exec_result: ExecResult,
     attempt: int,
-) -> Any:
+) -> GateReport:
     report = gates.evaluate(package.round_no, package, exec_result, store, attempt=attempt)
     store.save_gate_report(report)
     _log(
@@ -569,7 +607,7 @@ def _stage_gate(
 def _stage_snapshot(
     store: "Store",
     package: TaskPackage,
-    report: Any,
+    report: GateReport,
     workdir: Path,
     round_no: int,
     dry_run: bool,
@@ -591,7 +629,245 @@ def _stage_snapshot(
     return snapshot
 
 
-# ---------------------------------------------------------------- 轮次编排（参考实现）
+# ---------------------------------------------------------------- LangGraph 编排（R-14）
+
+
+def build_graph(
+    *,
+    store: "Store",
+    llm: "LLM",
+    executor: "Executor",
+    workdir: str | Path = ".",
+    max_attempts: int = 3,
+    dry_run: bool = True,
+    injection: str = "none",
+    checkpointer: Any = None,
+) -> Any:
+    """编译 LangGraph `StateGraph`（签名与 state 契约见 D2 R-14）。
+
+    用法::
+
+        app = build_graph(store=store, llm=llm, executor=executor, workdir=tmp)
+        final = app.invoke({"round_no": 1, "design_text": text, "design_ref": "examples/design-r1.md"})
+        final["state"], final["gate"].state          # 终止态
+
+    - 节点按 `GRAPH_NODES` 冻结：`gen_tickets → guard_tickets → build_package → execute → gate → finalize`；
+      未关闭 HIGH 票 → 直接 `finalize`（`state=TICKETS_OPEN`，CLI 退出码 3）；
+      `gate` 判 NEEDS_FIX 且 `attempt < max_attempts` → 带 `avoid_patterns` 回 `execute`（重建任务包，D1-11）。
+    - 节点只调纯函数 + Store + 执行器，节点内不写判据（D1-12 约束 2）。
+    - `checkpointer=None` 时**不挂 checkpointer**，保证 R-14 的「`invoke` 只给三个入参」可直接跑；
+      传入自定义 checkpointer 时由调用方按 LangGraph 约定给 `config`（如 `thread_id`）。
+    """
+    try:
+        from langgraph.graph import END, StateGraph
+    except ImportError as exc:  # pragma: no cover - 依赖由 Chief 统一安装
+        raise DependencyMissingError(
+            "[pipeline] 缺少 langgraph（编排层） → 让 Chief 按 D1-12 统一安装（退出码 4）"
+        ) from exc
+
+    workdir_path = Path(workdir)
+    if injection in EXECUTOR_INJECTIONS and hasattr(executor, "injection"):
+        executor.injection = injection  # type: ignore[attr-defined]
+
+    # ---------------------------------------------------------- 节点
+
+    def n_gen_tickets(state: RoundGraphState) -> dict:
+        round_no = int(state["round_no"])
+        workdir_path.mkdir(parents=True, exist_ok=True)
+        store.init_schema()
+        _log(f"[1/6] 设计录入：ref={state.get('design_ref', '')} round={round_no} dry_run={dry_run}")
+        store.upsert_round(
+            Round(
+                round_no=round_no,
+                design_ref=str(state.get("design_ref", "")),
+                state=RoundState.DESIGN_IN,
+            )
+        )
+        tickets = _stage_tickets(store, llm, round_no, str(state["design_text"]))
+        return {"tickets": tickets, "state": RoundState.TICKETS_OPEN}
+
+    def n_guard_tickets(state: RoundGraphState) -> dict:
+        round_no = int(state["round_no"])
+        # R-13：只有「未关闭的 HIGH 票」阻塞；MEDIUM/LOW 走攒批确认
+        open_high = [t.ticket_id for t in store.list_open_high_tickets(round_no)]
+        if open_high:
+            _log(f"[3/6] 硬规则闸：拦停，未关闭高影响票 {len(open_high)} 张（{'、'.join(open_high)}）")
+            return {"open_high": open_high, "state": RoundState.TICKETS_OPEN}
+        _log("[3/6] 硬规则闸：通过（无未关闭高影响票；MEDIUM/LOW 不阻塞）")
+        store.set_round_state(round_no, RoundState.RELEASED)
+        return {"open_high": [], "state": RoundState.RELEASED}
+
+    def route_guard(state: RoundGraphState) -> str:
+        return "finalize" if state.get("open_high") else "build_package"
+
+    def n_build_package(state: RoundGraphState) -> dict:
+        avoid = [str(p) for p in store.list_avoid_patterns()]
+        package = _stage_package(
+            store,
+            llm,
+            int(state["round_no"]),
+            str(state["design_text"]),
+            state.get("tickets") or [],
+            avoid,
+        )
+        return {"task_package": package, "avoid_patterns": avoid}
+
+    def n_execute(state: RoundGraphState) -> dict:
+        attempt = int(state.get("attempt", 0)) + 1
+        avoid = [str(p) for p in (state.get("avoid_patterns") or [])]
+        package = state.get("task_package")
+        # 重试边「带 avoid_patterns 回 execute」：用回灌区重建任务包（D1-11）
+        if attempt > 1 or (package is not None and avoid and list(package.feedback) != avoid):
+            package = _stage_package(
+                store,
+                llm,
+                int(state["round_no"]),
+                str(state["design_text"]),
+                state.get("tickets") or [],
+                avoid,
+            )
+        if package is None:  # pragma: no cover - build_package 必先于 execute
+            raise PipelineError("[pipeline] execute 缺少任务包 → 检查 build_package 入边")
+        exec_result = _stage_execute(store, executor, package, workdir_path, attempt)
+        return {"attempt": attempt, "task_package": package, "exec_result": exec_result}
+
+    def n_gate(state: RoundGraphState) -> dict:
+        package = state.get("task_package")
+        exec_result = state.get("exec_result")
+        if package is None or exec_result is None:  # pragma: no cover
+            raise PipelineError("[pipeline] gate 缺少任务包或执行结果 → 检查 execute 出边")
+        report = _stage_gate(store, package, exec_result, int(state.get("attempt", 1)))
+        return {"gate": report, "avoid_patterns": [str(p) for p in store.list_avoid_patterns()]}
+
+    def route_gate(state: RoundGraphState) -> str:
+        report = state.get("gate")
+        if report is None:  # pragma: no cover
+            return "finalize"
+        if report.state is GateState.PASS or report.state is GateState.BLOCKED:
+            return "finalize"
+        if int(state.get("attempt", 1)) < max(1, max_attempts):
+            return "execute"
+        return "finalize"
+
+    def n_finalize(state: RoundGraphState) -> dict:
+        round_no = int(state["round_no"])
+        tickets = state.get("tickets") or []
+        package = state.get("task_package")
+        exec_result = state.get("exec_result")
+        report = state.get("gate")
+
+        # ① 未关闭 HIGH 票拦停（R-13 / R-1 退出码 3）
+        if state.get("open_high") and report is None:
+            ids = list(state["open_high"])
+            store.set_round_state(round_no, RoundState.TICKETS_OPEN)
+            message = (
+                f"{BLOCKED_MARK} [pipeline] 第 {round_no} 轮拦停：{len(ids)} 张未关闭高影响票"
+                f"（{'、'.join(ids)}） → 先 `kfpa tickets close` 攒批确认后重跑本轮（退出码 3）"
+            )
+            _log(message)
+            return {
+                "state": RoundState.TICKETS_OPEN,
+                "tickets": tickets,
+                "task_package": None,
+                "exec_result": None,
+                "gate": None,
+                "snapshot": None,
+                "message": message,
+            }
+
+        # ② 重试上限用尽且未升级 → attempts_exhausted 终态（D1-5）
+        if report is not None and report.state is GateState.NEEDS_FIX:
+            attempt = int(state.get("attempt", 1))
+            if package is not None:  # 终止前补齐回灌区（失败必回灌，D1-11）
+                avoid = [str(p) for p in store.list_avoid_patterns()]
+                package.feedback = avoid or [
+                    f"第 {attempt} 次尝试失败：{'；'.join(report.reasons)}"
+                ]
+                store.save_package(package)
+            report = gates.exhausted_report(round_no, attempt, store, last=report)
+            store.save_gate_report(report)
+
+        if report is None:  # pragma: no cover
+            raise PipelineError("[pipeline] 图终止态缺少门禁结果 → 检查 finalize 入边")
+
+        if report.state is GateState.PASS:
+            if package is None:  # pragma: no cover
+                raise PipelineError("[pipeline] PASS 终止态缺少任务包 → 检查 build_package 入边")
+            snapshot = _stage_snapshot(store, package, report, workdir_path, round_no, dry_run)
+            workdir_path.mkdir(parents=True, exist_ok=True)
+            (workdir_path / "review-prompt.md").write_text(
+                build_review_prompt(package, exec_result, report), encoding="utf-8"
+            )
+            message = (
+                f"[pipeline] 第 {round_no} 轮门禁 PASS（第 {state.get('attempt')} 次尝试）："
+                f"package_hash={snapshot.package_hash}，已快照 tag={snapshot.tag}"
+            )
+            _log(message)
+            return {
+                "state": RoundState.SNAPSHOTTED,
+                "tickets": tickets,
+                "task_package": package,
+                "exec_result": exec_result,
+                "gate": report,
+                "snapshot": snapshot,
+                "message": message,
+            }
+
+        store.set_round_state(round_no, RoundState.BLOCKED)
+        message = (
+            f"{BLOCKED_MARK} [gate] 第 {round_no} 轮 BLOCKED（第 {state.get('attempt')} 次尝试）："
+            f"同类失败第 {report.same_reason_count + 1} 次（阈值 {gates.ESCALATE_THRESHOLD}）"
+            " → 先做变更影响分析再重规划（退出码 11）"
+        )
+        _log(message)
+        return {
+            "state": RoundState.BLOCKED,
+            "tickets": tickets,
+            "task_package": package,
+            "exec_result": exec_result,
+            "gate": report,
+            "snapshot": None,
+            "message": message,
+        }
+
+    # ---------------------------------------------------------- 图
+
+    graph = StateGraph(RoundGraphState)
+    graph.add_node("gen_tickets", n_gen_tickets)
+    graph.add_node("guard_tickets", n_guard_tickets)
+    graph.add_node("build_package", n_build_package)
+    graph.add_node("execute", n_execute)
+    graph.add_node("gate", n_gate)
+    graph.add_node("finalize", n_finalize)
+
+    graph.set_entry_point("gen_tickets")
+    graph.add_edge("gen_tickets", "guard_tickets")
+    graph.add_conditional_edges(
+        "guard_tickets", route_guard, {"finalize": "finalize", "build_package": "build_package"}
+    )
+    graph.add_edge("build_package", "execute")
+    graph.add_edge("execute", "gate")
+    graph.add_conditional_edges("gate", route_gate, {"finalize": "finalize", "execute": "execute"})
+    graph.add_edge("finalize", END)
+
+    return graph.compile(checkpointer=checkpointer) if checkpointer is not None else graph.compile()
+
+
+def _result_from_state(state: dict) -> RoundResult:
+    """把图终止态组装成 `RoundResult`（R-14：终止态字段与 RoundResult 同型）。"""
+    return RoundResult(
+        round_no=int(state["round_no"]),
+        state=state["state"],
+        tickets=list(state.get("tickets") or []),
+        task_package=state.get("task_package"),
+        exec_result=state.get("exec_result"),
+        gate=state.get("gate"),
+        snapshot=state.get("snapshot"),
+        message=str(state.get("message") or ""),
+    )
+
+
+# ---------------------------------------------------------------- 对外轮次入口
 
 
 def run_round(
@@ -607,363 +883,29 @@ def run_round(
     dry_run: bool = True,
     injection: str = "none",
 ) -> RoundResult:
-    """跑一轮完整生命周期：设计录入→开票→放行→任务包→执行→门禁→快照。
+    """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14）。
 
-    - 高影响票未清零时**不进入执行**，返回 state=TICKETS_OPEN + BLOCKED_MARK（退出码 3）；
-    - `injection` 非 none 时透传给支持注入的执行器（D1-7，供 A4 验收）；
-    - 不同原因连续失败到 `max_attempts` → BLOCKED + reason=attempts_exhausted（D1-5）。
+    - 未关闭 HIGH 票 → `state=TICKETS_OPEN` + `BLOCKED_MARK`（CLI 退出码 3）；
+    - `injection` 只把 `apply_fail` / `test_fail` 转给执行器（R-10）；
+    - 不同原因连续失败到 `max_attempts` → BLOCKED + `attempts_exhausted`（D1-5）。
     """
-    workdir_path = Path(workdir)
-    workdir_path.mkdir(parents=True, exist_ok=True)
-    store.init_schema()
-    _log(f"[1/6] 设计录入：ref={design_ref} round={round_no} dry_run={dry_run}")
-    store.upsert_round(Round(round_no=round_no, design_ref=design_ref, state=RoundState.DESIGN_IN))
-
-    if injection in EXECUTOR_INJECTIONS and hasattr(executor, "injection"):
-        executor.injection = injection  # type: ignore[attr-defined]
-
-    tickets = _stage_tickets(store, llm, round_no, design_text)
-
-    # [3/6] 硬规则闸（D1-1）
-    open_high = store.list_open_high_tickets(round_no)
-    if open_high:
-        ids = [t.ticket_id for t in open_high]
-        _log(f"[3/6] 硬规则闸：拦停，未关闭高影响票 {len(ids)} 张（{'、'.join(ids)}）")
-        return RoundResult(
-            round_no=round_no,
-            state=RoundState.TICKETS_OPEN,
-            tickets=tickets,
-            message=(
-                f"{BLOCKED_MARK} [pipeline] 第 {round_no} 轮拦停：{len(ids)} 张未关闭高影响票"
-                f"（{'、'.join(ids)}） → 先 `kfpa tickets close` 攒批确认后重跑本轮（退出码 3）"
-            ),
-        )
-    _log("[3/6] 硬规则闸：通过（无未关闭高影响票）")
-
-    package = _stage_package(store, llm, round_no, design_text, tickets)
-
-    last_exec: Optional[ExecResult] = None
-    last_gate: Any = None
-    attempt = 0
-
-    while attempt < max(1, max_attempts):
-        attempt += 1
-        exec_result = _stage_execute(store, executor, package, workdir_path, attempt)
-        report = _stage_gate(store, package, exec_result, attempt)
-        last_exec, last_gate = exec_result, report
-
-        if report.state is GateState.PASS:
-            snapshot = _stage_snapshot(store, package, report, workdir_path, round_no, dry_run)
-            (workdir_path / "review-prompt.md").write_text(
-                build_review_prompt(package, exec_result, report), encoding="utf-8"
-            )
-            return RoundResult(
-                round_no=round_no,
-                state=RoundState.SNAPSHOTTED,
-                tickets=tickets,
-                task_package=package,
-                exec_result=exec_result,
-                gate=report,
-                snapshot=snapshot,
-                message=(
-                    f"[pipeline] 第 {round_no} 轮门禁 PASS（第 {attempt} 次尝试）："
-                    f"package_hash={snapshot.package_hash}，已快照 tag={snapshot.tag}，"
-                    f"验收断言 {len(report.failing_criteria) or len(package.acceptance)} 条全过"
-                ),
-            )
-
-        # 失败必回灌（D1-11）：把 AVOID 行写进任务包回灌区并落库
-        avoid = store.list_avoid_patterns()
-        package.feedback = list(avoid) or [
-            f"第 {attempt} 次尝试失败：{'；'.join(report.reasons)}"
-        ]
-        store.save_package(package)
-
-        if report.state is GateState.BLOCKED:
-            store.set_round_state(round_no, RoundState.BLOCKED)
-            message = (
-                f"{BLOCKED_MARK} [gate] 第 {round_no} 轮 BLOCKED（第 {attempt} 次尝试）："
-                f"同类失败第 {report.same_reason_count + 1} 次（阈值 {gates.ESCALATE_THRESHOLD}）"
-                f" → 先做变更影响分析再重规划（退出码 11）"
-            )
-            _log(message)
-            return RoundResult(
-                round_no=round_no,
-                state=RoundState.BLOCKED,
-                tickets=tickets,
-                task_package=package,
-                exec_result=exec_result,
-                gate=report,
-                message=message,
-            )
-
-        if attempt >= max(1, max_attempts):
-            exhausted = gates.exhausted_report(round_no, attempt, store, last=report)
-            store.save_gate_report(exhausted)
-            store.set_round_state(round_no, RoundState.BLOCKED)
-            message = (
-                f"{BLOCKED_MARK} [gate] 第 {round_no} 轮 BLOCKED：不同原因连续失败到重试上限"
-                f"（attempts_exhausted，{attempt} 次） → 先做变更影响分析再重规划（退出码 11）"
-            )
-            _log(message)
-            return RoundResult(
-                round_no=round_no,
-                state=RoundState.BLOCKED,
-                tickets=tickets,
-                task_package=package,
-                exec_result=exec_result,
-                gate=exhausted,
-                message=message,
-            )
-
-        package = _stage_package(store, llm, round_no, design_text, tickets)
-
-    raise PipelineError(
-        "[pipeline] 内部错误：尝试循环未产出结果 → 检查 max_attempts 与门禁实现"
-    )  # pragma: no cover
-
-
-# ---------------------------------------------------------------- LangGraph 编排层（D1-12）
-
-
-def build_graph(
-    store: "Store",
-    llm: "LLM",
-    executor: "Executor",
-    workdir: str | Path = "runs",
-    *,
-    max_attempts: int = 3,
-    dry_run: bool = True,
-    injection: str = "none",
-) -> Any:
-    """编译 LangGraph `StateGraph`（P0 编排层，D1-12）。
-
-    节点只做「调用纯函数 + 落库 + 调执行器」，判据一律来自 `gates` / 本模块纯函数。
-    checkpoint 用 `InMemorySaver`（P0 单进程）；台账真相源仍是 SQLite（D1-9）。
-
-    用法：:
-
-        app = build_graph(store, llm, executor, workdir=tmp)
-        state = app.invoke({"round_no": 1, "design_text": text, "design_ref": "examples/design-r1.md"},
-                           {"configurable": {"thread_id": "round-1"}})
-        state["result"]      # RoundResult
-
-    也可直接用 `run_round_via_graph(...)`（等价于 run_round，只多走一层图）。
-    """
-    try:
-        from langgraph.checkpoint.memory import InMemorySaver
-        from langgraph.graph import END, StateGraph
-    except ImportError as exc:  # pragma: no cover - 依赖由 Chief 统一安装
-        raise DependencyMissingError(
-            "[pipeline] 缺少 langgraph（编排层） → 让 Chief 按 D1-12 统一安装，"
-            "或用 run_round 纯函数路径（退出码 4）"
-        ) from exc
-
-    workdir_path = Path(workdir)
-    if injection in EXECUTOR_INJECTIONS and hasattr(executor, "injection"):
-        executor.injection = injection  # type: ignore[attr-defined]
-
-    class RoundGraphState(TypedDict, total=False):
-        """图状态：节点间只传数据，判据一律来自纯函数（D1-12 约束 2）。"""
-
-        round_no: int
-        design_text: str
-        design_ref: str
-        tickets: list[QATicket]
-        package: TaskPackage
-        exec_result: ExecResult
-        gate: Any
-        attempt: int
-        result: RoundResult
-
-    def node_round_start(state: dict) -> dict:
-        round_no = int(state["round_no"])
-        workdir_path.mkdir(parents=True, exist_ok=True)
-        store.init_schema()
-        _log(f"[1/6] 设计录入：ref={state.get('design_ref', '')} round={round_no} dry_run={dry_run}")
-        store.upsert_round(
-            Round(
-                round_no=round_no,
-                design_ref=str(state.get("design_ref", "")),
-                state=RoundState.DESIGN_IN,
-            )
-        )
-        return {}
-
-    def node_tickets(state: dict) -> dict:
-        tickets = _stage_tickets(store, llm, int(state["round_no"]), str(state["design_text"]))
-        return {"tickets": tickets}
-
-    def route_hard_rule(state: dict) -> str:
-        return "blocked" if store.list_open_high_tickets(int(state["round_no"])) else "package"
-
-    def node_open_high(state: dict) -> dict:
-        round_no = int(state["round_no"])
-        ids = [t.ticket_id for t in store.list_open_high_tickets(round_no)]
-        _log(f"[3/6] 硬规则闸：拦停，未关闭高影响票 {len(ids)} 张（{'、'.join(ids)}）")
-        result = RoundResult(
-            round_no=round_no,
-            state=RoundState.TICKETS_OPEN,
-            tickets=state.get("tickets") or [],
-            message=(
-                f"{BLOCKED_MARK} [pipeline] 第 {round_no} 轮拦停：{len(ids)} 张未关闭高影响票"
-                f"（{'、'.join(ids)}） → 先 `kfpa tickets close` 攒批确认后重跑本轮（退出码 3）"
-            ),
-        )
-        return {"result": result}
-
-    def node_package(state: dict) -> dict:
-        round_no = int(state["round_no"])
-        _log("[3/6] 硬规则闸：通过（无未关闭高影响票）")
-        package = _stage_package(
-            store,
-            llm,
-            round_no,
-            str(state["design_text"]),
-            state.get("tickets") or [],
-        )
-        return {"package": package}
-
-    def node_execute(state: dict) -> dict:
-        attempt = int(state.get("attempt", 0)) + 1
-        exec_result = _stage_execute(
-            store, executor, state["package"], workdir_path, attempt
-        )
-        return {"attempt": attempt, "exec_result": exec_result}
-
-    def node_gate(state: dict) -> dict:
-        report = _stage_gate(
-            store, state["package"], state["exec_result"], int(state.get("attempt", 1))
-        )
-        return {"gate": report}
-
-    def route_gate(state: dict) -> str:
-        report = state["gate"]
-        if report.state is GateState.PASS:
-            return "snapshot"
-        if report.state is GateState.BLOCKED:
-            return "blocked"
-        return "feedback" if int(state.get("attempt", 1)) < max(1, max_attempts) else "exhausted"
-
-    def node_feedback(state: dict) -> dict:
-        """失败必回灌（D1-11）：带着 AVOID 行重建任务包，再执行一次。"""
-        round_no = int(state["round_no"])
-        package = _stage_package(
-            store, llm, round_no, str(state["design_text"]), state.get("tickets") or []
-        )
-        return {"package": package}
-
-    def node_snapshot(state: dict) -> dict:
-        package = state["package"]
-        report = state["gate"]
-        snapshot = _stage_snapshot(
-            store, package, report, workdir_path, int(state["round_no"]), dry_run
-        )
-        (workdir_path / "review-prompt.md").write_text(
-            build_review_prompt(package, state["exec_result"], report), encoding="utf-8"
-        )
-        result = RoundResult(
-            round_no=int(state["round_no"]),
-            state=RoundState.SNAPSHOTTED,
-            tickets=state.get("tickets") or [],
-            task_package=package,
-            exec_result=state["exec_result"],
-            gate=report,
-            snapshot=snapshot,
-            message=(
-                f"[pipeline] 第 {int(state['round_no'])} 轮门禁 PASS（第 {state.get('attempt')} 次尝试）："
-                f"package_hash={snapshot.package_hash}，已快照 tag={snapshot.tag}"
-            ),
-        )
-        return {"result": result}
-
-    def node_blocked(state: dict) -> dict:
-        round_no = int(state["round_no"])
-        report = state["gate"]
-        package = state["package"]
-        store.set_round_state(round_no, RoundState.BLOCKED)
-        message = (
-            f"{BLOCKED_MARK} [gate] 第 {round_no} 轮 BLOCKED（第 {state.get('attempt')} 次尝试）："
-            f"同类失败第 {report.same_reason_count + 1} 次（阈值 {gates.ESCALATE_THRESHOLD}）"
-            " → 先做变更影响分析再重规划（退出码 11）"
-        )
-        _log(message)
-        return {
-            "result": RoundResult(
-                round_no=round_no,
-                state=RoundState.BLOCKED,
-                tickets=state.get("tickets") or [],
-                task_package=package,
-                exec_result=state.get("exec_result"),
-                gate=report,
-                message=message,
-            )
-        }
-
-    def node_exhausted(state: dict) -> dict:
-        round_no = int(state["round_no"])
-        attempt = int(state.get("attempt", 1))
-        package = state.get("package")
-        if package is not None:  # 终止前仍把回灌区补齐（失败必回灌）
-            package.feedback = list(store.list_avoid_patterns()) or [
-                f"第 {attempt} 次尝试失败：{'；'.join(state['gate'].reasons)}"
-            ]
-            store.save_package(package)
-        report = gates.exhausted_report(round_no, attempt, store, last=state.get("gate"))
-        store.save_gate_report(report)
-        store.set_round_state(round_no, RoundState.BLOCKED)
-        message = (
-            f"{BLOCKED_MARK} [gate] 第 {round_no} 轮 BLOCKED：不同原因连续失败到重试上限"
-            f"（attempts_exhausted，{attempt} 次） → 先做变更影响分析再重规划（退出码 11）"
-        )
-        _log(message)
-        return {
-            "result": RoundResult(
-                round_no=round_no,
-                state=RoundState.BLOCKED,
-                tickets=state.get("tickets") or [],
-                task_package=state.get("package"),
-                exec_result=state.get("exec_result"),
-                gate=report,
-                message=message,
-            )
-        }
-
-    graph = StateGraph(RoundGraphState)
-    graph.add_node("round_start", node_round_start)
-    graph.add_node("tickets", node_tickets)
-    graph.add_node("open_high", node_open_high)
-    graph.add_node("package", node_package)
-    graph.add_node("execute", node_execute)
-    graph.add_node("gate", node_gate)
-    graph.add_node("feedback", node_feedback)
-    graph.add_node("snapshot", node_snapshot)
-    graph.add_node("blocked", node_blocked)
-    graph.add_node("exhausted", node_exhausted)
-
-    graph.set_entry_point("round_start")
-    graph.add_edge("round_start", "tickets")
-    graph.add_conditional_edges(
-        "tickets", route_hard_rule, {"blocked": "open_high", "package": "package"}
+    graph = build_graph(
+        store=store,
+        llm=llm,
+        executor=executor,
+        workdir=workdir,
+        max_attempts=max_attempts,
+        dry_run=dry_run,
+        injection=injection,
     )
-    graph.add_edge("open_high", END)
-    graph.add_edge("package", "execute")
-    graph.add_edge("execute", "gate")
-    graph.add_conditional_edges(
-        "gate",
-        route_gate,
-        {
-            "snapshot": "snapshot",
-            "blocked": "blocked",
-            "feedback": "feedback",
-            "exhausted": "exhausted",
-        },
+    final = graph.invoke(
+        {"round_no": round_no, "design_text": design_text, "design_ref": design_ref}
     )
-    graph.add_edge("feedback", "execute")
-    graph.add_edge("snapshot", END)
-    graph.add_edge("blocked", END)
-    graph.add_edge("exhausted", END)
-    return graph.compile(checkpointer=InMemorySaver())
+    if not isinstance(final, dict) or "state" not in final:
+        raise PipelineError(
+            "[pipeline] 图未返回含 state 的终止态 → 检查 finalize 节点（R-14）"
+        )
+    return _result_from_state(final)
 
 
 def run_round_via_graph(
@@ -979,39 +921,30 @@ def run_round_via_graph(
     dry_run: bool = True,
     injection: str = "none",
 ) -> RoundResult:
-    """走 LangGraph 编排层跑一轮（A8 冒烟用；语义与 run_round 一致）。"""
-    app = build_graph(
-        store,
-        llm,
-        executor,
-        workdir,
+    """兼容别名：语义与 `run_round` 完全一致（两者都走 LangGraph）。"""
+    return run_round(
+        round_no,
+        design_text,
+        design_ref,
+        store=store,
+        llm=llm,
+        executor=executor,
+        workdir=workdir,
         max_attempts=max_attempts,
         dry_run=dry_run,
         injection=injection,
     )
-    final = app.invoke(
-        {"round_no": round_no, "design_text": design_text, "design_ref": design_ref, "attempt": 0},
-        {"configurable": {"thread_id": f"kfpa-round-{round_no}"}},
-    )
-    result = final.get("result") if isinstance(final, dict) else None
-    if not isinstance(result, RoundResult):
-        raise PipelineError(
-            "[pipeline] LangGraph 未产出 RoundResult → 检查图的终止节点与 state['result']"
-        )
-    return result
 
 
 __all__ = [
     "PROMPTS_DIR",
-    "EXIT_PASS",
-    "EXIT_NEEDS_FIX",
-    "EXIT_BLOCKED",
-    "EXIT_OPEN_HIGH_TICKETS",
     "BLOCKED_MARK",
     "EXECUTOR_INJECTIONS",
     "MAX_TICKETS_PER_ROUND",
     "IMPACT_FLOOR_HIGH",
     "IMPACT_FLOOR_MEDIUM",
+    "GRAPH_NODES",
+    "RoundGraphState",
     "PipelineError",
     "DependencyMissingError",
     "OpenHighTicketsError",
@@ -1022,6 +955,6 @@ __all__ = [
     "render_task_package",
     "build_review_prompt",
     "run_round",
-    "build_graph",
     "run_round_via_graph",
+    "build_graph",
 ]
