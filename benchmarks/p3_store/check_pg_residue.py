@@ -16,7 +16,13 @@
     python benchmarks/p3_store/check_pg_residue.py --all            # 连整表行数一起报（看不出归属，仅上下文）
     python benchmarks/p3_store/check_pg_residue.py --allow-skip     # 无 PG 时 rc=0 + 可见说明（clean env 台架用）
 
-退出码（沿用 R-31 三分）：0 = 无残留 / 1 = 有残留 / 2 = 用法错误 / 4 = PG 不可达（未给 --allow-skip）。
+退出码（沿用 R-31 三分）：0 = 无残留 / 1 = 有残留 / 2 = 用法错误（含「目标不是 PG」）
+/ 4 = PG 不可达（未给 --allow-skip）。
+
+> **R-25.1 的坑就在门口**：本工具第一优先读 `KFPA_DB_URL`。若机器上残留的 `KFPA_DB_URL`
+> 指向 sqlite（`sqlite:///...`），旧的实现会连到一个**新建的空 sqlite**、然后宣布「无残留」——
+> 一句撒谎的结论。现在入口就判 `is_postgres_dsn()`，非 PG → **rc=2 + 中文**；
+> 顺利时输出带上**实际后端与打码 DSN**，一眼看出查的是谁。
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ def _repo_root() -> Path:
 REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from kfpa.store import DB_URL_ENV, make_store  # noqa: E402
+from kfpa.store import DB_URL_ENV, is_postgres_dsn, make_store, mask_dsn  # noqa: E402
 
 #: 已知的桩前缀（`stub3-` = 实现方桩；`p3stub-` = 搬进 tests/ 的版本）
 DEFAULT_PREFIXES = ("stub3-", "p3stub-")
@@ -47,8 +53,25 @@ DEFAULT_PREFIXES = ("stub3-", "p3stub-")
 #: 查这两张表；`(表名, id 列)`
 TABLES = (("fastlane_requests", "request_id"), ("knowledge_samples", "cid"))
 
+#: 连接超时（秒）：不可达端口要 2 分钟才返回，会把挂 A0 尾的自查拖成负担
+CONNECT_TIMEOUT_S = 3
+
+
+def _with_timeout(dsn: str) -> str:
+    """给 DSN 加上连接超时（psycopg 认 `connect_timeout`）。
+
+    URL 形式（`postgresql://…`）→ 追加查询参数；关键字形式（`host=… port=…`）→ 追加键值。
+    """
+    if "connect_timeout" in dsn:
+        return dsn
+    if "://" in dsn:
+        sep = "&" if "?" in dsn else "?"
+        return f"{dsn}{sep}connect_timeout={CONNECT_TIMEOUT_S}"
+    return f"{dsn} connect_timeout={CONNECT_TIMEOUT_S}"
+
 
 def _dsn(port: str) -> str:
+    """解析目标 DSN：`KFPA_DB_URL` 优先，否则按端口拼默认。"""
     return os.environ.get(DB_URL_ENV) or f"postgresql://kfpa:kfpa@127.0.0.1:{port}/kfpa"
 
 
@@ -68,12 +91,32 @@ def main(argv: list[str] | None = None) -> int:
         print("[residue] 用法错误：--prefix 不许为空", file=sys.stderr)
         return 2
 
+    dsn = _dsn(args.port)
+    # 门禁：本工具的对象**必须是 PG**。否则（典型是机器上残留的 `KFPA_DB_URL=sqlite://…`）
+    # 会连到一个新建的空 sqlite 并宣布「无残留」—— 那是撒谎的结论（R-25.1 的机型）。
+    if not is_postgres_dsn(dsn):
+        print(
+            f"[residue] 用法错误：残留自查的对象必须是 PostgreSQL，当前目标是 {mask_dsn(dsn)!r} → "
+            f"清掉/改掉环境变量 {DB_URL_ENV}，或用 --port 指向真正的 PG 实例",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
-        store = make_store(_dsn(args.port))
+        store = make_store(_with_timeout(dsn))
     except Exception as exc:  # 依赖/凭据/连接失败 → R-31 判 4
-        msg = f"[residue] 无法连接 PG（{type(exc).__name__}: {exc}）"
+        msg = (f"[residue] 无法连接 PG（{mask_dsn(dsn)}）"
+               f"：{type(exc).__name__}: {exc}")
         print(msg + "；--allow-skip 可把这条降级为可见说明", file=sys.stderr)
         return 0 if args.allow_skip else 4
+
+    if getattr(store, "name", "") != "postgres":  # 理论上不可达：上面已挡住非 PG DSN
+        print(f"[residue] 用法错误：连到的后端是 {type(store).__name__!r}，不是 PostgreSQL",
+              file=sys.stderr)
+        store.close()
+        return 2
+
+    print(f"[residue] 目标：{type(store).__name__}（{mask_dsn(dsn)}，超时 {CONNECT_TIMEOUT_S}s）")
 
     # 占位符按驱动选（psycopg 要 %s、sqlite3 要 ?）—— 这一步用错正是上次「假清理」的根因
     ph = "%s" if getattr(store, "name", "") == "postgres" else "?"
