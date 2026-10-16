@@ -9,6 +9,13 @@ marker 三级、退出口径等），与 `scripts/verify_p0.py`（A1–A10 的�
 """
 import json, os, re, sys, tempfile, pathlib
 
+# R-19：独立脚本不经过 cli.main()，必须在任何 print 之前自己做 stdio 兜底（同 R-18.1）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from kfpa.store import Store, TABLE_NAMES, BUSINESS_TABLES, SCHEMA_VERSION

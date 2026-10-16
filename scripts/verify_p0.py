@@ -1480,8 +1480,22 @@ CHECKS = [
 ]
 
 
+def _force_utf8_stdio() -> None:
+    """R-19：`scripts/**` 是独立脚本，不经过 `cli.main()`，必须自己做与 R-18.1 等价的 stdio 兜底。
+
+    没有这层，在 Windows 上把输出重定向到文件/管道（stdout 被判定为 cp1252 且非 tty）时，
+    本脚本自己的中文 print 就会 UnicodeEncodeError —— 台架先于被测代码崩溃。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="KFPA P0 独立验收台架（A1–A9）")
+    _force_utf8_stdio()   # R-19：必须在任何 print 之前
+    ap = argparse.ArgumentParser(description="KFPA P0 独立验收台架（A1–A10）")
     ap.add_argument("--root", default=str(REPO_ROOT), help="仓库根（默认脚本上级目录）")
     ap.add_argument("--only", default="", help="只跑指定断言，逗号分隔，支持前缀（如 A2,A5）")
     ap.add_argument("--json", dest="json_path", default="", help="把完整证据写到 JSON")
