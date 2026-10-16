@@ -27,9 +27,12 @@ from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from .config import (
     DEFAULT_CONFIG_PATH,
+    PROVIDERS,
     ROLE_NAMES,
     load_roles as _load_roles,
+    normalize_provider,
     normalize_role,
+    resolve_provider,
     role_config,
 )
 
@@ -299,6 +302,174 @@ class MockLLM:
         return self._json({"embedding": vec, "dim": len(vec), "mock": True})
 
 
+# ---------------------------------------------------------------- MockHetero（P2）
+
+
+#: `MockHeteroLLM` 的确定性注入档位（对应 G8 的每一条折算分支）
+HETERO_INJECTIONS: tuple[str, ...] = (
+    "none",                      # 按提示词里的 DEFECT: 行判定
+    "major_with_criterion",      # major + criterion → G8 阻塞
+    "major_without_criterion",   # major 无 criterion → 只记 reasons
+    "minor",                     # 只记 reasons
+    "info",                      # 只记 reasons
+    "malformed",                 # 非 JSON → 解析失败只记 reasons（R-5）
+)
+
+#: 提示词里的机读缺陷行：`DEFECT: AC2 | location: 段4 接口契约 | kind: missing_error_code`
+_DEFECT_PREFIX = "DEFECT:"
+
+
+class MockHeteroLLM:
+    """provider="mock_hetero"（P2 D4-3.2）：**确定性异构评审剧本**，离线可验收。
+
+    与 `MockLLM` 的区别：它扮演「另一家模型」的评审位，只服务 REVIEWER，
+    输出 D4-3.1 的 `ReviewReport` 形状（`verdict` + `findings[{severity,location,issue,suggestion,criterion}]`）。
+
+    判定规则（不推理，只看机读行）：
+    - 提示词里出现 ``DEFECT: <criterion>`` 行 → 一条 `major` + 该 criterion（verdict=fail）；
+    - 没有 DEFECT 行 → verdict=pass、findings 为空；
+    - 构造函数 `inject` 可强制某个 G8 分支（供 A18/A22 逐条验折算），取值见 :data:`HETERO_INJECTIONS`。
+
+    `REVIEWER` 之外的角色一律 `MockScriptError`（异构位只做评审，不抢 ARCHITECT/FLASH 的活）。
+    """
+
+    name = "mock_hetero"
+
+    def __init__(
+        self,
+        roles: Optional[Mapping[str, Any]] = None,
+        inject: str = "none",
+        **kwargs: Any,
+    ) -> None:
+        self.roles = dict(roles or {})
+        if inject not in HETERO_INJECTIONS:
+            raise MockScriptError(
+                f"未知 mock_hetero 注入档：{inject!r}（允许：{' / '.join(HETERO_INJECTIONS)}）"
+            )
+        self.inject = inject
+        self.options = dict(kwargs)
+
+    def complete(self, role: str, system: str, user: str, *, json_mode: bool = False) -> str:
+        name = normalize_role(role)
+        if name != "REVIEWER":
+            raise MockScriptError(
+                f"mock_hetero 只服务 REVIEWER（异构评审位），当前角色是 {name} → 检查 provider 配置"
+            )
+        if self.inject == "malformed":
+            return "（mock_hetero）这不是 JSON：模拟评审格式不合法，门禁只应记 reasons"
+        findings = self._findings_from_text(f"{system}\n{user}")
+        self._apply_injection(findings)
+        verdict = "fail" if any(f["severity"] == "major" for f in findings) else "pass"
+        return json.dumps({"verdict": verdict, "findings": findings}, ensure_ascii=False, sort_keys=True)
+
+    # -------------------------------------------------- 内部
+
+    def _findings_from_text(self, text: str) -> list[dict[str, str]]:
+        """抽缺陷标记 → findings（D4-3.4 与长流种子集共用的机读形状）。
+
+        主口径（长流 `benchmarks/review/seed.jsonl` 用的）：标记**嵌在六段正文里**
+        ``[DEFECT:<kind>] <criterion>: <描述>``，例如
+        ``[DEFECT:missing_error_code] AC2: 接口契约只写了成功返回，没写错误码``。
+        criterion 为空（`[DEFECT:kind]: 描述`）时按「无法定位」处理，G8 不阻塞。
+
+        兼容口径：行首 `DEFECT: <criterion> | location: … | kind: …`（早期形状）。
+
+        **没有缺陷标记时返回空列表**（长流要求：默认剧本必须 verdict=pass + findings=[]，
+        否则会把 P0/P1 的 happy path 判红）。
+        """
+        findings: list[dict[str, str]] = []
+        pattern = re.compile(r"\[DEFECT:([^\]]+)\]\s*([^:\s]*)\s*:?\s*(.*)")
+        for raw in text.splitlines():
+            line = raw.strip()
+            matched = pattern.search(line)
+            if matched is not None:
+                kind, criterion, desc = matched.group(1).strip(), matched.group(2).strip(), matched.group(3).strip()
+                findings.append(
+                    {
+                        "severity": "major",
+                        "location": "任务包",
+                        "issue": f"[{kind}] {desc}".strip(),
+                        "suggestion": "按 criterion 修正后重跑",
+                        "criterion": criterion,
+                    }
+                )
+                continue
+            if line.upper().startswith(_DEFECT_PREFIX):  # 早期行首形状
+                body = line.split(":", 1)[1]
+                segments = [seg.strip() for seg in body.split("|")]
+                criterion = segments[0] if segments else ""
+                fields: dict[str, str] = {}
+                for seg in segments[1:]:
+                    if ":" in seg:
+                        key, value = seg.split(":", 1)
+                        fields[key.strip().lower()] = value.strip()
+                findings.append(
+                    {
+                        "severity": "major",
+                        "location": fields.get("location", "任务包"),
+                        "issue": fields.get("kind", "异构评审发现的问题"),
+                        "suggestion": fields.get("suggestion", "按 criterion 修正后重跑"),
+                        "criterion": criterion,
+                    }
+                )
+        return findings
+
+    def _apply_injection(self, findings: list[dict[str, str]]) -> None:
+        if self.inject == "none":
+            return
+        base = {"location": "任务包", "issue": f"mock_hetero 注入：{self.inject}", "suggestion": "见 G8 折算"}
+        if self.inject == "major_with_criterion":
+            findings.append({**base, "severity": "major", "criterion": "AC1"})
+        elif self.inject == "major_without_criterion":
+            findings.append({**base, "severity": "major", "criterion": ""})
+        elif self.inject == "minor":
+            findings.append({**base, "severity": "minor", "criterion": ""})
+        elif self.inject == "info":
+            findings.append({**base, "severity": "info", "criterion": ""})
+
+
+class RoleRoutingLLM:
+    """按角色解析 provider 的路由器（P2 D4-3.2）。
+
+    `resolve_provider()` 决定每个角色用哪个适配器；同一个 provider 的适配器只构造一次。
+    """
+
+    name = "role-router"
+
+    def __init__(
+        self,
+        roles: Mapping[str, Any],
+        override: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.roles = dict(roles or {})
+        self.override = override
+        self.options = dict(kwargs)
+        self._adapters: dict[str, LLM] = {}
+
+    def provider_for(self, role: str) -> str:
+        return resolve_provider(self.roles, role, self.override)
+
+    def adapter_for(self, role: str) -> LLM:
+        provider = self.provider_for(role)
+        if provider not in self._adapters:
+            self._adapters[provider] = _build_single(self.roles, provider, **self.options)
+        return self._adapters[provider]
+
+    def complete(self, role: str, system: str, user: str, *, json_mode: bool = False) -> str:
+        return self.adapter_for(role).complete(role, system, user, json_mode=json_mode)
+
+
+def _build_single(roles: Mapping[str, Any], provider: str, **kwargs: Any) -> LLM:
+    """构造单个 provider 的适配器（未知 provider → ValueError 中文）。"""
+    key = normalize_provider(provider)
+    if key == "mock":
+        return MockLLM(roles=roles, **kwargs)
+    if key == "mock_hetero":
+        return MockHeteroLLM(roles=roles, **kwargs)
+    return LiteLLMAdapter(roles=roles, **kwargs)
+
+
 # ---------------------------------------------------------------- LiteLLM
 
 
@@ -362,24 +533,54 @@ class LiteLLMAdapter:
         return resp.choices[0].message.content or ""
 
 
-def build_llm(roles: Mapping[str, Any], provider: str = "mock", **kwargs: Any) -> LLM:
-    """装配 LLM。`provider` 只认 mock / litellm；未知 provider 抛 ValueError（中文）。"""
-    key = str(provider or "mock").strip().lower()
+def _build_single(roles: Mapping[str, Any], provider: str, **kwargs: Any) -> LLM:
+    """构造单个 provider 的适配器（未知 provider → ValueError 中文）。
+
+    每个适配器只吃自己的参数（`mock` 吃 injection/high_impact、`mock_hetero` 吃 inject），
+    其余一律丢掉——路由器的 kwargs 是全局的，不能因为给 REVIEWER 的档位把 ARCHITECT 顶炸。
+    """
+    key = normalize_provider(provider)
     if key == "mock":
-        return MockLLM(roles=roles, **kwargs)
+        allowed = {k: v for k, v in kwargs.items() if k in ("injection", "high_impact")}
+        return MockLLM(roles=roles, **allowed)
+    if key == "mock_hetero":
+        allowed = {k: v for k, v in kwargs.items() if k == "inject"}
+        return MockHeteroLLM(roles=roles, **allowed)
     if key == "litellm":
-        return LiteLLMAdapter(roles=roles, **kwargs)
-    raise ValueError(f"未知 provider：{provider!r}（可选：mock / litellm）")
+        return LiteLLMAdapter(roles=roles)
+    raise ValueError(f"未知 provider：{provider!r}（可选：{' / '.join(PROVIDERS)}）")
+
+
+def build_llm(
+    roles: Mapping[str, Any],
+    provider: Optional[str] = None,
+    **kwargs: Any,
+) -> LLM:
+    """装配 LLM（P2 D4-3.2）。
+
+    - `provider=None`（默认）→ :class:`RoleRoutingLLM`：**按角色**解析 provider
+      （CLI 全局 `--provider` > 角色 `provider:` > `mock`）；
+    - `provider="mock" | "mock_hetero" | "litellm"` → 对所有角色**强制**该 provider（旧行为兼容）；
+    - 未知 provider → `ValueError`（中文）。
+    """
+    if provider is None or not str(provider).strip():
+        return RoleRoutingLLM(roles, override=None, **kwargs)
+    key = normalize_provider(provider)
+    return _build_single(roles, key, **kwargs)
 
 
 __all__ = [
     "LLM",
     "MockLLM",
+    "MockHeteroLLM",
+    "RoleRoutingLLM",
     "MockScriptError",
     "LiteLLMAdapter",
     "build_llm",
     "load_roles",
     "ROLE_NAMES",
+    "PROVIDERS",
+    "HETERO_INJECTIONS",
     "MARKER_TASK_QA",
     "MARKER_TASK_PACKAGE",
     "MARKER_GEN_TICKETS",

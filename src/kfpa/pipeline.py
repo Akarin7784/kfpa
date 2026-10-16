@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 from . import gates
 from . import knowledge
 from . import ledger as ledger_mod
+from . import review as review_mod
 from .schemas import (
     AcceptanceCriterion,
     ExecResult,
@@ -655,10 +656,12 @@ def _stage_gate(
     exec_result: ExecResult,
     attempt: int,
     coverage: Any = None,
+    reviews: Any = None,
 ) -> GateReport:
-    """门禁判定；`coverage` 非 None 时才启用 G7（R-22.3：无报告不得判红）。"""
+    """门禁判定；`coverage` 非 None 才启用 G7（R-22.3），`reviews` 走 G8 折算（D4-3.3）。"""
     report = gates.evaluate(
-        package.round_no, package, exec_result, store, attempt=attempt, coverage=coverage
+        package.round_no, package, exec_result, store, attempt=attempt,
+        coverage=coverage, reviews=reviews,
     )
     store.save_gate_report(report)
     coverage_note = ""
@@ -739,6 +742,9 @@ def build_graph(
     checkpointer: Any = None,
     coverage: Any = None,
     coverage_json: str | Path | None = None,
+    review: bool = True,
+    review_provider: str = "mock_hetero",
+    review_model_ref: str = "",
 ) -> Any:
     """编译 LangGraph `StateGraph`（签名与 state 契约见 D2 R-14）。
 
@@ -760,6 +766,8 @@ def build_graph(
     coverage_report = coverage
     if coverage_report is None and coverage_json:
         coverage_report = gates.load_coverage_report(coverage_json)
+    # P2 D4-3.3：REVIEWER 接入主循环的开关与留痕信息（provider 只记录，实际路由由 llm 按角色完成）
+    review_enabled = bool(review)
     try:
         from langgraph.graph import END, StateGraph
     except ImportError as exc:  # pragma: no cover - 依赖由 Chief 统一安装
@@ -851,12 +859,48 @@ def build_graph(
         exec_result = state.get("exec_result")
         if package is None or exec_result is None:  # pragma: no cover
             raise PipelineError("[pipeline] gate 缺少任务包或执行结果 → 检查 execute 出边")
-        report = _stage_gate(
-            store, package, exec_result, int(state.get("attempt", 1)), coverage_report
-        )
+        round_no = int(state["round_no"])
+        attempt = int(state.get("attempt", 1))
+
+        # P2 D4-3.3：REVIEWER 接入主循环（fresh context），发现按 G8 折算进本次门禁
+        reviews: Any = None
+        if review_enabled:
+            try:
+                review_report = review_mod.run_review(
+                    package,
+                    llm,
+                    provider=review_provider,
+                    round_no=round_no,
+                    attempt=attempt,
+                    model_ref=review_model_ref,
+                )
+                review_mod.persist_report(store, review_report)
+                if review_report.parse_ok:
+                    reviews = review_mod.review_findings_as_dicts(review_report)
+                else:
+                    # R-5 / A22：解析失败只记 reasons，不改三态
+                    reviews = [{
+                        "severity": "info",
+                        "location": f"review:{review_report.context_id}",
+                        "issue": "评审输出解析失败 → 只记录，不改三态（R-5）",
+                    }]
+                _log(
+                    f"[6/6] 评审位（{review_report.provider}，context={review_report.context_id}）："
+                    f"parse_ok={review_report.parse_ok} verdict={review_report.verdict} "
+                    f"findings={len(review_report.findings)} blockers={len(review_report.blockers())}"
+                )
+            except Exception as exc:  # 评审位异常不得让主循环崩（R-5 语义）
+                _log(f"[6/6] 评审位调用异常（{exc}）→ 只记录，不改三态")
+                reviews = [{
+                    "severity": "info",
+                    "location": "review:error",
+                    "issue": f"评审位调用异常（{type(exc).__name__}）→ 只记录，不改三态",
+                }]
+
+        report = _stage_gate(store, package, exec_result, attempt, coverage_report, reviews)
         return {
             "gate": report,
-            "avoid_patterns": _scoped_avoid_patterns(store, int(state["round_no"])),
+            "avoid_patterns": _scoped_avoid_patterns(store, round_no),
         }
 
     def route_gate(state: RoundGraphState) -> str:
@@ -1065,8 +1109,11 @@ def run_round(
     roles: Optional[dict[str, dict]] = None,
     coverage: Any = None,
     coverage_json: str | Path | None = None,
+    review: bool = True,
+    review_provider: str = "mock_hetero",
+    review_model_ref: str = "",
 ) -> RoundResult:
-    """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14 + P1 D3-3.4/3.5）。
+    """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14 + P1 D3-3.4/3.5 + P2 D4-3.3）。
 
     - 未关闭 HIGH 票 → `state=TICKETS_OPEN` + `BLOCKED_MARK`（CLI 退出码 3）；
     - `injection` 只把 `apply_fail` / `test_fail` 转给执行器（R-10）；
@@ -1076,6 +1123,7 @@ def run_round(
       每次 `LLM.complete()` 经账本 wrapper 落一条 `LedgerEntry`（D3-3.4）；
       PASS 轮把「任务包真的用到的隔离区候选」标记复用并按规则转正（D3-3.5）；
       `coverage` / `coverage_json` 只在显式提供时启用 G7（R-22.3）。
+    - **P2**：`review=True` 时每轮门禁前调 REVIEWER（fresh context，D4-3.3），发现按 G8 折算并留痕。
     """
     if ledger is None:
         ledger = ledger_mod.make_ledger(store)
@@ -1098,6 +1146,9 @@ def run_round(
         checkpointer=resolved_checkpointer,
         coverage=coverage,
         coverage_json=coverage_json,
+        review=review,
+        review_provider=review_provider,
+        review_model_ref=review_model_ref,
     )
     payload = {"round_no": round_no, "design_text": design_text, "design_ref": design_ref}
     final = (
@@ -1127,6 +1178,9 @@ def run_round_via_graph(
     checkpointer: Any = "auto",
     coverage: Any = None,
     coverage_json: str | Path | None = None,
+    review: bool = True,
+    review_provider: str = "mock_hetero",
+    review_model_ref: str = "",
 ) -> RoundResult:
     """兼容别名：语义与 `run_round` 完全一致（两者都走 LangGraph）。"""
     return run_round(
@@ -1143,6 +1197,9 @@ def run_round_via_graph(
         checkpointer=checkpointer,
         coverage=coverage,
         coverage_json=coverage_json,
+        review=review,
+        review_provider=review_provider,
+        review_model_ref=review_model_ref,
     )
 
 

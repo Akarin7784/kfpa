@@ -24,8 +24,11 @@ from ..schemas import (
     KnowledgeCandidate,
     LedgerEntry,
     QATicket,
+    ReviewFinding,
+    ReviewReport,
     Round,
     RoundState,
+    Severity,
     Snapshot,
     TaskPackage,
     TicketImpact,
@@ -66,14 +69,19 @@ class PostgresStore:
     # ------------------------------------------------------------ 生命周期
 
     def init_schema(self) -> None:
-        """执行 `migrations/0001_init.sql`（幂等）+ 写 `meta.schema_version`。"""
-        path = _migration_path()
-        if not path.is_file():
-            raise RuntimeError(f"找不到迁移文件：{path} → 检查仓库是否完整（migrations/0001_init.sql）")
-        script = path.read_text(encoding="utf-8")
+        """按文件名顺序执行 `migrations/*.sql`（幂等）+ 写 `meta.schema_version`。
+
+        P2 起 `0001_init.sql` / `0002_reviews.sql` 依次应用；新增迁移只要加文件。
+        """
+        paths = sorted(migrations_dir().glob("*.sql"))
+        if not paths:
+            raise RuntimeError(
+                f"找不到迁移文件：{migrations_dir()} → 检查仓库是否完整（migrations/0001_init.sql）"
+            )
         with self._conn.cursor() as cur:
-            for statement in _split_statements(script):
-                cur.execute(statement)
+            for path in paths:
+                for statement in _split_statements(path.read_text(encoding="utf-8")):
+                    cur.execute(statement)
             cur.execute(
                 "INSERT INTO meta(key, value) VALUES(%s, %s) "
                 "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
@@ -496,12 +504,71 @@ class PostgresStore:
             if cur.rowcount == 0:
                 raise KeyError(f"沉淀候选不存在：{cid}")
 
+    # ------------------------------------------------------------ P2 评审留痕（D4-3.3 / A19）
+
+    def add_review_report(self, report: ReviewReport) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO reviews(round_no, attempt, provider, model_ref, context_id,
+                                parse_ok, verdict, findings, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                report.round_no,
+                report.attempt,
+                report.provider,
+                report.model_ref,
+                report.context_id,
+                1 if report.parse_ok else 0,
+                report.verdict,
+                dumps(list(report.findings)),
+                report.created_at or time.time(),
+            ),
+        )
+
+    def list_review_reports(self, round_no: Optional[int] = None) -> list[ReviewReport]:
+        if round_no is None:
+            rows = self._conn.execute(
+                "SELECT * FROM reviews ORDER BY round_no, attempt, id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM reviews WHERE round_no = %s ORDER BY attempt, id", (round_no,)
+            ).fetchall()
+        return [_review_from_row(r) for r in rows]
+
 
 # ---------------------------------------------------------------- 内部工具
 
 
-def _migration_path() -> Path:
-    return migrations_dir() / "0001_init.sql"
+def _review_from_row(row: dict[str, Any]) -> ReviewReport:
+    """把 reviews 行还原成 `ReviewReport`（与 SQLite 侧同一口径）。"""
+    try:
+        raw = json.loads(row["findings"]) if row["findings"] else []
+    except (TypeError, ValueError):
+        raw = []
+    findings = [
+        ReviewFinding(
+            severity=Severity(item.get("severity", Severity.INFO.value)),
+            location=str(item.get("location", "")),
+            issue=str(item.get("issue", "")),
+            suggestion=str(item.get("suggestion", "")),
+            criterion=str(item.get("criterion", "")),
+        )
+        for item in raw
+        if isinstance(item, dict)
+    ]
+    return ReviewReport(
+        round_no=row["round_no"],
+        provider=row["provider"],
+        model_ref=row["model_ref"],
+        context_id=row["context_id"],
+        parse_ok=bool(row["parse_ok"]),
+        verdict=row["verdict"],
+        findings=findings,
+        attempt=row["attempt"],
+        created_at=row["created_at"],
+    )
 
 
 def _split_statements(script: str) -> list[str]:

@@ -26,6 +26,12 @@ DEFAULT_CONFIG_PATH = "config/models.yaml"
 #: 可覆盖配置路径的环境变量（R-26）
 CONFIG_ENV = "KFPA_CONFIG"
 
+#: 合法 provider（P2 D4-3.2）：角色级 `provider:` 字段与 CLI `--provider` 共用白名单
+PROVIDERS: tuple[str, ...] = ("mock", "mock_hetero", "litellm")
+
+#: 默认 provider（角色没写 `provider:` 时）
+DEFAULT_PROVIDER = "mock"
+
 
 def resolve_config_path(config_path: str | Path = DEFAULT_CONFIG_PATH) -> Path:
     """R-26：把配置路径解析成一个真实文件，**不依赖 cwd**。
@@ -94,6 +100,32 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]
     return dict(data)
 
 
+def normalize_provider(provider: str | None) -> str:
+    """规范并校验 provider 名；未知值抛 ValueError（中文）。None/空 → 默认 `mock`。"""
+    name = str(provider or "").strip().lower() or DEFAULT_PROVIDER
+    if name not in PROVIDERS:
+        raise ValueError(f"未知 provider：{provider!r}（允许：{' / '.join(PROVIDERS)}）")
+    return name
+
+
+def resolve_provider(
+    roles: Mapping[str, Any] | None,
+    role: str,
+    override: str | None = None,
+) -> str:
+    """按角色解析 provider（P2 D4-3.2）。
+
+    优先级：**CLI 全局 `--provider`（override）> 角色自己的 `provider:` > 默认 `mock`**。
+    `override=None` / 空串 = 不覆盖（走角色配置）。
+    """
+    if override is not None and str(override).strip():
+        return normalize_provider(override)
+    name = normalize_role(role)
+    spec = roles.get(name) if isinstance(roles, Mapping) else None
+    configured = spec.get("provider") if isinstance(spec, Mapping) else None
+    return normalize_provider(configured)
+
+
 def validate_roles(roles: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
     """校验角色表并返回规范化副本。
 
@@ -101,7 +133,8 @@ def validate_roles(roles: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]
     1. `roles` 必须是非空映射；
     2. 角色名必须在 :data:`ROLE_NAMES` 内——多出未知角色 = 配置错误，直接报错（防拼写错误静默降级）；
     3. :data:`CORE_ROLES` 必须齐全，且每项是映射、`model` 是非空字符串；
-    4. EMBEDDING 不参与 P0 验收，存在就必须合法，缺失不算错。
+    4. EMBEDDING 不参与 P0 验收，存在就必须合法，缺失不算错；
+    5. **P2**：角色若写了 `provider:`，必须在 :data:`PROVIDERS` 白名单内（写错就报错，不静默降级成 mock）。
     """
     if not isinstance(roles, Mapping) or not roles:
         raise ValueError("角色配置为空：models.yaml 里的 roles 必须是非空映射")
@@ -114,6 +147,8 @@ def validate_roles(roles: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]
         model = spec.get("model")
         if model is None or not str(model).strip():
             raise ValueError(f"角色 {name} 缺少非空的 model 字段（模型绑定只能在 models.yaml 里改）")
+        if spec.get("provider") is not None:
+            normalize_provider(spec.get("provider"))  # 未知 provider → ValueError
         result[name] = dict(spec)
 
     missing = [name for name in CORE_ROLES if name not in result]
@@ -140,9 +175,15 @@ __all__ = [
     "ROLE_NAMES",
     "CORE_ROLES",
     "DEFAULT_CONFIG_PATH",
+    "CONFIG_ENV",
+    "PROVIDERS",
+    "DEFAULT_PROVIDER",
     "normalize_role",
+    "normalize_provider",
+    "resolve_provider",
     "load_config",
     "validate_roles",
     "load_roles",
     "role_config",
+    "resolve_config_path",
 ]
