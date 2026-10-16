@@ -14,9 +14,11 @@ roles:
     notes: "当前与 FLASH 同源，同源盲区债务挂账中"
 
   # 评审位：对抗性评审 / PR-Agent 审查聚合
-  # [待替换] 接入异构 API 后，只改这里两行，其他什么都不用动
+  # P2（D4-3.2）：评审位默认走**异构** provider（离线确定性剧本），消化「一个模型两挡位」的同源盲区。
+  # 真实异构模型到位后：把 provider 改成 litellm、model 换成另一家的模型串即可，代码零改动。
   REVIEWER:
     model: deepseek/deepseek-v4.1-flash   # [占位] 异构模型到位后换掉
+    provider: mock_hetero     # 离线异构评审位（P2 默认）；真实 key 到位后改 litellm 一行
     thinking: true
     fresh_context: true       # 硬规则：评审永远开全新上下文，禁止复用主BOT会话
     temperature: 0.4

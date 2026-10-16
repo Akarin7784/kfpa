@@ -30,8 +30,11 @@ from ..schemas import (
     KnowledgeCandidate,
     LedgerEntry,
     QATicket,
+    ReviewFinding,
+    ReviewReport,
     Round,
     RoundState,
+    Severity,
     Snapshot,
     TaskPackage,
     TicketImpact,
@@ -45,11 +48,18 @@ def _enum_value(value: Any) -> str:
     """str/Enum 统一成入库用的裸字符串（CandidateStatus 是 str Enum）。"""
     return str(value.value) if hasattr(value, "value") else str(value)
 
-#: 当前 schema 版本（P1 = "2"，写入 meta.schema_version）
-SCHEMA_VERSION = "2"
+#: 当前 schema 版本（P2 = "3"，写入 meta.schema_version）
+SCHEMA_VERSION = "3"
 
 #: P0 时代的 schema 版本（历史记录/兼容判定用）
 P0_SCHEMA_VERSION = "1"
+
+#: P1 的 schema 版本
+P1_SCHEMA_VERSION = "2"
+
+#: P2 的 schema 版本（`SCHEMA_VERSION` 始终等于当前阶段的常量）
+P2_SCHEMA_VERSION = "3"
+assert SCHEMA_VERSION == P2_SCHEMA_VERSION, "SCHEMA_VERSION 必须等于当前阶段的常量"
 
 #: D1-9 的 meta 表名
 META_TABLE = "meta"
@@ -67,11 +77,14 @@ BUSINESS_TABLES = (
 #: P1 新增的两张业务表（docs/dev/p1-plan.md §3.2）
 P1_TABLE_NAMES = ("ledger", "knowledge")
 
+#: P2 新增的表（docs/dev/p2-plan.md §3.3：评审留痕）
+P2_TABLE_NAMES = ("reviews",)
+
 #: P0 建库后的表集合（含 meta）——P0 台架 selfcheck_core 依赖此常量
 TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES)
 
-#: P1 建库后的完整表集合（含 meta）
-ALL_TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES, *P1_TABLE_NAMES)
+#: 当前建库后的完整表集合（含 meta）——A12 对拍与 P1/P2 台架用这个
+ALL_TABLE_NAMES = (META_TABLE, *BUSINESS_TABLES, *P1_TABLE_NAMES, *P2_TABLE_NAMES)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -167,6 +180,21 @@ CREATE TABLE IF NOT EXISTS knowledge (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_knowledge_status ON knowledge(status, round_no);
+
+-- ------------------------------------------------------------ P2（D4-3.3：评审留痕 / fresh context）
+CREATE TABLE IF NOT EXISTS reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_no   INTEGER NOT NULL,
+    attempt    INTEGER NOT NULL DEFAULT 1,
+    provider   TEXT NOT NULL,
+    model_ref  TEXT NOT NULL DEFAULT '',
+    context_id TEXT NOT NULL,
+    parse_ok   INTEGER NOT NULL DEFAULT 0,
+    verdict    TEXT NOT NULL DEFAULT 'unknown',
+    findings   TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_reviews_round ON reviews(round_no, attempt);
 """
 
 
@@ -714,6 +742,72 @@ class SqliteStore:
         self._conn.execute("UPDATE knowledge SET status = ? WHERE cid = ?", ("dropped", cid))
         self._conn.commit()
 
+    # ------------------------------------------------------------ P2 评审留痕（D4-3.3 / A19）
+
+    def add_review_report(self, report: ReviewReport) -> None:
+        """落一条评审留痕（含 `context_id`，A19 靠它验 fresh context）。"""
+        self._conn.execute(
+            """
+            INSERT INTO reviews(round_no, attempt, provider, model_ref, context_id,
+                                parse_ok, verdict, findings, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.round_no,
+                report.attempt,
+                report.provider,
+                report.model_ref,
+                report.context_id,
+                1 if report.parse_ok else 0,
+                report.verdict,
+                dumps(list(report.findings)),
+                report.created_at or time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def list_review_reports(self, round_no: Optional[int] = None) -> list[ReviewReport]:
+        """按轮次列评审留痕（None = 全部），按 round_no、attempt、id 排序。"""
+        if round_no is None:
+            rows = self._conn.execute(
+                "SELECT * FROM reviews ORDER BY round_no, attempt, id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM reviews WHERE round_no = ? ORDER BY attempt, id", (round_no,)
+            ).fetchall()
+        return [_review_from_row(r) for r in rows]
+
+
+def _review_from_row(row: sqlite3.Row) -> ReviewReport:
+    """把 reviews 行还原成 `ReviewReport`（findings 走 JSON，severity 还原成枚举）。"""
+    try:
+        raw = json.loads(row["findings"]) if row["findings"] else []
+    except (TypeError, ValueError):
+        raw = []
+    findings = [
+        ReviewFinding(
+            severity=Severity(item.get("severity", Severity.INFO.value)),
+            location=str(item.get("location", "")),
+            issue=str(item.get("issue", "")),
+            suggestion=str(item.get("suggestion", "")),
+            criterion=str(item.get("criterion", "")),
+        )
+        for item in raw
+        if isinstance(item, dict)
+    ]
+    return ReviewReport(
+        round_no=row["round_no"],
+        provider=row["provider"],
+        model_ref=row["model_ref"],
+        context_id=row["context_id"],
+        parse_ok=bool(row["parse_ok"]),
+        verdict=row["verdict"],
+        findings=findings,
+        attempt=row["attempt"],
+        created_at=row["created_at"],
+    )
+
 
 def _candidate_from_row(row: sqlite3.Row) -> KnowledgeCandidate:
     raw = row["reused_by"]
@@ -738,10 +832,13 @@ __all__ = [
     "SCHEMA_SQL",
     "SCHEMA_VERSION",
     "P0_SCHEMA_VERSION",
+    "P1_SCHEMA_VERSION",
+    "P2_SCHEMA_VERSION",
     "TABLE_NAMES",
     "ALL_TABLE_NAMES",
     "BUSINESS_TABLES",
     "P1_TABLE_NAMES",
+    "P2_TABLE_NAMES",
     "META_TABLE",
     "schemas",
 ]
