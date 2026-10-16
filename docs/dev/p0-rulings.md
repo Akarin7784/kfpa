@@ -382,6 +382,26 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
    `run_round(..., coverage: CoverageReport | None = None)`，内部转给 `gates.evaluate(..., coverage=…)`。
    CLI 现有的 `coverage` / `coverage_report` 兼容探测保留，但**以 `coverage` 为准**，将来只加这一个名字。
 
+## R-25 存储优先级改回「显式 `--db` 优先」；台架必须剥掉 `KFPA_DB_URL`
+
+**我自己的实测样本（合并 #27/#29 后）**：我把 `KFPA_DB_URL` 导出到全局再跑台架 →
+**A6/A7/A7.2/A10/A11/A12/A13 全变红**。原因是 R-24 之后的口径是「`KFPA_DB_URL` 压过显式普通路径」，
+于是台架给每个断言准备的临时库全被顶成了同一个 PG。清掉该变量重跑：P0 **13/13**、P1 **7/8**（只剩 A12）。
+这不是产品 bug，但它暴露了**优先级方向错了**：显式 `--db /tmp/x.db` 被环境变量静默改写，
+违反 CLI 常规约定，也制造了一整类「环境变量残留 → 台架全红」的假红。
+
+**裁决 R-25**：
+
+1. **优先级（改回常规）**：显式 `--db`（DSN 或普通路径） **>** `KFPA_DB_URL` **>** 默认 `kfpa.db`。
+   `KFPA_DB_URL` 只在「没给 `--db`」或「`--db` 等于默认 `kfpa.db`」时生效。
+   `make_store` 里 `explicit` 非空且非默认路径时，一律按 `explicit` 走，不再让 env 覆盖。
+2. **台架 A12 的 PG 侧显式传 DSN**，不依赖环境变量：
+   `--db postgresql://kfpa:kfpa@127.0.0.1:${KFPA_PG_PORT:-55440}/kfpa`。对拍本来就是「显式指定两库」，
+   这比靠 env 隐式切换清楚得多。
+3. **台架所有子进程统一剥掉 `KFPA_DB_URL`**（以及 `PYTHONIOENCODING` 的既有要求）：
+   谁机器上残留了这个变量，都不许把台架的临时库顶掉。这是台架的硬要求（与 R-19/R-22 同级）。
+4. A12 的端口仍按 R-22.1：台架读 `KFPA_PG_PORT`，默认 `55440`，禁用 55432–55434。
+
 ---
 
 ## 变更记录
@@ -400,3 +420,4 @@ UnicodeEncodeError: 'charmap' codec can't encode characters in position 8-11   �
 | 1.9 | 2026-10-16 | R-22 P1 首轮验收六红定位：PG 端口默认 55440 · checkpoint 落盘口径 · G7 仅在提供报告时启用 · 覆盖率白名单 · A14 只验机制 · A17 以台架口径为准 | Chief |
 | 2.0 | 2026-10-16 | R-23 快车道承认不进 P1（P3 落库）；`diff_files` 三来源优先级（执行产物 → `--files` → `no_diff_source`） | Chief |
 | 2.1 | 2026-10-16 | R-24 账本角色断言只认实际调用 · compose 去固定 `container_name` + 台架独立项目名 · `fastlane check` 退出码 0 · `run_round(coverage=)` 形参名冻结 | Chief |
+| 2.2 | 2026-10-16 | R-25 存储优先级改回「显式 `--db` 优先于 `KFPA_DB_URL`」· 台架 A12 显式传 DSN · 台架子进程必须剥掉 `KFPA_DB_URL` | Chief |

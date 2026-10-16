@@ -605,6 +605,23 @@ def _stage_execute(
     store.set_round_state(package.round_no, RoundState.EXECUTING)
     result = executor.apply(package, workdir)
     store.set_round_state(package.round_no, RoundState.GATED)
+    try:
+        # R-23.2 来源①：把执行器真实产出落盘，`kfpa fastlane check` 优先读它（不依赖 git 状态）
+        (workdir / "files_changed.json").write_text(
+            json.dumps(
+                {
+                    "round_no": package.round_no,
+                    "attempt": attempt,
+                    "files_changed": list(result.files_changed or []),
+                    "executor": getattr(result, "executor", ""),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:  # pragma: no cover - 落盘失败不影响门禁
+        _log(f"[pipeline] 改动清单落盘失败（{exc}）→ fastlane 将退回 --files / no_diff_source")
     return result
 
 
