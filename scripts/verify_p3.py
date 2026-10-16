@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -61,9 +62,26 @@ COVER_WHITELIST = (
 )
 COVER_WHITELIST_PREFIX: tuple[str, ...] = ()
 COVER_EXTERNAL_FILES = ("src/kfpa/store/postgres.py",)
-#: P3 新增模块：不在 R-32 门槛里，但必须**可见**（低于 80% 报建议，避免「门禁绿、新代码没测」）
-COVER_P3_REPORT_ONLY = ("src/kfpa/fastlane.py", "src/kfpa/knowledge.py", "src/kfpa/rag.py")
 COVER_THRESHOLD = 0.80
+#: R-33 配套（#59）：P3 新模块的 A20 增量 —— `knowledge.py` / `fastlane.py` **各 ≥80%**。
+#: 生效判据（不是「收口时再说」的口头约定，也不能让 A0 在落地前假红）：
+#:   ① 文件在树上 **且** ② 该模块的 P3 冻结接口已落地 → 进门槛，缺一即 FAIL；
+#:   只缺 ①/② 时 A23–A25 本来就是红的派工单，这里只作**可见报告项**，A0 保持绿。
+#:   注意「躲覆盖」不成立：不落接口 → A24/A25 直接红，红点只是换了检查项。
+COVER_P3_GATE: dict[str, tuple[str, str]] = {
+    "src/kfpa/fastlane.py": ("长流", "judge"),            # D5 §3.2 冻结纯函数
+    "src/kfpa/knowledge.py": ("长流", "record_sample"),   # D5 §3.3 P3 新增出口
+}
+#: 只作报告项的 P3 模块：`rag.py` 的 Dify 分支在无凭据环境不可达（#59：与 store/postgres.py 同理）
+COVER_P3_REPORT_ONLY = ("src/kfpa/rag.py",)
+#: A26 复用 A12 夹具（R-33）：KFPA_PG_PORT 优先、默认 55440；55432-55434 禁用（R-22.1）
+DEFAULT_PG_PORT = "55440"
+FORBIDDEN_PG_PORTS = ("55432", "55433", "55434")
+PG_COMPOSE = "docker-compose.yml"
+#: A26 双库对拍用**每进程唯一轮号**（A12 的 PROBE_ROUND 用 1000+，这里错开 20000 段），
+#: 免得共享 PG 库里别的进程那一轮的行混进 R-28 的「本轮+上一轮」窗口。
+A26_ROUND_BASE = 20000
+A26_ROUND_SPAN = 5000
 #: P2 收口时的白名单覆盖率（main `274c1c1` 实测）——只作对比基线，P3 门槛仍是 80%
 P2_WHITELIST_BASELINE = 0.907
 
@@ -353,7 +371,29 @@ def check_a0(ctx: Ctx, c: Check) -> None:
     if rate < P2_WHITELIST_BASELINE:
         c.warn(f"A0：R-32 白名单覆盖率 {rate:.1%} 低于 P2 收口基线 {P2_WHITELIST_BASELINE:.1%}"
                "（新增语句会拉低比率；低于 80% 才算 FAIL，这里只提示）。")
-    # P3 新增模块必须可见（不在 R-32 门槛内，但低于 80% 要报出来）
+    # R-33 配套（#59）：P3 新模块的 A20 增量门槛（各 ≥80%）——生效判据见 COVER_P3_GATE 注释
+    for f, (owner, iface) in COVER_P3_GATE.items():
+        if not (ctx.root / f).exists():
+            c.add(ok=True, note=f"A0（报告项）：P3 模块 {f} 尚未落地——红点归 A23–A25 的派工单（{owner}）")
+            continue
+        mod, merr = import_mod("kfpa." + Path(f).stem)
+        if mod is None or not callable(getattr(mod, iface, None)):
+            c.add(ok=True, note=f"A0（报告项）：{f} 在树上但冻结出口 `{iface}` 未落地"
+                                f"（import={merr or 'ok'}）——先由 A24/A25 判红，覆盖率暂只报告")
+            continue
+        info = per_file.get(f)
+        if info is None:
+            c.add(ok=False, note=f"A0：{f} 已落地（`{iface}` 可调用）却没出现在覆盖率报告")
+            c.fail(f"A0（硬验收）：P3 模块 {f} 已落地却被测试完全绕过（按 0 计）。")
+            continue
+        c.add(ok=info["rate"] >= COVER_THRESHOLD,
+              note=f"A0：P3 模块 {f} 行覆盖 {info['rate']:.1%}"
+                   f"（{info['covered']}/{info['statements']}）>= {COVER_THRESHOLD:.0%}（#59）")
+        if info["rate"] < COVER_THRESHOLD:
+            c.fail(f"A0（硬验收）：P3 模块 {f} 覆盖率 {info['rate']:.1%} < {COVER_THRESHOLD:.0%}"
+                   f"（#59：knowledge/fastlane 各 ≥80%），缺 "
+                   f"{info['statements'] - info['covered']} 语句。")
+    # 只作报告项（无凭据环境下不可达的分支）
     for f in COVER_P3_REPORT_ONLY:
         info = per_file.get(f)
         if info is None:
@@ -362,8 +402,8 @@ def check_a0(ctx: Ctx, c: Check) -> None:
             c.add(ok=True, note=f"A0（报告项）：{f} 行覆盖 {info['rate']:.1%}"
                                 f"（{info['covered']}/{info['statements']}）")
             if info["statements"] and info["rate"] < COVER_THRESHOLD:
-                c.warn(f"A0：P3 新模块 {f} 覆盖率 {info['rate']:.1%} < {COVER_THRESHOLD:.0%}"
-                       "（不在 R-32 门槛内，但门槛绿而新代码没测是缺口）。")
+                c.warn(f"A0：报告项 {f} 覆盖率 {info['rate']:.1%} < {COVER_THRESHOLD:.0%}"
+                       "（#59 定为报告项：Dify 分支无凭据不可达；门槛见 COVER_P3_GATE）。")
     ext = [p for p in per_file if p in COVER_EXTERNAL_FILES]
     for p in ext:
         c.add(ok=True, note=f"A0（A20b 口径报告项，非门槛）：{p} 行覆盖 "
@@ -601,6 +641,14 @@ def check_a24(ctx: Ctx, c: Check) -> None:
     if not callable(judge):
         c.fail("A24：缺 `judge(request) -> bool`（D5 §3.2 冻结签名）。")
 
+    # R-33：出口名冻结（judge/plan/ack/batch_ack），探不到 = FAIL（名字漂 = 契约漂）
+    for name in ("plan", "ack", "batch_ack"):
+        ok = callable(getattr(mod, name, None))
+        c.add(ok=ok, note=f"fastlane.{name} 可调用 = {ok}（R-33 冻结出口）")
+        if not ok:
+            c.fail(f"A24：缺冻结出口 `{name}(...)`（D5 §3.2 / R-33）；"
+                   f"当前模块顶层有 {sorted(n for n in vars(mod) if not n.startswith('_'))[:12]}…")
+
     sc, serr = import_mod("kfpa.schemas")
     if sc is None or not hasattr(sc, "FastlaneRequest"):
         c.add(ok=False, note=f"契约缺 FastlaneRequest：{serr}")
@@ -670,6 +718,12 @@ def check_a25(ctx: Ctx, c: Check) -> None:
         return
     if not _sub_ready(ctx, c, "knowledge", "list", "sample", "verdict", "report"):
         return
+    # D5 自相冲突：A25 验收行列了 `promote`，§3.3 冻结 CLI 只列 sample|verdict|report。
+    # 断言跟冻结接口走 → 缺 `promote` 只作可见提示，不判红（请 Chief 下一版 D5 收敛）。
+    _pm = ctx.cli("knowledge", "promote", "--help")
+    if _pm["rc"] != EXIT_PASS:
+        c.warn("A25：`knowledge promote` 未挂 —— D5 验收行列了它、§3.3 冻结 CLI 没有它；"
+               "按冻结接口不判红，但口径要收敛。")
     mod, err = import_mod("kfpa.knowledge")
     if mod is None:
         c.add(ok=False, note=f"import kfpa.knowledge 失败：{err}")
@@ -677,14 +731,35 @@ def check_a25(ctx: Ctx, c: Check) -> None:
         return
 
     threshold = getattr(mod, "CONFIDENCE_THRESHOLD", None)
-    c.add(ok=threshold is not None and abs(float(threshold) - 0.6) < 1e-9,
-          note=f"knowledge.CONFIDENCE_THRESHOLD = {threshold!r}（D5 §3.3 冻结 0.6）")
+    c.add(ok=threshold is not None and abs(float(threshold) - 0.80) < 1e-9,
+          note=f"knowledge.CONFIDENCE_THRESHOLD = {threshold!r}（D5 §3.3.1 / A15 原文冻结 0.80；"
+               "R-33 已把 D5 v1.0 的 0.6 判为笔误——断言跟口径走，不跟实现走）")
     if threshold is None:
-        c.fail("A25：缺 `CONFIDENCE_THRESHOLD` 常量（D5 §3.3 冻结 = 0.6）。")
+        c.fail("A25：缺 `CONFIDENCE_THRESHOLD` 常量（D5 §3.3.1 冻结 = 0.80）。")
+    elif abs(float(threshold) - 0.80) >= 1e-9:
+        c.fail(f"A25：门槛 = {threshold!r}，D5 §3.3.1 冻结 0.80（R-33 裁定门槛不回退）。")
 
-    can_promote = getattr(mod, "can_promote", None)
+    # R-33：闸门入口名冻结（`admit` / `record_sample`），探不到 = FAIL
+    gate = getattr(mod, "admit", None)
+    sample_fn = getattr(mod, "record_sample", None)
+    c.add(ok=callable(gate), note=f"knowledge.admit 可调用 = {callable(gate)}（R-33 冻结入口名）")
+    if not callable(gate):
+        alias = [n for n in ("gate", "ingest", "apply_gate", "submit_candidate", "judge_candidate")
+                 if callable(getattr(mod, n, None))]
+        c.fail(f"A25：缺冻结入口 `admit(store, candidate)`（R-33 / D5 §3.3）；"
+               f"当前只找到别名 {alias or '无'} —— 名字漂了就是契约漂了。")
+    c.add(ok=callable(sample_fn),
+          note=f"knowledge.record_sample 可调用 = {callable(sample_fn)}（R-33 冻结出口）")
+    if not callable(sample_fn):
+        c.fail("A25：缺 `record_sample(store, cid, passed, *, sampled_by, rate)`（D5 §3.3 / R-33 冻结）。")
+
+    can_promote = getattr(mod, "can_promote", None) or getattr(mod, "promotable", None)
+    promote_name = ("can_promote" if callable(getattr(mod, "can_promote", None))
+                    else "promotable" if callable(getattr(mod, "promotable", None)) else "")
     rate_fn = getattr(mod, "sampling_rate", None)
-    c.add(ok=callable(can_promote), note=f"knowledge.can_promote 可调用 = {callable(can_promote)}")
+    c.add(ok=callable(can_promote),
+          note=f"knowledge.{promote_name or 'can_promote/promotable'} 可调用 = {callable(can_promote)}"
+               "（D5 §3.3 转正判据）")
     if not callable(can_promote):
         c.fail("A25：缺 `can_promote(candidate) -> bool`（D5 §3.3）。")
     c.add(ok=callable(rate_fn), note=f"knowledge.sampling_rate 可调用 = {callable(rate_fn)}")
@@ -734,14 +809,9 @@ def check_a25(ctx: Ctx, c: Check) -> None:
     if "knowledge_samples" not in _t2:
         c.fail("A25：缺 `knowledge_samples` 表（磐石 migrations/0003_fastlane.sql，D5 §3.3 留痕）。")
 
-    # 低置信度直接 DROPPED：CLI 侧落一条（用 store 写入 + 闸门入口驱动）
-    gate_names = ("gate", "admit", "ingest", "apply_gate", "evaluate_candidate", "judge_candidate")
-    gate = next((getattr(mod, n) for n in gate_names if callable(getattr(mod, n, None))), None)
-    c.add(ok=gate is not None,
-          note=f"A25：闸门入口候选名 {gate_names} → 命中 {gate.__name__ if gate else '无'}")
-    if gate is None:
-        c.fail("A25：无法独立验证「低置信度直接丢弃」——`kfpa.knowledge` 没暴露闸门入口"
-               f"（试过 {gate_names}）；请在 PR 里给出入口名（或让 CLI 的 knowledge 子命令承担）。")
+    # 低置信度直接 DROPPED：用 store 写入 + 冻结闸门入口驱动
+    if not callable(gate):
+        c.add(ok=False, note="A25：闸门入口 `admit` 不可用 —— 低置信度丢弃与抽检两条都无从独立验证")
     else:
         store = None
         store_mod, _e = import_mod("kfpa.store")
@@ -756,11 +826,8 @@ def check_a25(ctx: Ctx, c: Check) -> None:
             for cid, conf in (("K-low", 0.2), ("K-high", 0.95)):
                 try:
                     gate(store, cand(cid=cid, conf=conf))
-                except TypeError:
-                    try:
-                        gate(cand(cid=cid, conf=conf))
-                    except Exception as exc:  # noqa: BLE001
-                        c.add(ok=False, note=f"闸门调用失败：{type(exc).__name__}: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    c.add(ok=False, note=f"admit({cid}) 抛 {type(exc).__name__}: {exc}")
             low = store.get_candidate("K-low")
             high = store.get_candidate("K-high")
             low_status = str(getattr(low.status, "value", low.status))
@@ -773,6 +840,56 @@ def check_a25(ctx: Ctx, c: Check) -> None:
                   note=f"A25：过门槛(0.95) 状态 = {high_status}（期望 quarantine/promoted）")
             if high_status not in ("quarantine", "promoted"):
                 c.fail(f"A25：过门槛的候选状态是 {high_status}，期望先落 quarantine。")
+
+            # R-33：抽检 passed=False → 该候选 DROPPED + 内容进回避模式 + knowledge_samples 留痕
+            if callable(sample_fn):
+                try:
+                    sample_fn(store, "K-high", False, sampled_by="verify_p3", rate=0.2)
+                    c.add(ok=True, note="A25：`record_sample(K-high, passed=False)` 可调用")
+                except Exception as exc:  # noqa: BLE001
+                    c.add(ok=False, note=f"record_sample 抛 {type(exc).__name__}: {exc}")
+                    c.fail("A25：抽检 `passed=False` 路径不可用（D5 §3.3 冻结出口）。")
+                after = store.get_candidate("K-high")
+                after_status = str(getattr(after.status, "value", after.status))
+                c.add(ok=after_status == "dropped",
+                      note=f"A25：抽检不过之后 K-high 状态 = {after_status}（期望 dropped）")
+                if after_status != "dropped":
+                    c.fail(f"A25：抽检 passed=False 没把候选打成 dropped（={after_status}）。")
+                con = sqlite3.connect(str(db))
+                try:
+                    rows = con.execute(
+                        "select cid, passed, sampled_by, rate from knowledge_samples").fetchall()
+                except sqlite3.Error as exc:
+                    rows = []
+                    c.add(ok=False, note=f"读 knowledge_samples 失败：{exc}")
+                finally:
+                    con.close()
+                hit = [r for r in rows if str(r[0]) == "K-high"]
+                c.add(ok=bool(hit), note=f"A25：knowledge_samples 留痕 = {rows}")
+                if not hit:
+                    c.fail("A25：抽检没落 knowledge_samples 留痕行（D5 §3.3 留痕可查）。")
+                else:
+                    c.add(ok=not int(hit[0][1]), note=f"A25：留痕 passed 列 = {hit[0][1]}（期望假=不过）")
+                    c.add(ok=str(hit[0][2]) == "verify_p3",
+                          note=f"A25：留痕 sampled_by = {hit[0][2]!r}（期望 verify_p3，可追责）")
+                # 回避模式：内容要进回避清单（写成 kind=avoid 的候选）。找不到列表 API 就只报可见。
+                lister = next((getattr(store, n) for n in
+                               ("list_candidates", "list_knowledge_candidates", "candidates")
+                               if callable(getattr(store, n, None))), None)
+                if lister is None:
+                    c.warn("A25：store 没暴露候选列表 API，回避模式清单未独立核（内容级验证见 A26 回灌）。")
+                else:
+                    try:
+                        avoid = [x for x in lister()
+                                 if str(getattr(getattr(x, "kind", ""), "value", getattr(x, "kind", "")))
+                                 == "avoid" and str(getattr(x, "content", "")) == "c"]
+                    except Exception as exc:  # noqa: BLE001
+                        avoid = []
+                        c.add(ok=False, note=f"列表候选抛 {type(exc).__name__}: {exc}")
+                    c.add(ok=bool(avoid),
+                          note=f"A25：抽检不过写入回避模式 kind=avoid 候选 = {len(avoid)} 条")
+                    if not avoid:
+                        c.fail("A25：抽检 passed=False 没把内容写进回避模式清单（D5 §3.3）。")
             store.close()
 
     # CLI 面：list / report 可跑，且 report 落盘
@@ -805,62 +922,158 @@ def check_a25(ctx: Ctx, c: Check) -> None:
 
 
 def check_a26(ctx: Ctx, c: Check) -> None:
-    """A26：失败进下一轮 feedback；回灌只取本轮+上一轮；两库 package_hash 一致。"""
+    """A26：失败进下一轮 feedback；回灌只取本轮+上一轮（含上界）；两库 package_hash 一致。
+
+    双库对拍沿用 A12 的成熟形态（R-33）：**每进程唯一轮号**避免共享库撞车，
+    两侧跑同一序列（注入失败轮 → 净轮）再比 `snapshot.package_hash` 与 feedback。
+    """
     if not _cli_ready(ctx, c, "round"):
         return
+    base = A26_ROUND_BASE + (os.getpid() % A26_ROUND_SPAN)
+    n_old, n_bad, n_clean = base, base + 1, base + 2
     db = ctx.fresh_db("a26")
     ev = ctx.init_db(db)
     c.add(cmd=ev["cmd"], rc=ev["rc"], ok=ev["rc"] == EXIT_PASS, note="A26：建临时库")
 
     work = ctx.tmp / "a26-work"
-    # 第 1 轮注入 test_fail → 失败记录（avoid pattern）
-    r1 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                  "--round", "1", "--dry-run", "--json", "--inject", "test_fail",
-                  "--db", str(db), "--workdir", str(work)])
-    c.add(cmd=r1["cmd"], rc=r1["rc"], stdout=r1["stdout"], stderr=r1["stderr"],
-          note="A26：第 1 轮注入 test_fail")
-    # 第 2 轮任务包 feedback 必须带出上一轮的回避模式
-    r2 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                  "--round", "2", "--dry-run", "--json", "--db", str(db),
-                  "--workdir", str(work)])
-    payload = last_json_line(r2["stdout"])
-    c.add(cmd=r2["cmd"], rc=r2["rc"], stdout=r2["stdout"], stderr=r2["stderr"],
-          ok=payload is not None, note="A26：第 2 轮产出 JSON")
-    if payload is None:
-        c.fail("A26：第 2 轮没产出可解析的 JSON，无法验证回灌。")
-    else:
-        pkg = payload.get("task_package") or {}
-        feedback = [str(x) for x in (pkg.get("feedback") or [])]
-        c.add(ok=any(x.startswith("AVOID[") for x in feedback),
-              note=f"A26：第 2 轮任务包 feedback = {feedback}")
-        if not any(x.startswith("AVOID[") for x in feedback):
-            c.fail("A26：失败回避模式没进下一轮任务包 feedback（R-28 回灌断裂）。")
-        c.add(ok=True, note=f"A26：回灌条数 = {len(feedback)}（R-28：只取本轮+上一轮）")
 
-    # 双库一致：有 PG DSN 时对拍，没有则可见 SKIP
-    dsn = os.environ.get("KFPA_VERIFY_PG_DSN", "")
+    def run_round(num: int, conn, *, inject: str = "", tag: str = "") -> dict:
+        argv = [ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
+                "--round", str(num), "--dry-run", "--json", "--db", conn,
+                "--workdir", str(work)]
+        if inject:
+            argv += ["--inject", inject]
+        ev = ctx.run(argv, timeout=600)
+        note = f"A26：{tag or ('第 ' + str(num) + ' 轮')}"
+        c.add(cmd=ev["cmd"], rc=ev["rc"], stdout=ev["stdout"], stderr=ev["stderr"], note=note)
+        return ev
+
+    def feedback_of(ev: dict) -> list[str] | None:
+        p = last_json_line(ev["stdout"])
+        if p is None:
+            return None
+        return [str(x) for x in ((p.get("task_package") or {}).get("feedback") or [])]
+
+    # ① 更早轮注入失败（它的 AVOID 只允许出现在紧邻的下一轮，不得越窗）
+    run_round(n_old, str(db), inject="test_fail", tag=f"最老轮 {n_old} 注入 test_fail（下界样本）")
+    # ② 紧邻轮：feedback 必须带出上一轮回避模式
+    ev_bad_next = run_round(n_bad, str(db), tag=f"第 {n_bad} 轮（承接 {n_old} 的失败）")
+    fb_bad_next = feedback_of(ev_bad_next)
+    if fb_bad_next is None:
+        c.fail("A26：承接轮没产出可解析 JSON，无法验证回灌。")
+        return
+    c.add(ok=any(x.startswith("AVOID[") for x in fb_bad_next),
+          note=f"A26：第 {n_bad} 轮 feedback = {fb_bad_next}")
+    if not any(x.startswith("AVOID[") for x in fb_bad_next):
+        c.fail("A26：失败回避模式没进下一轮任务包 feedback（R-28 回灌断裂）。")
+
+    # ③ 再下一轮：窗口是 ② 与 ③，②无失败 → feedback 不许再有 AVOID（R-28 上界：不许全库历史）
+    ev_clean = run_round(n_clean, str(db), tag=f"第 {n_clean} 轮（窗口内无失败）")
+    fb_clean = feedback_of(ev_clean)
+    if fb_clean is None:
+        c.fail(f"A26：第 {n_clean} 轮没产出可解析 JSON。")
+        return
+    c.add(ok=not any(x.startswith("AVOID[") for x in fb_clean),
+          note=f"A26：第 {n_clean} 轮 feedback = {fb_clean}（窗口={n_bad},{n_clean}，不应含 AVOID）")
+    if any(x.startswith("AVOID[") for x in fb_clean):
+        c.fail(f"A26：第 {n_clean} 轮仍带出更早轮（{n_old}）的回避模式 —— 回灌超窗（R-28 只取本轮+上一轮）。")
+
+    # 双库一致（R-33）：复用 A12 夹具 —— KFPA_PG_PORT 优先（默认 55440），
+    # KFPA_VERIFY_PG_DSN 显式覆盖；连不上 = 可见 SKIP；**不自建容器**（R-24/R-33）。
+    dsn, origin, why = _a26_pg_dsn(ctx)
+    c.add(ok=not why, note=f"A26：PG 夹具 {origin}；DSN = {mask_dsn(dsn) if dsn else '（无）'}"
+                           + (f"；{why}" if why else ""))
+    if why:
+        c.fail(f"A26：{why}")
+        return
     if not dsn:
-        c.skip("A26：未提供 `KFPA_VERIFY_PG_DSN`，PG 侧 `package_hash` 对拍未跑"
-               "（本机无 PG 时在报告里必须可见；有 Docker 的环境请设该变量重跑）。")
+        c.skip("A26：KFPA_PG_PORT/KFPA_VERIFY_PG_DSN 都没能给出可用 DSN，PG 侧 "
+               "`package_hash` 对拍未跑（报告里必须可见）。")
         return
-    pg_db = ctx.tmp / "a26_pg.json"
-    r3 = ctx.run([ctx.python, "-m", "kfpa", "round", "--design", str(ctx.design()),
-                  "--round", "1", "--dry-run", "--json", "--db", dsn,
-                  "--workdir", str(ctx.tmp / "a26-pg")], timeout=600)
-    pg_payload = last_json_line(r3["stdout"])
-    c.add(cmd=r3["cmd"], rc=r3["rc"], stdout=r3["stdout"], stderr=r3["stderr"],
-          ok=pg_payload is not None, note="A26：PG 侧同一轮")
+    if not _pg_reachable(ctx, dsn):
+        c.skip(f"A26：{origin} 上连不上 PG（clean env 无 Docker 的正常态）→ PG 侧 "
+               "`package_hash` 对拍可见 SKIP；有 PG 的环境设 `KFPA_PG_PORT=<port>` 重跑。")
+        return
+    c.add(ok=True, note=f"A26：PG 可达（{origin}），跑同一轮序列（轮号 {n_old}/{n_bad}，"
+                        f"本进程唯一，避免共享库撞车）")
+
+    ev0 = ctx.run([ctx.python, "-m", "kfpa", "init", "--db", dsn], timeout=300)
+    c.add(cmd=ev0["cmd"], rc=ev0["rc"], ok=ev0["rc"] == EXIT_PASS, note="A26：PG 侧建库（复用 A12 夹具）")
+    if ev0["rc"] != EXIT_PASS:
+        c.fail(f"A26：PG 侧 `kfpa init` rc={ev0['rc']}（归磐石 store/postgres.py 建表）。")
+        return
+    run_round(n_old, dsn, inject="test_fail", tag=f"PG 第 {n_old} 轮注入 test_fail")
+    pg_ev = run_round(n_bad, dsn, tag=f"PG 第 {n_bad} 轮")
+    pg_payload = last_json_line(pg_ev["stdout"])
     if pg_payload is None:
-        c.fail(f"A26：PG 侧没产出 JSON（rc={r3['rc']}）。")
+        c.fail(f"A26：PG 侧没产出 JSON（rc={pg_ev['rc']}）。")
         return
-    sqlite_payload = last_json_line(r1["stdout"])
+    sqlite_payload = last_json_line(ev_bad_next["stdout"])
+
     def digest(p):
-        return ((p or {}).get("task_package") or {}).get("package_hash")
-    c.add(ok=bool(digest(pg_payload)) and digest(pg_payload) == digest(sqlite_payload),
-          note=f"A26：package_hash SQLite={digest(sqlite_payload)!r} PG={digest(pg_payload)!r}")
-    if digest(pg_payload) != digest(sqlite_payload):
+        """`package_hash` 落在 `snapshot`（实测形状）；兼容 `task_package` 上的旧位置。"""
+        snap = (p or {}).get("snapshot") or {}
+        return snap.get("package_hash") or ((p or {}).get("task_package") or {}).get("package_hash")
+
+    s_hash, p_hash = digest(sqlite_payload), digest(pg_payload)
+    c.add(ok=bool(s_hash) and s_hash == p_hash,
+          note=f"A26：第 {n_bad} 轮 package_hash SQLite={s_hash!r} PG={p_hash!r}")
+    if not s_hash:
+        c.fail("A26：SQLite 侧没读出 package_hash（对拍无从成立，别让 None==None 混过去）。")
+    elif s_hash != p_hash:
         c.fail("A26：两库同轮 package_hash 不一致（回灌范围或轮次过滤两端不同口径）。")
-    _ = pg_db
+    pg_fb = [str(x) for x in ((pg_payload.get("task_package") or {}).get("feedback") or [])]
+    c.add(ok=pg_fb == fb_bad_next, note=f"A26：feedback 两库一致 = {pg_fb == fb_bad_next}"
+                                        f"（PG={pg_fb}）")
+    if pg_fb != fb_bad_next:
+        c.fail("A26：两库同一轮的 feedback 不一致（回灌区在两库口径不同）。")
+
+
+def mask_dsn(dsn: str) -> str:
+    """打码 DSN 里的密码，只留口令位形状（报告里不许出现明文凭据）。"""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", dsn or "")
+
+
+def _a26_pg_dsn(ctx: Ctx) -> tuple[str, str, str]:
+    """R-33：A26 复用 A12 夹具。返回 (dsn, 来源说明, 硬错误)。
+
+    - `KFPA_VERIFY_PG_DSN` 显式覆盖优先；
+    - 否则按 `KFPA_PG_PORT`（默认 55440）/ R-22.1 组装，凭据读 compose；
+    - 禁用端口 55432-55434（R-22.1，别的项目占着）；
+    - **不自建容器**：连不上就是可见 SKIP，绝不 `docker compose up`（R-24/R-33）。
+    """
+    explicit = (os.environ.get("KFPA_VERIFY_PG_DSN") or "").strip()
+    if explicit:
+        return explicit, "显式 KFPA_VERIFY_PG_DSN", ""
+    port = str(os.environ.get("KFPA_PG_PORT") or DEFAULT_PG_PORT).strip()
+    if port in FORBIDDEN_PG_PORTS:
+        return "", f"KFPA_PG_PORT={port}", f"端口 {port} 属 R-22.1 禁用段（55432-55434）"
+    user, pwd, db = "kfpa", "kfpa", "kfpa"
+    compose = ctx.root / PG_COMPOSE
+    if compose.exists():
+        try:
+            import yaml
+            spec = yaml.safe_load(compose.read_text(encoding="utf-8")) or {}
+            for svc in (spec.get("services") or {}).values():
+                env = svc.get("environment") or {}
+                if isinstance(env, list):
+                    env = dict(x.split("=", 1) for x in env if "=" in x)
+                user = env.get("POSTGRES_USER", user)
+                pwd = env.get("POSTGRES_PASSWORD", pwd)
+                db = env.get("POSTGRES_DB", db)
+                break
+        except Exception:  # noqa: BLE001
+            pass
+    dsn = f"postgresql://{user}:{pwd}@127.0.0.1:{port}/{db}"
+    return dsn, f"KFPA_PG_PORT={port}（默认 {DEFAULT_PG_PORT}，A12 夹具）", ""
+
+
+def _pg_reachable(ctx: Ctx, dsn: str) -> bool:
+    """子进程探一次连通性（不在台架进程里 import psycopg）。"""
+    probe = ("import sys; import psycopg; "
+             "c = psycopg.connect(sys.argv[1], connect_timeout=3); c.close(); print('ok')")
+    ev = ctx.run([ctx.python, "-c", probe, dsn], timeout=60)
+    return ev["rc"] == 0 and "ok" in (ev["stdout"] or "")
 
 
 # ------------------------------------------------------------------ A27
