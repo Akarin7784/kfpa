@@ -40,8 +40,11 @@
 
 ## 状态
 
-✅ **P0 最小闭环已交付**（2026-10-16，main）：设计 → 質問票 → 人工确认 → 六段式任务包 → 执行器（mock）→ 门禁三态 → SQLite 落库 → 按轮快照，全程可**离线**验收（无网络、无 API key）。
-🚧 P1（PostgreSQL + Langfuse + PR-Agent + Streamlit 台账）进行中。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
+✅ **P0 最小闭环已交付**（2026-10-16）：设计 → 質問票 → 人工确认 → 六段式任务包 → 执行器（mock）→ 门禁三态 → SQLite 落库 → 按轮快照，全程可**离线**验收（无网络、无 API key）。
+
+✅ **P1 正经版已交付**（2026-10-16）：PostgreSQL 双驱动 + 双库对拍、token 账本、checkpoint 落盘、G7 覆盖率门槛、沉淀闸门、快车道判据、Streamlit 台账。
+
+✅ **P2 评审位异构化已交付**（2026-10-17，main）：评审位接进主循环（G8 折算：`major + criterion` 才阻塞）、异构 provider 可换挡、同源盲区可量化度量、评审报告三形态（Markdown / HTML / 页面）。路线图见 [docs/design.md §8](docs/design.md#8-路线图)。
 
 ### 快速开始（clean env，无需 API key）
 
@@ -55,17 +58,21 @@ python -m kfpa round --design examples/design-r1.md --round 1 --dry-run --db kfp
 python -m kfpa history --db kfpa.db                                  # 轮次快照
 ```
 
-退出码（D1-5 / D2 R-1）：`0` 通过 · `2` 用法错误 · `3` 等待人工确认 · `4` 依赖/环境 · `5` I/O · `10` 需修复 · `11` 阻塞。
+退出码（D1-5 / D2 R-1，rc 三分见 D2 R-31）：`0` 通过 · `2` 用法错误 · `3` 等待人工确认 · `4` 依赖/环境（含缺凭据）· `5` I/O 与 DB · `10` 需修复 · `11` 阻塞。
 
-### P0 验收结果（`main`，clean env 不设 `PYTHONIOENCODING`）
+### 验收结果（`main` `eca4837`，clean env 不设 `PYTHONIOENCODING`，PG 独占端口）
 
 | 台架 | 结果 |
 |---|---|
 | `python scripts/verify_p0.py` | **A1–A10 共 13 条断言 PASS 13 / FAIL 0 / SKIP 0** |
-| `python scripts/selfcheck_core.py` | **96 PASS / 0 FAIL** |
-| `python -m pytest tests -q` | **35 passed** |
+| `python scripts/verify_p1.py` | **A11–A17 共 8 条断言 PASS 8 / FAIL 0 / SKIP 0**（A12 双库对拍在真 PG 上） |
+| `python scripts/verify_p2.py` | **A18–A22 共 6 条断言 PASS 6 / FAIL 0 / SKIP 0**（A20 先要求 `pytest` 全绿） |
+| `python scripts/selfcheck_core.py` | **FAILED: 无** |
+| `python -m pytest tests -q` | **194 passed** |
 
-设计与裁决文档：[docs/dev/p0-plan.md](docs/dev/p0-plan.md)（施工图与 A1–A10）· [docs/dev/p0-design-addendum.md](docs/dev/p0-design-addendum.md)（D1 工程细节）· [docs/dev/p0-rulings.md](docs/dev/p0-rulings.md)（D2 裁决 R-1~R-19）· 验收报告 [docs/acceptance/p0-acceptance.md](docs/acceptance/p0-acceptance.md)。
+P2 关键数字：R-32 纯逻辑白名单行覆盖 **90.7%**（1605/1770，门槛 80%）；同源盲区度量 24 样本 —— 异构评审漏检 **0** vs 同源 **12**，一致率 **100% vs 50%**。
+
+设计与裁决文档：[docs/dev/p0-plan.md](docs/dev/p0-plan.md)（施工图与 A1–A10）· [docs/dev/p0-design-addendum.md](docs/dev/p0-design-addendum.md)（D1 工程细节）· [docs/dev/p0-rulings.md](docs/dev/p0-rulings.md)（D2 裁决 R-1~R-32）· [docs/dev/p1-plan.md](docs/dev/p1-plan.md)（D3）· [docs/dev/p2-plan.md](docs/dev/p2-plan.md)（D4 契约 1.3）· 验收报告 [P0](docs/acceptance/p0-acceptance.md) / [P1](docs/acceptance/p1-acceptance.md) / [P2](docs/acceptance/p2-acceptance.md)。
 
 ## License
 
