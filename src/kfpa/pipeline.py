@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 from . import gates
+from . import knowledge
+from . import ledger as ledger_mod
 from .schemas import (
     AcceptanceCriterion,
     ExecResult,
@@ -66,6 +68,9 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，运行期不依赖磐�
 
 #: 提示词模板目录
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+#: P1 默认 checkpoint 文件（D3-3.5：SqliteSaver，thread_id = kfpa-r{n}）
+CHECKPOINT_DB_DEFAULT = ".kfpa/checkpoints.sqlite"
 
 #: 高影响票硬规则的机器可判定标记（CLI 与测试都可据此断言）
 BLOCKED_MARK = "[KFPA-BLOCKED]"
@@ -647,6 +652,33 @@ def _stage_snapshot(
 # ---------------------------------------------------------------- LangGraph 编排（R-14）
 
 
+def _reuse_knowledge(store: "Store", package: TaskPackage, round_no: int) -> list[str]:
+    """PASS 轮登记沉淀候选复用并转正（D3-3.5）；P0 七表 store 上降级跳过。"""
+    if not hasattr(store, "list_candidates"):
+        return []
+    try:
+        return knowledge.reuse_from_package(store, package, round_no, passed=True)
+    except Exception as exc:  # pragma: no cover - 沉淀失败不该影响快照
+        _log(f"[knowledge] 复用标记失败（{exc}）→ 只警告，不影响本轮快照")
+        return []
+
+
+def _save_snapshot_for_pass(
+    store: "Store",
+    package: TaskPackage,
+    report: GateReport,
+    workdir_path: Path,
+    round_no: int,
+    dry_run: bool,
+) -> Snapshot:
+    """PASS 轮：快照 + 沉淀闸门复用标记（D3-3.5）。"""
+    snapshot = _stage_snapshot(store, package, report, workdir_path, round_no, dry_run)
+    promoted = _reuse_knowledge(store, package, round_no)
+    if promoted:
+        _log(f"[knowledge] 本轮复用触发转正 {len(promoted)} 条：{'、'.join(promoted)}")
+    return snapshot
+
+
 def build_graph(
     *,
     store: "Store",
@@ -699,7 +731,20 @@ def build_graph(
             )
         )
         tickets = _stage_tickets(store, llm, round_no, str(state["design_text"]))
-        return {"tickets": tickets, "state": RoundState.TICKETS_OPEN}
+        # 入口节点显式重置本轮运行态：挂了 checkpointer 后，同一 thread_id 重跑会把
+        # 上一轮的 gate/package/attempt 合并进 state，必须清零，否则会用陈旧门禁结果走 finalize。
+        return {
+            "tickets": tickets,
+            "state": RoundState.TICKETS_OPEN,
+            "open_high": [],
+            "task_package": None,
+            "exec_result": None,
+            "gate": None,
+            "snapshot": None,
+            "attempt": 0,
+            "avoid_patterns": [],
+            "message": "",
+        }
 
     def n_guard_tickets(state: RoundGraphState) -> dict:
         round_no = int(state["round_no"])
@@ -808,7 +853,9 @@ def build_graph(
         if report.state is GateState.PASS:
             if package is None:  # pragma: no cover
                 raise PipelineError("[pipeline] PASS 终止态缺少任务包 → 检查 build_package 入边")
-            snapshot = _stage_snapshot(store, package, report, workdir_path, round_no, dry_run)
+            snapshot = _save_snapshot_for_pass(
+                store, package, report, workdir_path, round_no, dry_run
+            )
             workdir_path.mkdir(parents=True, exist_ok=True)
             (workdir_path / "review-prompt.md").write_text(
                 build_review_prompt(package, exec_result, report), encoding="utf-8"
@@ -885,6 +932,49 @@ def _result_from_state(state: dict) -> RoundResult:
 # ---------------------------------------------------------------- 对外轮次入口
 
 
+def make_checkpointer(path: str | Path | None = None) -> Any:
+    """构造 P1 默认 checkpoint（`SqliteSaver`，D3-3.5）。
+
+    - 缺 `langgraph-checkpoint-sqlite` → `DependencyMissingError`（CLI 映射退出码 4）；
+    - `path=None` → `CHECKPOINT_DB_DEFAULT`；父目录自动创建。
+    """
+    try:
+        import sqlite3
+
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except ImportError as exc:  # pragma: no cover - 依赖由 Chief 统一安装
+        raise DependencyMissingError(
+            "[pipeline] 缺少 langgraph-checkpoint-sqlite（P1 checkpoint）"
+            " → 让 Chief 按 D3 §5 统一安装；或用 `checkpointer=None` 关闭（退出码 4）"
+        ) from exc
+    target = Path(path or CHECKPOINT_DB_DEFAULT)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # SqliteSaver.from_conn_string() 返回上下文管理器，不能直接当 saver 传给 compile()；
+    # 这里自持连接（check_same_thread=False）并由 saver 持有引用，进程内有效、落盘持久。
+    connection = sqlite3.connect(str(target), check_same_thread=False)
+    return SqliteSaver(connection)
+
+
+def _resolve_checkpointer(checkpointer: Any, round_no: int) -> Any:
+    """`"auto"` → 默认 SqliteSaver；`None` → 不挂（P0 A8 的三键 invoke 仍可跑）。"""
+    if checkpointer is None:
+        return None
+    if checkpointer == "auto":
+        _ = round_no  # thread_id 由调用方按 `kfpa-r{n}` 传给 invoke
+        return make_checkpointer()
+    return checkpointer
+
+
+def _default_roles() -> dict[str, dict]:
+    """尽力读 `config/models.yaml` 的角色表（拿不到就空表：model_ref 记空串，不编造）。"""
+    try:
+        from .config import load_roles
+
+        return dict(load_roles())
+    except Exception:  # pragma: no cover - 缺配置不该拖垮流水线
+        return {}
+
+
 def run_round(
     round_no: int,
     design_text: str,
@@ -897,24 +987,45 @@ def run_round(
     max_attempts: int = 3,
     dry_run: bool = True,
     injection: str = "none",
+    checkpointer: Any = "auto",
+    ledger: Any = None,
+    ledger_source: str = "mock",
+    roles: Optional[dict[str, dict]] = None,
 ) -> RoundResult:
-    """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14）。
+    """跑一轮完整生命周期 —— `build_graph(...).invoke(...)` 的**薄包装**（R-14 + P1 D3-3.4/3.5）。
 
     - 未关闭 HIGH 票 → `state=TICKETS_OPEN` + `BLOCKED_MARK`（CLI 退出码 3）；
     - `injection` 只把 `apply_fail` / `test_fail` 转给执行器（R-10）；
-    - 不同原因连续失败到 `max_attempts` → BLOCKED + `attempts_exhausted`（D1-5）。
+    - 不同原因连续失败到 `max_attempts` → BLOCKED + `attempts_exhausted`（D1-5）；
+    - **P1**：`checkpointer="auto"` → 默认 `SqliteSaver`，`thread_id = f"kfpa-r{round_no}"`（同轮重跑复用；
+      显式传 `None` 关闭）；每次 `LLM.complete()` 经账本 wrapper 落一条 `LedgerEntry`（D3-3.4）；
+      PASS 轮把「任务包真的用到的隔离区候选」标记复用并按规则转正（D3-3.5）。
     """
+    if ledger is None:
+        ledger = ledger_mod.make_ledger(store)
+    resolved_roles = roles if roles is not None else _default_roles()
+    resolved_checkpointer = _resolve_checkpointer(checkpointer, round_no)
     graph = build_graph(
         store=store,
-        llm=llm,
+        llm=ledger_mod.wrap_llm(
+            llm,
+            ledger,
+            round_no=round_no,
+            roles=resolved_roles,
+            source=ledger_source,
+        ),
         executor=executor,
         workdir=workdir,
         max_attempts=max_attempts,
         dry_run=dry_run,
         injection=injection,
+        checkpointer=resolved_checkpointer,
     )
-    final = graph.invoke(
-        {"round_no": round_no, "design_text": design_text, "design_ref": design_ref}
+    payload = {"round_no": round_no, "design_text": design_text, "design_ref": design_ref}
+    final = (
+        graph.invoke(payload, {"configurable": {"thread_id": f"kfpa-r{round_no}"}})
+        if resolved_checkpointer is not None
+        else graph.invoke(payload)
     )
     if not isinstance(final, dict) or "state" not in final:
         raise PipelineError(
@@ -953,6 +1064,7 @@ def run_round_via_graph(
 
 __all__ = [
     "PROMPTS_DIR",
+    "CHECKPOINT_DB_DEFAULT",
     "BLOCKED_MARK",
     "EXECUTOR_INJECTIONS",
     "MAX_TICKETS_PER_ROUND",
@@ -969,6 +1081,7 @@ __all__ = [
     "build_task_package",
     "render_task_package",
     "build_review_prompt",
+    "make_checkpointer",
     "run_round",
     "run_round_via_graph",
     "build_graph",
