@@ -223,6 +223,28 @@ def test_batch_ack_preserving_an_unknown_prior_actor_is_still_unverified():
     assert result["replayed"] == [] and result["unverified"]
 
 
+def test_batch_ack_flags_batch_id_drift_on_replay():
+    """镜鉴的边界洞：回读人**对上**但 `batch_id` 被换 → 台账被别的东西改过，不许算确认成功。"""
+    prior = req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="alice", decided_at=1700000000.0)
+    runner = make_runner([("batch-ack", Proc(0, "已承认")),
+                          ("list", Proc(0, _updated_listing(decided_by="alice", batch_id="flb-DIFFERENT")))])
+    result = fp.batch_ack([prior], ["fl-1-1"], by="bob", typed_count=1, runner=runner)
+    assert result["ok"] is False and result["verified"] is False
+    assert result["replayed"] == []
+    assert "batch_id" in result["unverified"][0]["reason"]
+
+
+def test_batch_ack_flags_decided_at_drift_on_replay():
+    """同一承认人、同一批次，但首次 `decided_at` 被改写 → 同样不算确认成功。"""
+    prior = req("fl-1-1", status="approved", batch_id="flb-1-1", decided_by="alice", decided_at=1700000000.0)
+    runner = make_runner([("batch-ack", Proc(0, "已承认")),
+                          ("list", Proc(0, _updated_listing(decided_by="alice", batch_id="flb-1-1",
+                                                            decided_at=1700009999.0)))])
+    result = fp.batch_ack([prior], ["fl-1-1"], by="bob", typed_count=1, runner=runner)
+    assert result["ok"] is False and result["replayed"] == []
+    assert "decided_at" in result["unverified"][0]["reason"]
+
+
 def test_list_requests_reports_missing_subcommand():
     rows, hint = fp.list_requests(runner=make_runner([("list", Proc(2, "", "invalid choice"))]))
     assert rows == [] and hint == fp.FASTLANE_MISSING_HINT

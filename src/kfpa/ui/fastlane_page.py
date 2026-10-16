@@ -397,6 +397,30 @@ def build_acks_yaml(request_ids: Iterable[Any], *, note: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
+#: 幂等重放要核对的「首次留痕整组」（D5 §3.2：二次承认不得覆盖其中任一项）
+_PRESERVED_FIELDS = ("decided_by", "batch_id", "decided_at")
+
+
+def _drifted_fields(prior_row: dict[str, Any], now_row: dict[str, Any]) -> list[str]:
+    """首次留痕里被改动的字段名（空 = 一项没动）。
+
+    回读只对上 ``decided_by`` 不够 —— ``batch_id`` / ``decided_at`` 漂移说明台账被别的东西改过，
+    这种「看起来像幂等重放」的行不能算确认成功（镜鉴抓到的边界洞，见 PR #63）。
+    """
+    drifted: list[str] = []
+    for field in _PRESERVED_FIELDS:
+        before, after = prior_row.get(field), now_row.get(field)
+        if field == "decided_at":
+            try:
+                if abs(float(before or 0.0) - float(after or 0.0)) > 1e-6:
+                    drifted.append(field)
+            except (TypeError, ValueError):
+                drifted.append(field)
+        elif str(before or "") != str(after or ""):
+            drifted.append(field)
+    return drifted
+
+
 def _pick_batch(rows: list[dict[str, Any]], selected: list[str]) -> dict[str, Any]:
     wanted = set(selected)
     picked = [row for row in rows if row["request_id"] in wanted]
@@ -423,8 +447,9 @@ def batch_ack(
     返回字段：``ok`` / ``written`` / ``verified`` / ``batch_id`` / ``decided_by`` / ``decided_at``
     / ``acknowledged`` / ``replayed`` / ``refused`` / ``reasons`` / ``stdout``。
     ``ok`` 为真当且仅当：防误点过了 + CLI 退出码 0 + 回读看到每个请求都落在 ``approved``，
-    且 ``decided_by`` 要么是本次承认人、要么是**此前已有的**同一个人（D5 §3.2 的幂等：
-    二次承认不覆盖首次留痕 —— 这种情形进 ``replayed``，会摊在页面上，不冒领成这次写的）。
+    且 ``decided_by`` / ``batch_id`` / ``decided_at`` 的**首次留痕整组**要么保持此前原值
+    （D5 §3.2 的幂等：二次承认不覆盖首次留痕 —— 这种情形进 ``replayed``，会摊在页面上，
+    不冒领成这次写的），要么就是本次承认人写入的新值（首次承认）。
     回读与预期任何一处不符 → ``ok=False`` + ``unverified``，**绝不谎报成功**。
     """
     rows = list(rows)
@@ -487,26 +512,46 @@ def batch_ack(
         if now["status"] != "approved":
             unverified.append({"request_id": request_id, "reason": f"回读状态仍是 `{now['status']}`"})
             continue
-        if not now["decided_by"] or now["decided_by"] == verdict["by"]:
-            continue
-        # D5 §3.2 的幂等：二次承认**不覆盖**首次 decided_by/decided_at，返回原记录。
-        # 所以「承认人与本次不同」在**此前已有决定**时是正确行为，不算回读失败 ——
-        # 但必须显式摊出来，别让人以为是这次写的（真实集成跑抓到的假红，见 v0.2 修复）。
-        prior_by = str(prior.get(request_id, {}).get("decided_by") or "")
-        if prior_by and now["decided_by"] == prior_by:
-            replayed.append(
-                {
-                    "request_id": request_id,
-                    "reason": (
-                        f"本条此前已由 {prior_by} 承认，按 D5 §3.2 幂等保留首次留痕"
-                        f"（batch_id/decided_by/decided_at 未被本次覆盖）"
-                    ),
-                }
-            )
-        else:
+        prior_row = prior.get(request_id) or {}
+        prior_by = str(prior_row.get("decided_by") or "")
+        if not prior_by:
+            # 此前没有人工决定：正常首写，回读人必须是本次承认人
+            if str(now["decided_by"] or "") == verdict["by"]:
+                continue
             unverified.append(
                 {"request_id": request_id, "reason": f"回读 decided_by=`{now['decided_by']}` 与承认人 `{verdict['by']}` 不符"}
             )
+            continue
+        # D5 §3.2 的幂等：二次承认**不覆盖**首次 decided_by/batch_id/decided_at，返回原记录。
+        # 所以「承认人与本次不同」在**此前已有决定**时是正确行为，不算回读失败 ——
+        # 但必须①把整组首次留痕核对一遍（任一项漂移说明台账被别的东西改过），
+        # ②把这种行显式摊出来，别让人以为是这次写的（镜鉴抓到的 batch_id 漂移洞）。
+        if str(now["decided_by"] or "") != prior_by:
+            unverified.append(
+                {"request_id": request_id, "reason": f"回读 decided_by=`{now['decided_by']}` 与承认人 `{verdict['by']}` 不符"}
+            )
+            continue
+        drifted = _drifted_fields(prior_row, now)
+        if drifted:
+            unverified.append(
+                {
+                    "request_id": request_id,
+                    "reason": (
+                        f"回读显示首次留痕的 {'/'.join(drifted)} 被改动（D5 §3.2 幂等保留整组 "
+                        f"decided_by/batch_id/decided_at）→ 台账被别的东西改过，不算确认成功"
+                    ),
+                }
+            )
+            continue
+        replayed.append(
+            {
+                "request_id": request_id,
+                "reason": (
+                    f"本条此前已由 {prior_by} 承认，按 D5 §3.2 幂等保留首次留痕"
+                    f"（batch_id/decided_by/decided_at 未被本次覆盖）"
+                ),
+            }
+        )
 
     result.update(_pick_batch(after, verdict["accepted"]))
     result["verified"] = not unverified
