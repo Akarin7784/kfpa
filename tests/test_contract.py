@@ -28,7 +28,7 @@ from kfpa.schemas import (
     to_jsonable,
 )
 
-SUPPORTED_CONTRACT_VERSIONS = {"1.0", "1.1", "1.2"}
+SUPPORTED_CONTRACT_VERSIONS = {"1.0", "1.1", "1.2", "1.3"}
 
 
 def test_contract_version_is_known_to_verifier():
