@@ -12,10 +12,14 @@
 约束（docs/dev/p0-plan.md §3.7 / docs/dev/p1-plan.md §3.7、A17）：
 
 - ``streamlit`` 惰性导入：缺包 → 中文提示 + rc=4（D1-5），不抛 ImportError；
+- **A17 的 headless 入口**：``render_tickets(db_path=…)`` 直接返回台账表格数据（list[dict]），
+  不需要浏览器、不 import streamlit；``render_headless(db_path=…)`` 则是「真跑一次 AppTest 再取数据」；
 - 台账列与攒批事务规则**不变**（D1-8 / R-9），攒批复用 ``kfpa.ui.cli`` 的解析与落库；
 - 快车道承认页在 ``kfpa/ui/fastlane.py``（D3 §2/§3.6/§3.7），判定走 ``kfpa.impact.analyze``；
 - 数据层（``load_ticket_rows`` / ``fastlane.load_reports``）不 import streamlit，可直接 headless 断言；
-- 页面数据落在 ``st.session_state["kfpa_rows"]``，``render_headless()`` 用它作为返回的表格数据。
+- 页面数据落在 ``st.session_state["kfpa_rows"]``，``render_headless()`` 用它作为返回的表格数据；
+- ``main(db_path=…)`` 也可直接调用；裸 python（没有 streamlit runtime）下自动走 headless，
+  ``streamlit run`` 下才渲染页面。
 
 退出码：``0`` 成功 / ``2`` 用法 / ``4`` 依赖缺失（streamlit 等）/ ``5`` I/O 或库错误。
 """
@@ -153,8 +157,23 @@ def load_ticket_rows(
     impact=None,
     store=None,
 ) -> list[dict[str, Any]]:
-    """台账表格数据（A17 的「返回表格数据」就是它）。"""
+    """台账表格数据（纯数据层，不 import streamlit）。"""
     return _ticket_rows(_list_tickets(store or _open_store(db_path), round_no, status, impact))
+
+
+def render_tickets(
+    db_path: str = DEFAULT_DB,
+    *,
+    round_no: Optional[int] = None,
+    status=None,
+    impact=None,
+) -> list[dict[str, Any]]:
+    """headless 渲染入口（A17 / D3 §3.7）：直接返回台账表格数据，不需要浏览器。
+
+    台架按名字找「可 headless 调用的渲染函数」（``render_tickets`` / ``render`` 等），
+    这个就是它；``render_headless()`` 是另一种入口（真跑 AppTest 后再取数据）。
+    """
+    return load_ticket_rows(db_path, round_no=round_no, status=status, impact=impact)
 
 
 def diff_files_from_env() -> dict[int, list[str]]:
@@ -406,15 +425,37 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def _has_streamlit_runtime() -> bool:
+    """当前是否在 ``streamlit run``（或 AppTest）的脚本运行上下文里。"""
+    try:
+        from streamlit.runtime import exists  # type: ignore[import-not-found]
+
+        return bool(exists())
+    except Exception:
+        return False
+
+
+def main(
+    argv: Optional[list[str]] = None,
+    *,
+    db_path: Optional[str] = None,
+    db: Optional[str] = None,
+) -> int:
+    """入口：``--headless``（或裸 python 下自动判定）走 headless，``streamlit run`` 走页面。
+
+    台架会以 ``main(db_path=...)`` 直接调用（A17 的补充检查），所以这里也接受关键字参数。
+    """
     _ensure_src_on_path()
     args = _parse(argv)
-    db_path = args.db or _env_db()
+    resolved_db = db_path or db or args.db or _env_db()
     include_fastlane = not args.no_fastlane and not os.environ.get("KFPA_UI_NO_FASTLANE")
 
-    if args.headless:
+    # 裸 python（没有 streamlit runtime）自动走 headless；但 AppTest 内部必须留在
+    # 浏览器渲染路径，否则 render_headless → 脚本 → main → render_headless 递归。
+    in_apptest = bool(os.environ.get(_ENV_APPTEST))
+    if args.headless or (not in_apptest and not _has_streamlit_runtime()):
         try:
-            data = render_headless(db_path, include_fastlane=include_fastlane)
+            data = render_headless(resolved_db, include_fastlane=include_fastlane)
         except UIDependencyError as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_DEPS
@@ -439,7 +480,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_DEPS
 
     try:
-        page(st, db_path, include_fastlane=include_fastlane)
+        page(st, resolved_db, include_fastlane=include_fastlane)
     except UIDependencyError as exc:
         st.error(str(exc))
         return EXIT_DEPS
