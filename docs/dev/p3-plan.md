@@ -117,14 +117,35 @@ knowledge_hits: list[str] = field(default_factory=list)   # 形如 "K1#reused=2"
 
 ### 3.3 沉淀闸门全量（长流）
 
-1. **置信度门槛**：`CONFIDENCE_THRESHOLD = 0.6`（`knowledge.py` 常量，可被 config 覆盖）——
-   `candidate.confidence < 门槛` → 直接 `DROPPED`，**不进隔离区**（design §5.5「不合格沉淀直接丢弃」）。
+1. **置信度门槛维持 `CONFIDENCE_THRESHOLD = 0.80`**（D3 §3.5 / A15 原文；R-33 裁定）——
+   `candidate.confidence < 0.80` → 直接 `DROPPED`，**不进隔离区**（design §5.5「不合格沉淀直接丢弃」）。
+   *（D5 v1.0 曾误写成 0.6，R-33 已改回；A15 口径不回退、期望不改。）*
 2. **隔离区**：过门槛的先落 `QUARANTINE`；只有 `can_promote()`（被 **≥1 个后续轮次**成功复用）才转正。
    **后续**判定：`reused_by` 里的轮次必须 `> candidate.round_no`，同轮复用不算（防自证）。
 3. **动态抽检**：`sampling_rate(successful_reuse_count)` 沿用 D3-3.5 的分档；被抽中的候选进抽检队列并写
    `KnowledgeSample` 留痕；抽检 `passed=False` → `DROPPED` **且**把内容写进回避模式清单（负知识）。
 4. **报告**：`kfpa knowledge report --out reports/knowledge-report.json`（稳定键：各状态计数、抽检率、
    被丢弃清单、转正清单）。
+
+**冻结的出口名（R-33，台架按名硬探，探不到 = FAIL）**：
+
+```python
+kfpa.knowledge.admit(store, candidate) -> KnowledgeCandidate     # 闸门唯一入口（P1 已有，语义不变）
+kfpa.knowledge.record_sample(store, cid, passed, *, sampled_by="", rate=0.0) -> KnowledgeSample
+# 既有出口不动：sampling_rate() / promotable() / mark_reused() / make_candidate() /
+#               is_sampled() / review_sample()
+# CLI：kfpa knowledge sample | verdict <cid> --pass/--fail | report
+```
+
+**快车道出口名（R-33，同批冻结）**：
+
+```python
+kfpa.fastlane.judge(request) -> bool                    # 三判据纯函数（等价 request.judged_fastlane()）
+kfpa.fastlane.plan(store, ...)  -> FastlaneRequest      # 登记 pending（不满足判据 → ESCALATED）
+kfpa.fastlane.ack(store, request_id, by) -> FastlaneRequest
+kfpa.fastlane.batch_ack(store, request_ids, by) -> list[FastlaneRequest]
+# CLI：kfpa fastlane plan | list | ack | batch-ack | show
+```
 
 ### 3.4 负知识闭环（长流，与 R-28 同口径）
 
@@ -159,10 +180,13 @@ A26 直接断 SQLite/PG 两侧 `package_hash` 一致。
 |---|---|---|
 | A23 | **快车道落库与攒批承认**：`plan` 登记 → `ack`/`batch-ack` 落 `fastlane_requests`；重复承认幂等；`batch_id` 同批共享；`ESCALATED`/`REJECTED` 不可被翻成 `APPROVED`；`schema_version="4"` | `python -m kfpa fastlane plan …` / `… list --json` |
 | A24 | **快车道判据与升级**：三判据全真才 `PENDING→APPROVED`；任一为假 → `ESCALATED` 且 reasons 指名是哪条；`no_diff_source`（R-23 第三来源）显式可见 | `python -m kfpa fastlane plan --round N` |
-| A25 | **沉淀闸门全量**：低于置信度门槛直接 `DROPPED`（不进隔离区）；`QUARANTINE` 只被**后续轮次**复用才转正（同轮不算）；抽检 `passed=False` → `DROPPED` + 写回避模式；抽检留痕可查 | `python -m kfpa knowledge list/promote/sample/verdict/report` |
-| A26 | **负知识回灌 + 双库一致**：失败记录进下一轮任务包 `feedback`；回灌只取本轮+上一轮；同轮次在 SQLite 与 PG 上 `package_hash` 一致 | `verify_p1.py --only A12` 扩到新表 + `round` 两轮对拍 |
+| A25 | **沉淀闸门全量**：低于置信度门槛（**0.80**）直接 `DROPPED`（不进隔离区）；`QUARANTINE` 只被**后续轮次**复用才转正（同轮不算）；抽检 `passed=False` → `DROPPED` + 写回避模式；抽检留痕可查。**入口名按 §3.3 冻结**（`admit` / `record_sample`），探不到 = FAIL | `python -m kfpa knowledge list/promote/sample/verdict/report` |
+| A26 | **负知识回灌 + 双库一致**：失败记录进下一轮任务包 `feedback`；回灌只取本轮+上一轮；同轮次在 SQLite 与 PG 上 `package_hash` 一致。**PG 夹具复用 A12**：`KFPA_PG_PORT`（默认 55440）连不上 → 可见 SKIP；`KFPA_VERIFY_PG_DSN` 为显式覆盖；**不自建容器**（R-24） | `verify_p1.py --only A12` 扩到新表 + `round` 两轮对拍 |
 | A27 | **RAG 检索**：本地回退可离线命中且**稳定排序**；未配 Dify 凭据 → rc=**4** + 中文；异常/日志/库里**无 key 明文**；回退结果标 `provider="local"` | `python -m kfpa rag search "…" --json` |
 | A0 | **不回归**：`verify_p0` 13/13、`verify_p1` 8/8、`verify_p2` 6/6、`pytest` 全绿 | 三条台架 + `pytest -q` |
+
+**A0 与 A23–A27 的地位不同（R-33）**：A0 **必须始终绿**；A23–A27 在实现落地前允许红，
+但每条红必须指名到人与接口——**红的是派工单，不是 main 回归**。P3 收口 = A23–A27 全绿。
 
 验证要求同前：命令 + 真实输出片段 + 结论；断言独立；失败指名到模块与接口；SKIP 只用于环境不具备且必须在报告里可见。
 

@@ -571,6 +571,33 @@ A18/A20 FAIL**。
 
 ---
 
+## R-33 P3 开工三问：沉淀门槛维持 0.80 · A25 闸门入口冻结名 · A26 复用 A12 的 PG 夹具
+
+镜鉴在 `verify_p3.py` 首版（#55）里问了三条，都会影响他判红还是判 SKIP；逐条裁：
+
+1. **沉淀闸门置信度门槛维持 `0.80`**（D3 §3.5 / A15 原文：`0.79 → dropped`、`0.85 → quarantine`）。
+   D5 §3.3 里我写的 `CONFIDENCE_THRESHOLD = 0.6` 是**笔误**：D5 不是重新设计阈值的地方，
+   A15 已按 0.80 验收过。**D5 已改回 0.80**；长流把常量改回 `0.80`（保留 config 可覆盖的能力），
+   **A15 不回退口径、不改期望**。教训同 R-31：改口径要有理由，不能顺手改数。
+2. **A25 闸门入口冻结名**（D5 §3.3 已补，台架按名硬探；探不到 = FAIL，不许 SKIP）：
+   - `kfpa.knowledge.admit(store, candidate) -> KnowledgeCandidate` —— 闸门唯一入口，语义不变
+     （空 `content` → dropped；`kind=="avoid"` → quarantine 且永不转正；`confidence < 0.80` → dropped；否则 quarantine）；
+   - `kfpa.knowledge.record_sample(store, cid, passed, *, sampled_by="", rate=0.0) -> KnowledgeSample`
+     —— 写 `knowledge_samples` 留痕；`passed=False` → 该候选 `DROPPED` **且**内容进回避模式清单；
+   - 既有出口不动：`sampling_rate()` / `promotable()` / `mark_reused()` / `make_candidate()` / `is_sampled()` / `review_sample()`；
+   - 转正只认**后续轮次**：`round_no > candidate.round_no`（同轮不算，防自证）；
+   - CLI：`kfpa knowledge sample | verdict <cid> --pass/--fail | report`。
+3. **A26 的 PG 对拍复用 A12 的夹具，不另起容器**：
+   - 优先 `KFPA_PG_PORT`（默认 **55440**，与 A12 同口径）；连不上 → **可见 SKIP**（clean env 无 Docker 的正常态）；
+   - `KFPA_VERIFY_PG_DSN` 保留为**显式覆盖**（调用方自带 DSN 时用）；
+   - **禁止**自建 compose / 固定容器名（R-24：多工作树互撞）。
+
+**配套口径**：`verify_p3.py` 的 **A0（内嵌 P0/P1/P2 三条台架 + `pytest` rc=0）必须始终绿**；
+**A23–A27 在实现落地前允许红**，但每条红必须指名到人与接口——红的是派工单，不是 main 回归。
+P3 收口判据不变：A23–A27 全绿 + `pytest` 全绿 + R-32 白名单覆盖率不下降。
+
+---
+
 ## 变更记录
 
 | 版本 | 日期 | 裁决 | 作者 |
@@ -593,3 +620,4 @@ A18/A20 FAIL**。
 | 2.5 | 2026-10-16 | R-28 回灌区只取「本轮 + 上一轮」失败（spec §5.2 原文），禁止全库历史导致 `package_hash` 漂移 | Chief |
 | 2.6 | 2026-10-17 | R-29 升版守卫=全部台架 · R-30 测试归属与交接路径 · R-31 A18 rc 口径纠正（未知 provider=2）+ A20 覆盖率缺口拆解（67.5%，不放水） | Chief |
 | 2.7 | 2026-10-17 | R-32 A20 白名单拆分：排除需外部服务的 `store/postgres.py`（覆盖交给 A12），纯逻辑门槛重算 75.0%，还需 +88 语句 | Chief |
+| 2.8 | 2026-10-17 | R-33 P3 开工三问：沉淀门槛维持 0.80（D5 §3.3 笔误已改）· A25 闸门入口冻结名（`admit`/`record_sample`）· A26 复用 A12 的 PG 夹具（`KFPA_PG_PORT` 默认 55440）· `verify_p3` 的红是派工单而 A0 必须始终绿 | Chief |
